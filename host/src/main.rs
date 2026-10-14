@@ -1,8 +1,12 @@
 mod apps;
+mod canvas;
+mod dialogs;
 mod grid;
 mod icons;
+mod outliner;
 mod panel;
 mod process;
+mod tablet;
 mod tabs;
 mod toolbar;
 mod widgets;

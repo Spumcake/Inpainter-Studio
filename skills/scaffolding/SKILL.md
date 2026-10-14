@@ -21,8 +21,8 @@ Check that `apps/<id>` does not exist yet.
 1. Copy the folder `apps/template` to `apps/<id>`, with every file in it.
 2. In `apps/<id>/Cargo.toml`, set the package `name` to the id. Leave the dependencies as they are: `protocol` only.
 3. In `apps/<id>/manifest.json`, set `id` and `executable` to the id and `name` to the name. Leave `protocol` as it is.
-4. In `apps/<id>/src/main.rs`, set the tab's `id` to the id and its `label` to the name. Keep the `contents` message only if the sub-application will use the shared grid, and the `panel` message only if it will use the properties panel; remove the ones it will not use. Add no other messages.
-5. In `apps/<id>/AGENTS.md`, change the heading to the name and replace the first paragraph with one sentence on what this sub-application is for. Keep the rules unchanged.
+4. In `apps/<id>/src/main.rs`, set the tab's `id` to the id and its `label` to the name, and change every other tab value that still says template to that same id. A scaffold keeps the contents message and the panel message, because the template declares the shared grid and the properties panel on the right. Remove one of those messages only when the task says this sub-application does not use it. Add no other messages.
+5. In `apps/<id>/AGENTS.md`, change the heading to the name and replace the first paragraph with one sentence. If the task states what the sub-application is for, use that as the one sentence. If it does not, use: This sub-application is a scaffold copied from the template. Keep the rules unchanged.
 6. Add `"apps/<id>"` to `members` in the workspace `Cargo.toml`.
 
 ## Check

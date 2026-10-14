@@ -4,14 +4,14 @@ use eframe::egui::{self, Color32, Pos2, Rect, Stroke};
 
 const GRID_SPACING: f64 = 24.0;
 
-fn screen_to_document(rect: Rect, origin: [f64; 2], zoom: f64, pos: Pos2) -> [f64; 2] {
+pub(crate) fn screen_to_document(rect: Rect, origin: [f64; 2], zoom: f64, pos: Pos2) -> [f64; 2] {
     [
         origin[0] + f64::from(pos.x - rect.min.x) / zoom,
         origin[1] + f64::from(pos.y - rect.min.y) / zoom,
     ]
 }
 
-fn document_to_screen(rect: Rect, origin: [f64; 2], zoom: f64, point: [f64; 2]) -> Pos2 {
+pub(crate) fn document_to_screen(rect: Rect, origin: [f64; 2], zoom: f64, point: [f64; 2]) -> Pos2 {
     Pos2::new(
         ((point[0] - origin[0]) * zoom) as f32 + rect.min.x,
         ((point[1] - origin[1]) * zoom) as f32 + rect.min.y,

@@ -1,0 +1,19 @@
+[package]
+name = "sketch"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[dependencies]
+directories = "=6.0.0"
+earcutr = "=0.5.0"
+eframe = "=0.36.2"
+i_overlay = "=9.0.1"
+kurbo = "=0.13.1"
+perfect_freehand = "=0.1.1"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.152"
+
+[dev-dependencies]
+iconflow = { version = "=2.1.0", default-features = false, features = ["pack-iconoir"] }

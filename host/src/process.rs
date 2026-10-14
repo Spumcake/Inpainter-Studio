@@ -117,6 +117,23 @@ impl Running {
         &self.shown
     }
 
+    pub fn declaration_mut(&mut self) -> &mut Declaration {
+        &mut self.shown
+    }
+
+    /// Writes one message to the sub-application. A process that never
+    /// started, or whose pipe has closed, drops it.
+    pub fn send(&mut self, message: &HostMessage) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        let Some(stdin) = child.stdin.as_mut() else {
+            return;
+        };
+        let _ = stdin.write_all(protocol::encode_host_message(message).as_bytes());
+        let _ = stdin.flush();
+    }
+
     /// Drains parsed lines, then checks whether the child has exited.
     /// Lines already queued are applied before that exit is recorded.
     pub fn poll(&mut self) {
@@ -192,6 +209,11 @@ impl Running {
 
     fn apply(&mut self, event: PipeEvent) {
         if !self.pending {
+            // A later line is applied. A line the parser rejects does not
+            // clear the shell or the live copy.
+            if let PipeEvent::Line(line) = event {
+                let _ = self.shown.accept(line);
+            }
             return;
         }
         match event {

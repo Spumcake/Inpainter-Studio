@@ -6,6 +6,16 @@ rust-version = "1.95"
 publish = false
 
 [dependencies]
+directories = "=6.0.0"
 eframe = "=0.36.2"
 iconflow = { version = "=2.1.0", default-features = false, features = ["pack-iconoir"] }
+kurbo = "=0.13.1"
+octotablet = { version = "=0.1.0", default-features = false, features = ["wayland-tablet-unstable-v2"] }
 protocol = { path = "../protocol" }
+rfd = "=0.15.4"
+sketch = { path = "../sketch" }
+
+# octotablet 0.1.0 binds tablet protocol versions it cannot parse, which
+# closes the window's Wayland connection. See vendor/octotablet/PATCHED.md.
+[patch.crates-io]
+octotablet = { path = "vendor/octotablet" }

@@ -1,7 +1,9 @@
 //! The host window. The title is always Inpainter.
 
-use crate::{grid, icons, panel, tabs, toolbar};
+use crate::{canvas, grid, icons, panel, tabs, toolbar};
 use eframe::egui::{self, Color32, Rect};
+use protocol::AppMessage;
+use sketch::registry::{CommandId, Tool};
 
 /// A hair darker than the white toolbar and active tab, as in the picture.
 const CANVAS: Color32 = Color32::from_rgb(251, 251, 252);
@@ -43,11 +45,18 @@ struct HostWindow {
     /// The panel starts closed.
     panel_open: bool,
     viewport: [f64; 2],
+    /// The live copy. Pen samples stay in this process. Absent in frame
+    /// tests that only draw a declaration.
+    sketch: Option<canvas::SketchApp>,
+    /// The first document from the app is a blank camera. Center it once.
+    saw_document: bool,
 }
 
 impl HostWindow {
     fn new(creation: &eframe::CreationContext<'_>, child: crate::process::Running) -> Self {
-        Self::with_child(&creation.egui_ctx, child)
+        let mut window = Self::with_child(&creation.egui_ctx, child);
+        window.sketch = Some(canvas::SketchApp::new(creation));
+        window
     }
 
     fn with_child(ctx: &egui::Context, child: crate::process::Running) -> Self {
@@ -62,6 +71,8 @@ impl HostWindow {
             child: Some(child),
             panel_open: false,
             viewport: [0.0, 0.0],
+            sketch: None,
+            saw_document: false,
         }
     }
 
@@ -75,6 +86,137 @@ impl HostWindow {
         self.child
             .as_mut()
             .expect("the child stays until the window closes")
+    }
+
+    /// Documents replace nodes and camera. Results are dialogs; this slice
+    /// does not draw a status from a stopped child, and it drains results
+    /// so they do not pile up unread.
+    fn apply_remote(&mut self) {
+        let documents = self.running_mut().declaration_mut().take_documents();
+        let _results = self.running_mut().declaration_mut().take_results();
+        let Some(sketch) = self.sketch.as_mut() else {
+            return;
+        };
+        let first = !self.saw_document;
+        let mut installed = false;
+        for document in documents {
+            let AppMessage::Document { sketch: value, dirty } = document else {
+                continue;
+            };
+            if sketch.session().install_document(&value, dirty) {
+                installed = true;
+            }
+            self.saw_document = true;
+        }
+        if first && installed {
+            sketch.forget_presented_view();
+        }
+    }
+
+    fn publish_sketch(&mut self, undo_before: usize, redo_before: usize, tool_before: Tool) {
+        let Some(sketch) = self.sketch.as_ref() else {
+            return;
+        };
+        let session = sketch.session_ref();
+        let tool_after = session.tool();
+        let viewport = sketch.viewport();
+        let undid = session.undo_len() < undo_before;
+        let redid = session.redo_len() < redo_before;
+        if tool_after != tool_before {
+            self.running_mut().send(&protocol::HostMessage::Command {
+                id: None,
+                viewport: Some(viewport),
+                path: None,
+                replace: None,
+                discard: None,
+                tool: Some(tool_name(tool_after).to_string()),
+            });
+        }
+        if undid {
+            self.send_command(CommandId::Undo, viewport);
+        } else if redid {
+            self.send_command(CommandId::Redo, viewport);
+        }
+    }
+
+    fn publish_document(&mut self, step: bool) {
+        let Some(sketch) = self.sketch.as_ref() else {
+            return;
+        };
+        let snapshot = sketch.session_ref().active_snapshot();
+        self.running_mut()
+            .send(&protocol::HostMessage::Document {
+                sketch: snapshot,
+                step,
+            });
+    }
+
+    fn send_command(&mut self, id: CommandId, viewport: [f64; 2]) {
+        self.running_mut().send(&protocol::HostMessage::Command {
+            id: Some(command_name(id).to_string()),
+            viewport: Some(viewport),
+            path: None,
+            replace: None,
+            discard: None,
+            tool: None,
+        });
+    }
+}
+
+fn tool_name(tool: Tool) -> &'static str {
+    match tool {
+        Tool::Brush => "brush",
+        Tool::Eraser => "eraser",
+        Tool::Select => "select",
+        Tool::Rectangle => "rectangle",
+        Tool::Ellipse => "ellipse",
+        Tool::Line => "line",
+        Tool::Text => "text",
+    }
+}
+
+fn command_name(id: CommandId) -> &'static str {
+    match id {
+        CommandId::NewSketch => "new_sketch",
+        CommandId::Open => "open",
+        CommandId::Save => "save",
+        CommandId::SaveAs => "save_as",
+        CommandId::SaveCopy => "save_copy",
+        CommandId::ClearRecent => "clear_recent",
+        CommandId::Close => "close",
+        CommandId::Undo => "undo",
+        CommandId::Redo => "redo",
+        CommandId::Cut => "cut",
+        CommandId::Copy => "copy",
+        CommandId::Paste => "paste",
+        CommandId::Delete => "delete",
+        CommandId::NudgeLeft => "nudge_left",
+        CommandId::NudgeRight => "nudge_right",
+        CommandId::NudgeUp => "nudge_up",
+        CommandId::NudgeDown => "nudge_down",
+        CommandId::ZoomIn => "zoom_in",
+        CommandId::ZoomOut => "zoom_out",
+        CommandId::Fit => "fit",
+        CommandId::ZoomToSelection => "zoom_to_selection",
+        CommandId::Maximize => "maximize",
+        CommandId::NewCanvas => "new_canvas",
+        CommandId::Group => "group",
+        CommandId::Ungroup => "ungroup",
+        CommandId::BringForward => "bring_forward",
+        CommandId::SendBackward => "send_backward",
+        CommandId::BringToFront => "bring_to_front",
+        CommandId::SendToBack => "send_to_back",
+        CommandId::AlignLeft => "align_left",
+        CommandId::AlignCenter => "align_center",
+        CommandId::AlignRight => "align_right",
+        CommandId::RotateClockwise => "rotate_clockwise",
+        CommandId::RotateCounterclockwise => "rotate_counterclockwise",
+        CommandId::RotateHalf => "rotate_half",
+        CommandId::FlipHorizontal => "flip_horizontal",
+        CommandId::FlipVertical => "flip_vertical",
+        CommandId::TogglePanel => "toggle_panel",
+        CommandId::SizeDown => "size_down",
+        CommandId::SizeUp => "size_up",
     }
 }
 
@@ -99,7 +241,16 @@ fn shows_panel(declaration: &protocol::Declaration) -> bool {
 }
 
 impl eframe::App for HostWindow {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if let Some(sketch) = self.sketch.as_mut() {
+            sketch.raw_input_hook(ctx, raw_input);
+        }
+    }
+
     fn on_exit(&mut self) {
+        if let Some(sketch) = self.sketch.as_mut() {
+            sketch.on_exit();
+        }
         if let Some(child) = self.child.take() {
             child.shutdown();
         }
@@ -110,28 +261,56 @@ impl eframe::App for HostWindow {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let pending = {
-            let child = self.running_mut();
-            child.poll();
-            child.pending()
-        };
+        self.running_mut().poll();
+        self.apply_remote();
+        let pending = self.running().pending();
         if pending {
             ui.ctx().request_repaint();
         }
+
+        let live = self.sketch.is_some() && self.running().declaration().toolbar.is_some();
+        let before = self.sketch.as_ref().filter(|_| live).map(|sketch| {
+            let session = sketch.session_ref();
+            (
+                session.undo_len(),
+                session.redo_len(),
+                session.tool(),
+                session.active_snapshot(),
+            )
+        });
 
         let mut visuals = egui::Visuals::light();
         visuals.panel_fill = Color32::WHITE;
         ui.ctx().set_visuals(visuals);
 
+        let dismissing = egui::Popup::is_any_open(ui.ctx());
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
+                if live {
+                    self.sketch
+                        .as_mut()
+                        .expect("live")
+                        .commit_text_on_outside_press(ui);
+                }
                 {
                     let declaration = self.running().declaration();
                     tabs::show(ui, declaration);
                 }
-                toolbar::show(ui);
+                if live {
+                    let viewport = self.sketch.as_ref().expect("live").viewport();
+                    let center = toolbar::show_session(
+                        ui,
+                        self.sketch.as_mut().expect("live").session(),
+                        viewport,
+                    );
+                    if center {
+                        self.sketch.as_mut().expect("live").center_next_view();
+                    }
+                } else {
+                    toolbar::show(ui);
+                }
 
                 let full = ui.available_rect_before_wrap();
                 // A tab without a declared panel has no panel tab, and F4
@@ -139,6 +318,9 @@ impl eframe::App for HostWindow {
                 let has_panel = shows_panel(self.running().declaration());
                 if !has_panel {
                     self.panel_open = false;
+                }
+                if live {
+                    self.sketch.as_mut().expect("live").handle_keys(ui.ctx());
                 }
                 // F4 can open the panel. Split after the key so that frame
                 // gives the panel its width and narrows the contents.
@@ -154,21 +336,36 @@ impl eframe::App for HostWindow {
                 let rect = Rect::from_min_max(full.min, egui::pos2(right, full.bottom()));
                 self.viewport = [f64::from(rect.width()), f64::from(rect.height())];
 
-                let show_grid = shows_grid(self.running().declaration());
-                let painter = ui.painter().with_clip_rect(rect);
-                painter.rect_filled(rect, 0.0, CANVAS);
-                if show_grid {
-                    // As `Camera::centered` sets a new sketch: origin in the
-                    // middle of the area, zoom 1. This slice does not pan or zoom.
-                    let origin = [-self.viewport[0] / 2.0, -self.viewport[1] / 2.0];
-                    let zoom = 1.0;
-                    grid::paint_grid(&painter, rect, origin, zoom);
+                if live {
+                    self.sketch
+                        .as_mut()
+                        .expect("live")
+                        .drive(ui, rect, dismissing);
+                } else {
+                    let show_grid = shows_grid(self.running().declaration());
+                    let painter = ui.painter().with_clip_rect(rect);
+                    painter.rect_filled(rect, 0.0, CANVAS);
+                    if show_grid {
+                        // Until the first sketch document, the grid stays the
+                        // centered grid the scaffold already draws.
+                        let origin = [-self.viewport[0] / 2.0, -self.viewport[1] / 2.0];
+                        let zoom = 1.0;
+                        grid::paint_grid(&painter, rect, origin, zoom);
+                    }
                 }
 
                 if self.panel_open && panel_w > 0.0 {
                     let panel_rect =
                         Rect::from_min_max(egui::pos2(rect.right(), full.top()), full.max);
-                    panel::show(ui, panel_rect);
+                    if live {
+                        panel::page::show(
+                            ui,
+                            self.sketch.as_mut().expect("live").session(),
+                            panel_rect,
+                        );
+                    } else {
+                        panel::show(ui, panel_rect);
+                    }
                 } else if self.panel_open {
                     ui.ctx().request_repaint();
                 }
@@ -176,6 +373,23 @@ impl eframe::App for HostWindow {
                     panel::toggle_tab(ui.ctx(), &mut self.panel_open, rect.right(), full.top());
                 }
             });
+
+        if let Some((undo_before, redo_before, tool_before, snap_before)) = before {
+            let (changed, nodes_changed, undid, redid) = {
+                let session = self.sketch.as_ref().expect("live").session_ref();
+                let snap_after = session.active_snapshot();
+                (
+                    snap_after != snap_before,
+                    snap_after.get("nodes") != snap_before.get("nodes"),
+                    session.undo_len() < undo_before,
+                    session.redo_len() < redo_before,
+                )
+            };
+            self.publish_sketch(undo_before, redo_before, tool_before);
+            if changed && !undid && !redid {
+                self.publish_document(nodes_changed);
+            }
+        }
     }
 }
 

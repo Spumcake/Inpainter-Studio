@@ -1,3 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["host", "protocol", "apps/template"]
+members = ["host", "protocol", "sketch", "apps/template", "apps/simple-sketch"]
+
+# The host's pen library. A workspace only reads [patch] from this file.
+[patch.crates-io]
+octotablet = { path = "host/vendor/octotablet" }

@@ -1,0 +1,12 @@
+[package]
+name = "simple-sketch"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[dependencies]
+protocol = { path = "../../protocol" }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.152"
+sketch = { path = "../../sketch" }

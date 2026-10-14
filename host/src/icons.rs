@@ -1,191 +1,9 @@
-//! Icon names, shortcut chords, and the face names the toolbar installs.
+//! Font names and the panel shortcut. Tool chords and icon specs come from
+//! the sketch registry.
 
 use eframe::egui;
 
-/// How an icon name is drawn from the Iconoir font. A name ending in
-/// `-solid` is the icon's filled style, as Iconoir names it on its site. A
-/// name in [`TURNED_ICONS`] is another icon turned by quarter turns.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct IconSpec<'a> {
-    pub glyph: &'a str,
-    pub filled: bool,
-    pub quarter_turns: u8,
-}
-
-/// Icons Iconoir has only in one direction: the name, the icon it turns, and
-/// the clockwise quarter turns.
-const TURNED_ICONS: &[(&str, &str, u8)] = &[("flip-vertical", "flip", 1)];
-
-pub(crate) fn icon_spec(name: &str) -> IconSpec<'_> {
-    if let Some((_, glyph, turns)) = TURNED_ICONS.iter().find(|(alias, _, _)| *alias == name) {
-        return IconSpec {
-            glyph,
-            filled: false,
-            quarter_turns: *turns,
-        };
-    }
-    match name.strip_suffix("-solid") {
-        Some(glyph) => IconSpec {
-            glyph,
-            filled: true,
-            quarter_turns: 0,
-        },
-        None => IconSpec {
-            glyph: name,
-            filled: false,
-            quarter_turns: 0,
-        },
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Key {
-    B,
-    C,
-    E,
-    G,
-    L,
-    N,
-    O,
-    R,
-    S,
-    T,
-    V,
-    W,
-    X,
-    Y,
-    Z,
-    Digit0,
-    Digit2,
-    Plus,
-    Equals,
-    Minus,
-    BracketLeft,
-    BracketRight,
-    F4,
-    Delete,
-    Backspace,
-    Left,
-    Right,
-    Up,
-    Down,
-}
-
-impl Key {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Key::B => "B",
-            Key::C => "C",
-            Key::E => "E",
-            Key::G => "G",
-            Key::L => "L",
-            Key::N => "N",
-            Key::O => "O",
-            Key::R => "R",
-            Key::S => "S",
-            Key::T => "T",
-            Key::V => "V",
-            Key::W => "W",
-            Key::X => "X",
-            Key::Y => "Y",
-            Key::Z => "Z",
-            Key::Digit0 => "0",
-            Key::Digit2 => "2",
-            Key::Plus | Key::Equals => "+",
-            Key::Minus => "-",
-            Key::BracketLeft => "[",
-            Key::BracketRight => "]",
-            Key::F4 => "F4",
-            Key::Delete => "Delete",
-            Key::Backspace => "Backspace",
-            Key::Left => "Left",
-            Key::Right => "Right",
-            Key::Up => "Up",
-            Key::Down => "Down",
-        }
-    }
-}
-
-/// `shift: None` means the shortcut ignores Shift. Ctrl++ is Shift+= on a US keyboard.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct Chord {
-    pub command: bool,
-    pub shift: Option<bool>,
-    pub alt: bool,
-    pub key: Key,
-}
-
-impl Chord {
-    const fn plain(key: Key) -> Self {
-        Self {
-            command: false,
-            shift: Some(false),
-            alt: false,
-            key,
-        }
-    }
-
-    #[allow(dead_code)]
-    const fn ctrl(key: Key) -> Self {
-        Self {
-            command: true,
-            shift: Some(false),
-            alt: false,
-            key,
-        }
-    }
-
-    #[allow(dead_code)]
-    const fn ctrl_shift(key: Key) -> Self {
-        Self {
-            command: true,
-            shift: Some(true),
-            alt: false,
-            key,
-        }
-    }
-
-    /// Command plus this key, whether or not Shift is held.
-    #[allow(dead_code)]
-    const fn ctrl_any_shift(key: Key) -> Self {
-        Self {
-            command: true,
-            shift: None,
-            alt: false,
-            key,
-        }
-    }
-
-    #[allow(dead_code)]
-    const fn shift(key: Key) -> Self {
-        Self {
-            command: false,
-            shift: Some(true),
-            alt: false,
-            key,
-        }
-    }
-
-    pub(crate) fn label(self) -> String {
-        let mut parts = Vec::new();
-        if self.command {
-            parts.push("Ctrl");
-        }
-        if self.shift == Some(true) {
-            parts.push("Shift");
-        }
-        parts.push(self.key.label());
-        parts.join("+")
-    }
-}
-
-pub(crate) fn hover(label: &str, shortcuts: &[Chord]) -> String {
-    match shortcuts.first() {
-        Some(chord) => format!("{label} ({})", chord.label()),
-        None => label.to_string(),
-    }
-}
+pub(crate) use sketch::registry::{icon_spec, hover, Chord, Key};
 
 pub(crate) const INTER: &str = "Inter";
 pub(crate) const INTER_BOLD: &str = "Inter Bold";
@@ -194,7 +12,12 @@ pub(crate) const INTER_BOLD_ITALIC: &str = "Inter Bold Italic";
 
 /// The panel shortcut. The edge tab's hover is "Properties (F4)".
 const PANEL_LABEL: &str = "Properties";
-const PANEL: &[Chord] = &[Chord::plain(Key::F4)];
+const PANEL: &[Chord] = &[Chord {
+    command: false,
+    shift: Some(false),
+    alt: false,
+    key: Key::F4,
+}];
 
 pub(crate) fn panel_tip() -> String {
     hover(PANEL_LABEL, PANEL)

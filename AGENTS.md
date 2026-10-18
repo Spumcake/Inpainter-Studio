@@ -1,6 +1,6 @@
-# AGENTS.md — Inpainter
+# AGENTS.md — Inpainter Studio
 
-Inpainter is a desktop framework for creative work. One host program draws a shared shell, and each kind of work is a separate sub-application that the host starts and draws through one protocol. This repository holds the code. The product's mission and version documents live in the team repository, https://github.com/Spumcake/Inpainter-Team.
+Inpainter Studio is the open-source computer graphics (CG) authoring application behind the Inpainter platform. One host program draws a shared shell, and each kind of work is a separate sub-application that the host starts and draws through one protocol. This repository holds the code, and what Studio is lives in `docs/overview.md`. The product's mission and version documents live in the team repository, https://github.com/Spumcake/Inpainter-Team.
 
 The stack is Rust, egui through eframe, and Iconoir icons.
 

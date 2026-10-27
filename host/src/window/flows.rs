@@ -1,75 +1,48 @@
-//! The workspace's flows, reached from the logo menu and the window's close:
-//! saving, opening, a recent workspace, clearing, a new window, and quitting.
+//! The project's flows: keeping it, switching, a new one, removing, and quitting.
 //!
-//! The host owns the workspace file. It holds each tab's sub-application,
-//! file, label, and camera, the selected tab, and the conversation, never a
-//! sub-application's work. Saving first asks each tab that saves and has no
-//! file to keep itself, through its sub-application's own Save. Opening,
-//! clearing, and quitting first offer to save the workspace when it has
-//! changed, then close every tab through the quit flow, so each
-//! sub-application asks about its own unsaved work. Opening then starts the
-//! sub-applications the file names to restore, and reopens each tab.
+//! The host owns the project file. It holds each tab's sub-application, file,
+//! label, and camera, the selected tab, the folders, whether the workspace is
+//! shown, and the conversation, never a sub-application's work. Switching,
+//! creating, and removing the current project close every tab through the quit
+//! flow, so each sub-application asks about its own unsaved work. The project
+//! is written on its own, at most once a second, and always before switching,
+//! creating, or closing.
 
-use super::{AppSpec, HostWindow, Started};
-use crate::chat::LogoChoice;
+use super::{AppSpec, HostWindow, Project, Started};
+use crate::chat::{LogoChoice, ProjectChoice};
 use crate::process::Running;
-use crate::workspace::{self, View, WorkspaceFile, WorkspaceTab};
+use crate::workspace::{self, ProjectFile, ProjectTab, ReadError, View};
 use assistant::{Command, Entry, Role};
 use eframe::egui;
-use protocol::{Ask, AskButton, FileFilter, HostMessage};
-use std::collections::{HashMap, VecDeque};
+use protocol::{Ask, AskButton, HostMessage};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// After the sub-applications have declared themselves, what they report
-/// for this long is still the workspace's starting state, not a change.
+/// for this long is still the project's starting state, not a change.
 #[cfg(not(test))]
 const SETTLE_GRACE: Duration = Duration::from_millis(400);
 #[cfg(test)]
 const SETTLE_GRACE: Duration = Duration::ZERO;
 /// How long a restore waits for the tabs it asked to reopen.
 const RESTORE_WAIT: Duration = Duration::from_secs(10);
-/// A tab asked to keep itself that has not answered after this long, with
-/// no question or file dialog of its own showing, cancels the save.
-const NO_KEPT: Duration = Duration::from_secs(10);
+/// How often a changed project is written, apart from a switch, a new one,
+/// or the window closing, which write at once.
+pub(super) const WRITE_EVERY: Duration = Duration::from_secs(1);
 /// The host's own question's id, apart from every sub-application's.
 const QUESTION: usize = usize::MAX;
-
-/// What runs once the workspace question is answered.
-#[derive(Debug, Clone, PartialEq)]
-pub(super) enum After {
-    Quit,
-    /// Open Workspace…: choose the file, then open it.
-    Pick,
-    Open(PathBuf),
-    Clear,
-}
 
 /// The quit flow is closing every tab, and then this happens.
 enum Closing {
     Quit { closed: bool },
-    Open(PathBuf, WorkspaceFile),
-    Clear,
+    Open { id: String, file: ProjectFile },
+    Fresh { note: Option<String> },
+    Remove,
 }
 
 /// A question the host asks itself, in the existing dialog look.
 enum Question {
-    Save(After),
-    Failed { title: String, line: String },
-}
-
-struct SaveJob {
-    /// Save Workspace As…, or a workspace never saved: ask for its file.
-    choose: bool,
-    /// Tabs that save and have no file, each asked to keep itself in turn.
-    queue: VecDeque<(usize, String)>,
-    waiting: Option<(usize, String)>,
-    /// When the tab waited on last showed a question or a file dialog, or
-    /// was asked.
-    heard: Instant,
-    /// The files those tabs were kept as.
-    kept: HashMap<(usize, String), String>,
-    then: Option<After>,
+    Remove,
 }
 
 struct RestoreTab {
@@ -94,8 +67,8 @@ struct Restore {
     cameras: Vec<(usize, String, View)>,
 }
 
-/// A tab as the workspace's changes are judged: its sub-application, its
-/// id, and its file.
+/// A tab as the project's changes are judged: its sub-application, its id,
+/// and its file.
 #[derive(Debug, Clone, PartialEq)]
 struct TabKey {
     app: String,
@@ -108,6 +81,9 @@ struct Baseline {
     tabs: Vec<TabKey>,
     selected: Option<TabKey>,
     conversation: usize,
+    name: String,
+    folders: Vec<String>,
+    workspace_open: bool,
 }
 
 #[derive(Default)]
@@ -119,20 +95,38 @@ enum Settle {
     Done,
 }
 
+/// A tab as closing began. An application may close a tab after the person
+/// answers, and the project still keeps the tab from before that.
+struct KeptTab {
+    app: usize,
+    tab: String,
+    record: ProjectTab,
+    /// A never-saved tab the person discarded. It leaves the project.
+    dropped: bool,
+    /// The application has stopped reporting it.
+    gone: bool,
+}
+
+struct Kept {
+    tabs: Vec<KeptTab>,
+    /// Which `tabs` entry was selected, before any were dropped.
+    selected: Option<usize>,
+}
+
 #[derive(Default)]
 pub(crate) struct Flows {
-    /// The workspace's file, once saved or opened.
-    pub path: Option<PathBuf>,
-    /// A tab's camera was moved by hand since the workspace was saved.
+    /// A tab's camera was moved by hand since the project was written.
     pub moved: bool,
-    /// When a file dialog a sub-application asked for last closed.
-    pub dialog_closed: Option<Instant>,
     baseline: Baseline,
     settle: Settle,
     question: Option<Question>,
-    save: Option<SaveJob>,
     closing: Option<Closing>,
     restore: Option<Restore>,
+    /// The tabs at the start of a quit, updated with a path a save produces.
+    kept: Option<Kept>,
+    /// Paths the file dialog returned during a quit: the application, how
+    /// many tab reports it had sent by then, and the path.
+    save_paths: Vec<(usize, usize, String)>,
 }
 
 impl Flows {
@@ -140,8 +134,18 @@ impl Flows {
     #[cfg(test)]
     pub(crate) fn question_shown(&self) -> Option<String> {
         match self.question.as_ref()? {
-            Question::Save(_) => Some("Save this workspace?".to_string()),
-            Question::Failed { title, .. } => Some(title.clone()),
+            Question::Remove => Some("Remove this project?".to_string()),
+        }
+    }
+
+    /// The lines of the host's own question, while one shows.
+    #[cfg(test)]
+    pub(crate) fn question_lines(&self) -> Vec<String> {
+        match &self.question {
+            Some(Question::Remove) => vec![
+                "The conversation is deleted. The folders and files stay.".to_string(),
+            ],
+            None => Vec::new(),
         }
     }
 
@@ -152,10 +156,7 @@ impl Flows {
     }
 
     fn busy(&self) -> bool {
-        self.question.is_some()
-            || self.save.is_some()
-            || self.closing.is_some()
-            || self.restore.is_some()
+        self.question.is_some() || self.closing.is_some() || self.restore.is_some()
     }
 }
 
@@ -174,13 +175,6 @@ fn note(text: String) -> Entry {
         attachments: Vec::new(),
         tool: None,
         ok: None,
-    }
-}
-
-fn workspace_filter() -> FileFilter {
-    FileFilter {
-        name: "Inpainter workspace".to_string(),
-        extensions: vec![workspace::EXTENSION.to_string()],
     }
 }
 
@@ -217,8 +211,7 @@ fn match_tabs(wanted: &[RestoreTab], reported: &[protocol::TabEntry]) -> Vec<Opt
 }
 
 impl HostWindow {
-    /// Every running sub-application's tabs, as the workspace's changes
-    /// are judged.
+    /// Every running sub-application's tabs, as the project's changes are judged.
     fn tab_keys(&self) -> Vec<TabKey> {
         let mut keys = Vec::new();
         for started in self.apps.iter().filter(|started| !started.running.exited()) {
@@ -246,31 +239,53 @@ impl HostWindow {
     }
 
     fn rebaseline(&mut self) {
+        let (name, folders, workspace_open) = match &self.project {
+            Some(project) => (
+                project.name.clone(),
+                project.folders.clone(),
+                project.workspace_open,
+            ),
+            None => (String::new(), Vec::new(), true),
+        };
         self.flows.baseline = Baseline {
             tabs: self.tab_keys(),
             selected: self.selected_key(),
             conversation: self.chat.conversation.len(),
+            name,
+            folders,
+            workspace_open,
         };
         self.flows.moved = false;
     }
 
-    /// The workspace has changes it has not saved: a tab opened or closed,
-    /// a tab gained a file, the selection or a camera changed, or the
-    /// conversation grew. A workspace still starting has none.
-    pub(super) fn workspace_dirty(&self) -> bool {
+    /// The project has changes it has not written: a tab opened or closed, a
+    /// tab gained a file, the selection or a camera changed, the conversation
+    /// grew, or the name, the folders, or the workspace changed. A project
+    /// still starting has none.
+    pub(super) fn project_dirty(&self) -> bool {
         if !matches!(self.flows.settle, Settle::Done) {
             return false;
         }
+        let (name, folders, workspace_open) = match &self.project {
+            Some(project) => (
+                project.name.as_str(),
+                project.folders.as_slice(),
+                project.workspace_open,
+            ),
+            None => ("", &[][..], true),
+        };
         let base = &self.flows.baseline;
         self.flows.moved
             || self.tab_keys() != base.tabs
             || self.selected_key() != base.selected
             || self.chat.conversation.len() != base.conversation
+            || name != base.name
+            || folders != base.folders
+            || workspace_open != base.workspace_open
     }
 
-    /// The workspace as its file holds it. `kept` gives the files tabs were
-    /// just kept as, before their sub-applications report them.
-    pub(super) fn workspace_file(&self, kept: &HashMap<(usize, String), String>) -> WorkspaceFile {
+    /// The project as its file holds it.
+    fn project_file(&self) -> ProjectFile {
         let mut tabs = Vec::new();
         let mut selected = None;
         for (index, started) in self.apps.iter().enumerate() {
@@ -291,291 +306,425 @@ impl HostWindow {
                         origin: display.camera.origin,
                         zoom: display.camera.zoom,
                     });
-                let path = kept
-                    .get(&(index, entry.id.clone()))
-                    .cloned()
-                    .or(entry.path);
-                tabs.push(WorkspaceTab {
+                tabs.push(ProjectTab {
                     app: started.id.clone(),
-                    path,
+                    path: entry.path,
                     label: entry.label,
                     camera,
                 });
             }
         }
-        WorkspaceFile {
+        let (name, folders, workspace_open) = match &self.project {
+            Some(project) => (
+                project.name.clone(),
+                project.folders.clone(),
+                project.workspace_open,
+            ),
+            None => (workspace::UNTITLED.to_string(), Vec::new(), false),
+        };
+        ProjectFile {
             version: workspace::VERSION,
+            name,
+            folders,
             tabs,
             selected,
+            workspace_open,
             conversation: self.chat.conversation.clone(),
         }
     }
 
-    /// A row of the logo menu. While a request runs, only New Window goes.
-    pub(super) fn logo(
-        &mut self,
-        choice: LogoChoice,
-        ctx: &egui::Context,
-        frame: &mut eframe::Frame,
-    ) {
-        if choice == LogoChoice::NewWindow {
-            self.new_window();
+    /// What changed, so a failed write is tried again only after a new change.
+    fn change_signature(&self) -> String {
+        let tabs = self.tab_keys();
+        let selected = self.selected_key();
+        let (name, folders, open) = match &self.project {
+            Some(project) => (
+                project.name.clone(),
+                project.folders.clone(),
+                project.workspace_open,
+            ),
+            None => (String::new(), Vec::new(), true),
+        };
+        format!(
+            "{tabs:?}|{selected:?}|{}|{name}|{folders:?}|{open}|{}",
+            self.chat.conversation.len(),
+            self.flows.moved
+        )
+    }
+
+    fn tell(&mut self, text: String) {
+        self.assistant.send(Command::Note(text));
+    }
+
+    /// Writes the project when it has changed. `force` writes even during the
+    /// once-a-second wait, and even when the last attempt failed on this same
+    /// change: switching, creating, and closing use it.
+    pub(super) fn write_project(&mut self, force: bool) {
+        if self.project.is_none() || self.data.is_none() {
             return;
         }
+        if !force && (self.flows.closing.is_some() || self.flows.restore.is_some()) {
+            return;
+        }
+        if !force && !matches!(self.flows.settle, Settle::Done) {
+            return;
+        }
+        let signature = self.change_signature();
+        if !force && !self.project_dirty() {
+            return;
+        }
+        if !force && self.failed_signature.as_ref() == Some(&signature) {
+            return;
+        }
+        if !force
+            && self
+                .last_project_write
+                .is_some_and(|last| last.elapsed() < WRITE_EVERY)
+        {
+            return;
+        }
+        let file = self.project_file();
+        self.write_file(file);
+    }
+
+    fn write_file(&mut self, file: ProjectFile) {
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let Some(data) = self.data.clone() else {
+            return;
+        };
+        let id = project.id.clone();
+        let signature = self.change_signature();
+        match file.write(&workspace::project_path(&data, &id)) {
+            Ok(()) => {
+                self.rebaseline();
+                self.failed_signature = None;
+                self.last_project_write = Some(Instant::now());
+            }
+            Err(reason) => {
+                self.last_project_write = Some(Instant::now());
+                if self.failed_signature.as_ref() != Some(&signature) {
+                    self.tell(format!("The project could not be kept: {reason}"));
+                }
+                self.failed_signature = Some(signature);
+            }
+        }
+    }
+
+    /// The open tabs, taken when a quit starts. An application may close a tab
+    /// it has asked about, so the tabs after the questions are not the project's.
+    fn snapshot_tabs(&self) -> Kept {
+        let mut tabs = Vec::new();
+        let mut selected = None;
+        for (index, started) in self.apps.iter().enumerate() {
+            if started.running.exited() {
+                continue;
+            }
+            // The same tabs the project file records, including one an
+            // application reported only in its greeting.
+            let (entries, active) = started.running.tabs();
+            for entry in entries {
+                if index == self.selected && active.as_deref() == Some(entry.id.as_str()) {
+                    selected = Some(tabs.len());
+                }
+                let camera = started
+                    .running
+                    .declared
+                    .documents
+                    .get(&entry.id)
+                    .map(|display| View {
+                        origin: display.camera.origin,
+                        zoom: display.camera.zoom,
+                    });
+                tabs.push(KeptTab {
+                    app: index,
+                    tab: entry.id,
+                    record: ProjectTab {
+                        app: started.id.clone(),
+                        path: entry.path,
+                        label: entry.label,
+                        camera,
+                    },
+                    dropped: false,
+                    gone: false,
+                });
+            }
+        }
+        Kept { tabs, selected }
+    }
+
+    /// A file dialog answered with a path during a quit. Which tab it saved
+    /// shows in the application's later tab reports, so it is only noted here.
+    pub(super) fn note_save_path(&mut self, app: usize, path: String) {
+        if self.flows.closing.is_none() {
+            return;
+        }
+        let reports = self
+            .apps
+            .get(app)
+            .and_then(|started| started.running.declared.tab_log.as_ref())
+            .map_or(0, Vec::len);
+        self.flows.save_paths.push((app, reports, path));
+    }
+
+    /// Follows each application's tab reports since the quit started, using
+    /// only what the protocol carries. A tab keeps the last file it reported.
+    /// A tab with no file that leaves a report after a file dialog returned a
+    /// path, alone, was saved there. Any other tab with no file that leaves
+    /// was discarded, and leaves the project.
+    fn absorb_kept(&mut self) {
+        let logs: Vec<Vec<Vec<(String, Option<String>, String)>>> = self
+            .apps
+            .iter_mut()
+            .map(|started| started.running.declared.tab_log.take().unwrap_or_default())
+            .collect();
+        let mut paths = std::mem::take(&mut self.flows.save_paths);
+        let Some(kept) = &mut self.flows.kept else {
+            return;
+        };
+        for (app, log) in logs.iter().enumerate() {
+            for (index, report) in log.iter().enumerate() {
+                let mut left = Vec::new();
+                for (row_index, row) in kept.tabs.iter_mut().enumerate() {
+                    if row.app != app || row.gone {
+                        continue;
+                    }
+                    match report.iter().find(|tab| tab.0 == row.tab) {
+                        Some((_, path, label)) => {
+                            if let Some(path) = path {
+                                // A dialog's path a tab now reports is that
+                                // tab's, and is no longer waiting for one.
+                                paths.retain(|(which, _, waiting)| *which != app || waiting != path);
+                                row.record.path = Some(path.clone());
+                            }
+                            if !label.is_empty() {
+                                row.record.label = label.clone();
+                            }
+                        }
+                        None => {
+                            row.gone = true;
+                            if row.record.path.is_none() {
+                                left.push(row_index);
+                            }
+                        }
+                    }
+                }
+                let waiting = paths
+                    .iter()
+                    .position(|(which, reports, _)| *which == app && *reports <= index);
+                match (left.as_slice(), waiting) {
+                    ([saved], Some(at)) => {
+                        kept.tabs[*saved].record.path = Some(paths.remove(at).2);
+                    }
+                    _ => {
+                        for row in left {
+                            kept.tabs[row].dropped = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Writes the tabs from when the quit started, not the ones left after
+    /// each question closed its tab.
+    fn write_kept(&mut self) {
+        self.absorb_kept();
+        let mut file = self.project_file();
+        if let Some(kept) = self.flows.kept.take() {
+            let mut tabs = Vec::new();
+            let mut selected = None;
+            for (index, tab) in kept.tabs.into_iter().enumerate() {
+                if tab.dropped {
+                    continue;
+                }
+                if kept.selected == Some(index) {
+                    selected = Some(tabs.len());
+                }
+                tabs.push(tab.record);
+            }
+            file.tabs = tabs;
+            file.selected = selected;
+        }
+        self.write_file(file);
+    }
+
+    /// The logo menu. It only quits, and quitting closes the window as its
+    /// close button does.
+    pub(super) fn logo(&mut self, choice: LogoChoice, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.locked() || self.flows.busy() {
             return;
         }
-        match choice {
-            LogoChoice::NewWindow => {}
-            LogoChoice::Open => self.begin(After::Pick, frame),
-            LogoChoice::Recent(path) => self.begin(After::Open(path), frame),
-            LogoChoice::Save => self.start_save(false, None),
-            LogoChoice::SaveAs => self.start_save(true, None),
-            LogoChoice::Clear => self.begin(After::Clear, frame),
-            LogoChoice::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+        if choice == LogoChoice::Quit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
-    /// Another Inpainter with the same sub-applications and a fresh workspace.
-    fn new_window(&self) {
-        let Ok(exe) = std::env::current_exe() else {
+    /// A row of the project menu.
+    pub(super) fn project_menu(&mut self, choice: ProjectChoice, frame: &mut eframe::Frame) {
+        if self.locked() || self.flows.busy() || self.project.is_none() {
             return;
-        };
-        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-        if let Ok(mut child) = std::process::Command::new(exe).args(args).spawn() {
-            // Collected when it exits, so it leaves nothing behind.
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
         }
-    }
-
-    /// Offers to save a changed workspace, then goes on.
-    fn begin(&mut self, after: After, frame: &mut eframe::Frame) {
-        if self.workspace_dirty() {
-            self.flows.question = Some(Question::Save(after));
-        } else {
-            self.proceed(after, frame);
-        }
-    }
-
-    fn proceed(&mut self, after: After, frame: &mut eframe::Frame) {
-        match after {
-            After::Quit => self.start_closing(Closing::Quit { closed: false }),
-            After::Clear => self.start_closing(Closing::Clear),
-            After::Pick => {
+        match choice {
+            ProjectChoice::Rename => {
+                self.rename_draft = self
+                    .project
+                    .as_ref()
+                    .map(|project| project.name.clone())
+                    .unwrap_or_default();
+                self.renaming = true;
+            }
+            ProjectChoice::Switch(id) => self.begin_switch(id),
+            ProjectChoice::New => self.start_closing(Closing::Fresh { note: None }),
+            ProjectChoice::Remove => self.flows.question = Some(Question::Remove),
+            ProjectChoice::AddFolder => {
                 let picked = if self.native_dialogs {
-                    crate::dialogs::pick_open(frame, None, Some(&workspace_filter()))
+                    crate::dialogs::pick_folder(frame)
                 } else {
                     self.scripted_path()
                 };
                 if let Some(path) = picked {
-                    self.proceed(After::Open(path), frame);
+                    self.attach_folder(path);
                 }
             }
-            After::Open(path) => match WorkspaceFile::read(&path) {
-                Ok(file) => self.start_closing(Closing::Open(path, file)),
-                Err(reason) => {
-                    if !path.exists() {
-                        self.settings.forget_recent(&path);
-                    }
-                    self.flows.question = Some(Question::Failed {
-                        title: format!("Could not open “{}”", workspace::name(Some(&path))),
-                        line: reason,
-                    });
-                }
-            },
+            ProjectChoice::RemoveFolder(index) => self.detach_folder(index),
         }
     }
 
-    /// Every sub-application resolves its unsaved work, as when the window
-    /// closes. Each is asked again, even one that was ready before.
-    fn start_closing(&mut self, closing: Closing) {
-        for started in &mut self.apps {
-            started.running.declared.quit_ready = false;
-            started.running.send(&HostMessage::Quit);
+    /// The name typed for the project. An empty name leaves the old one.
+    pub(super) fn commit_rename(&mut self, name: String) {
+        self.renaming = false;
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return;
         }
-        self.flows.closing = Some(closing);
+        let Some(project) = self.project.as_mut() else {
+            return;
+        };
+        if project.name == name {
+            return;
+        }
+        project.name = name;
+        self.write_project(true);
+    }
+
+    fn attach_folder(&mut self, path: PathBuf) {
+        let text = path.display().to_string();
+        let Some(project) = self.project.as_mut() else {
+            return;
+        };
+        if project.folders.iter().any(|known| known == &text) {
+            return;
+        }
+        project.folders.push(text);
+        self.write_project(true);
+    }
+
+    fn detach_folder(&mut self, index: usize) {
+        let Some(project) = self.project.as_mut() else {
+            return;
+        };
+        if index >= project.folders.len() {
+            return;
+        }
+        project.folders.remove(index);
+        self.write_project(true);
+    }
+
+    /// Shows or hides the workspace, and keeps that with the project.
+    pub(super) fn toggle_workspace(&mut self) {
+        let Some(project) = self.project.as_mut() else {
+            return;
+        };
+        project.workspace_open = !project.workspace_open;
+        self.sent_viewport = None;
+        self.write_project(true);
+    }
+
+    fn begin_switch(&mut self, id: String) {
+        if self.project.as_ref().is_some_and(|project| project.id == id) {
+            return;
+        }
+        let Some(data) = self.data.clone() else {
+            return;
+        };
+        match ProjectFile::read(&workspace::project_path(&data, &id)) {
+            Ok(file) => self.start_closing(Closing::Open { id, file }),
+            Err(ReadError::Version(version)) => {
+                self.start_closing(Closing::Fresh {
+                    note: Some(workspace::version_line(version)),
+                });
+            }
+            Err(ReadError::Other(reason)) => self.tell(reason),
+        }
     }
 
     /// The person answered a sub-application's question. Its dismiss button
     /// during the quit flow cancels the flow: everything stays open.
     pub(super) fn note_answer(&mut self, ask: &Ask, button: &str) {
         if self.flows.closing.is_some() && ask.dismiss.as_deref() == Some(button) {
-            self.flows.closing = None;
-            for started in &mut self.apps {
-                started.running.declared.quit_ready = false;
-            }
+            self.stop_closing();
         }
     }
 
-    fn start_save(&mut self, choose: bool, then: Option<After>) {
-        let mut queue = VecDeque::new();
-        for (index, started) in self.apps.iter().enumerate() {
-            if started.running.exited() {
-                continue;
-            }
-            for tab in started.running.tabs().0 {
-                if tab.saves && tab.path.is_none() {
-                    queue.push_back((index, tab.id));
-                }
-            }
+    /// A save dialog the quit opened was cancelled. The application stops its
+    /// quit there, so the whole quit stops, as a dismissed question does.
+    pub(super) fn note_save_cancelled(&mut self) {
+        if self.flows.closing.is_some() {
+            self.stop_closing();
         }
+    }
+
+    /// Everything stays open, as it was before the quit started.
+    fn stop_closing(&mut self) {
+        self.flows.closing = None;
+        self.flows.kept = None;
+        self.flows.save_paths.clear();
         for started in &mut self.apps {
-            started.running.declared.kept.clear();
-        }
-        self.flows.save = Some(SaveJob {
-            choose: choose || self.flows.path.is_none(),
-            queue,
-            waiting: None,
-            heard: Instant::now(),
-            kept: HashMap::new(),
-            then,
-        });
-    }
-
-    /// Moves the save on: each tab keeps itself in turn, then the file is
-    /// chosen and written.
-    fn save_frame(&mut self, frame: &mut eframe::Frame) {
-        let Some(mut job) = self.flows.save.take() else {
-            return;
-        };
-        if let Some((app, tab)) = job.waiting.clone() {
-            let Some(started) = self.apps.get_mut(app) else {
-                return;
-            };
-            let answer = started
-                .running
-                .declared
-                .kept
-                .iter()
-                .position(|(kept, _)| *kept == tab);
-            match answer {
-                Some(position) => {
-                    let (_, path) = started.running.declared.kept.remove(position).unwrap_or_default();
-                    match path {
-                        Some(path) => {
-                            job.kept.insert((app, tab), path);
-                            job.waiting = None;
-                        }
-                        // The person cancelled the tab's own Save.
-                        None => return,
-                    }
-                }
-                None if started.running.exited() || started.running.not_responding() => return,
-                None if started.running.declared.ask.is_some()
-                    || !started.running.declared.files.is_empty() =>
-                {
-                    job.heard = Instant::now();
-                    self.flows.save = Some(job);
-                    return;
-                }
-                // The person may be in a file dialog the host opened; that
-                // frame waits on the dialog, so time passes only outside it.
-                None if job.heard.elapsed() >= NO_KEPT
-                    && self
-                        .flows
-                        .dialog_closed
-                        .is_none_or(|closed| closed.elapsed() >= NO_KEPT) =>
-                {
-                    return;
-                }
-                None => {
-                    self.flows.save = Some(job);
-                    return;
-                }
-            }
-        }
-        if let Some((app, tab)) = job.queue.pop_front() {
-            if let Some(started) = self.apps.get_mut(app) {
-                started.running.send(&HostMessage::Keep { tab: tab.clone() });
-            }
-            job.waiting = Some((app, tab));
-            job.heard = Instant::now();
-            self.flows.save = Some(job);
-            return;
-        }
-        let target = if job.choose {
-            let name = format!(
-                "{}.{}",
-                workspace::name(self.flows.path.as_deref()),
-                workspace::EXTENSION
-            );
-            let picked = if self.native_dialogs {
-                crate::dialogs::pick_save(frame, None, &name, Some(&workspace_filter()))
-            } else {
-                self.scripted_path()
-            };
-            picked.map(workspace::with_extension)
-        } else {
-            self.flows.path.clone()
-        };
-        let Some(target) = target else {
-            return;
-        };
-        let file = self.workspace_file(&job.kept);
-        match file.write(&target) {
-            Ok(()) => {
-                self.settings.add_recent(&target);
-                self.flows.path = Some(target);
-                self.rebaseline();
-                if let Some(after) = job.then {
-                    self.proceed(after, frame);
-                }
-            }
-            Err(reason) => {
-                self.flows.question = Some(Question::Failed {
-                    title: format!("Could not save “{}”", workspace::name(Some(&target))),
-                    line: reason,
-                });
-            }
+            started.running.declared.quit_ready = false;
+            started.running.declared.tab_log = None;
         }
     }
 
     /// Shows the host's own question, when it has one. Returns whether it did.
-    pub(super) fn show_question(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) -> bool {
+    pub(super) fn show_question(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) -> bool {
         let ask = match &self.flows.question {
             None => return false,
-            Some(Question::Save(_)) => Ask {
-                id: "workspace-save".to_string(),
-                title: "Save this workspace?".to_string(),
-                lines: vec![workspace::name(self.flows.path.as_deref())],
-                buttons: vec![
-                    button("save", "Save"),
-                    button("discard", "Discard"),
-                    button("cancel", "Cancel"),
-                ],
+            Some(Question::Remove) => Ask {
+                id: "project-remove".to_string(),
+                title: "Remove this project?".to_string(),
+                lines: vec!["The conversation is deleted. The folders and files stay.".to_string()],
+                buttons: vec![button("remove", "Remove"), button("cancel", "Cancel")],
                 dismiss: Some("cancel".to_string()),
-            },
-            Some(Question::Failed { title, line }) => Ask {
-                id: "workspace-failed".to_string(),
-                title: title.clone(),
-                lines: vec![line.clone()],
-                buttons: vec![button("ok", "OK")],
-                dismiss: Some("ok".to_string()),
             },
         };
         if let Some(chosen) = crate::ask::show(ctx, QUESTION, &ask) {
-            let question = self.flows.question.take();
-            if let Some(Question::Save(after)) = question {
-                match chosen.as_str() {
-                    "save" => self.start_save(false, Some(after)),
-                    "discard" => self.proceed(after, frame),
-                    _ => {}
-                }
-            }
+            self.answer_question(&chosen);
         }
         true
     }
 
-    /// Runs every frame: the window's close, the workspace's start, and the
-    /// save, quit, and restore flows in progress.
-    pub(super) fn workspace_frame(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    /// The button chosen on the host's question.
+    pub(super) fn answer_question(&mut self, chosen: &str) {
+        if self.flows.question.is_none() {
+            return;
+        }
+        self.flows.question = None;
+        if chosen == "remove" {
+            self.start_closing(Closing::Remove);
+        }
+    }
+
+    /// Runs every frame: the window's close, the project's start, and the
+    /// quit and restore flows in progress.
+    pub(super) fn project_frame(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.settle_frame();
-        self.close_frame(ctx, frame);
-        self.save_frame(frame);
+        self.close_frame(ctx);
         self.closing_frame(ctx);
         self.restore_frame();
+        self.write_project(false);
+        let _ = frame;
     }
 
     fn settle_frame(&mut self) {
@@ -591,17 +740,19 @@ impl HostWindow {
                 self.rebaseline();
                 if Instant::now() >= until {
                     self.flows.settle = Settle::Done;
+                    // The starting tabs are part of the project, so the file
+                    // matches them once they have arrived.
+                    self.write_project(true);
                 }
             }
             Settle::Done => {}
         }
     }
 
-    /// The window's close: a changed workspace is offered to save first,
-    /// then each sub-application resolves its unsaved work. The window
-    /// closes once every one is ready or has exited. A cancelled question
-    /// leaves the window open; closing again asks again.
-    fn close_frame(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    /// The window's close: each sub-application resolves its unsaved work.
+    /// The window closes once every one is ready or has exited, and the
+    /// project is written then. A cancelled question leaves the window open.
+    fn close_frame(&mut self, ctx: &egui::Context) {
         let requested = ctx.input(|input| input.viewport().close_requested());
         if !requested {
             return;
@@ -619,11 +770,8 @@ impl HostWindow {
             Some(_) => ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose),
             None => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                if self.flows.question.is_none()
-                    && self.flows.save.is_none()
-                    && self.flows.restore.is_none()
-                {
-                    self.begin(After::Quit, frame);
+                if self.flows.question.is_none() && self.flows.restore.is_none() {
+                    self.start_closing(Closing::Quit { closed: false });
                 }
             }
         }
@@ -640,84 +788,43 @@ impl HostWindow {
             return;
         }
         match self.flows.closing.take() {
-            Some(Closing::Quit { closed }) => {
-                if !closed {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+            Some(Closing::Quit { closed: true }) => {
                 self.flows.closing = Some(Closing::Quit { closed: true });
             }
-            Some(Closing::Open(path, file)) => self.open_now(path, file),
-            Some(Closing::Clear) => self.clear_now(),
+            Some(Closing::Quit { closed: false }) => {
+                self.write_kept();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.flows.closing = Some(Closing::Quit { closed: true });
+            }
+            Some(Closing::Open { id, file }) => {
+                self.write_kept();
+                self.open_loaded(id, file);
+            }
+            Some(Closing::Fresh { note }) => {
+                self.write_kept();
+                self.open_fresh(note);
+            }
+            Some(Closing::Remove) => self.remove_current(),
             None => {}
         }
     }
 
-    /// Stops every sub-application and starts these instead.
-    fn restart(&mut self, specs: Vec<AppSpec>, restore: bool) {
-        for started in std::mem::take(&mut self.apps) {
-            started.running.shutdown();
-        }
-        self.apps = specs
-            .into_iter()
-            .map(|spec| {
-                let running = match &spec.executable {
-                    Some(executable) => {
-                        Running::start(executable, crate::apps::data_dir(&spec.id), restore)
-                    }
-                    None => Running::not_started(),
-                };
-                running.attach(&self.ctx);
-                Started {
-                    id: spec.id,
-                    name: spec.name,
-                    executable: spec.executable,
-                    running,
-                }
-            })
-            .collect();
-        self.selected = 0;
-        self.viewport_sent = vec![false; self.apps.len()];
-        self.shown = None;
-        self.surface.reset();
-        self.live.reset();
-        self.panel_open = false;
-        self.routing = Default::default();
-        self.flows.settle = Settle::Waiting;
-    }
-
-    /// A fresh start: the sub-applications started at launch, each as at
-    /// launch, and an empty conversation.
-    fn clear_now(&mut self) {
-        self.restart(self.launch.clone(), false);
-        self.flows.path = None;
-        self.chat.conversation.clear();
-        self.assistant.send(Command::Clear);
-    }
-
-    /// Starts the sub-applications the workspace names, and only those, to
-    /// restore, and asks each to reopen its tabs. A file that no longer
-    /// exists, or a sub-application no longer installed, is left out, and a
-    /// line in the conversation says which.
-    fn open_now(&mut self, path: PathBuf, file: WorkspaceFile) {
+    /// Every installed sub-application is started. One the project names is
+    /// restored; one it does not name starts as it does at launch, so it is
+    /// there when the workspace is shown.
+    fn open_loaded(&mut self, id: String, file: ProjectFile) {
         let installed = crate::apps::discover();
         let mut notes = Vec::new();
         let mut specs: Vec<AppSpec> = Vec::new();
+        let mut restoring: Vec<bool> = Vec::new();
         let mut apps: Vec<RestoreApp> = Vec::new();
         let mut selected = None;
         for (index, tab) in file.tabs.iter().enumerate() {
-            // A sub-application this window already started is started from
-            // the same program again; any other is found by its manifest.
-            let running = self.apps.iter().map(|started| AppSpec {
-                id: started.id.clone(),
-                name: started.name.clone(),
-                executable: started.executable.clone(),
-            });
             let known = self
                 .launch
                 .iter()
+                .find(|spec| spec.id == tab.app)
                 .cloned()
-                .chain(running)
-                .find(|spec| spec.id == tab.app && spec.executable.is_some())
                 .or_else(|| {
                     installed
                         .iter()
@@ -733,6 +840,7 @@ impl HostWindow {
                 None => match known {
                     Some(spec) => {
                         specs.push(spec);
+                        restoring.push(true);
                         apps.push(RestoreApp {
                             tabs: Vec::new(),
                             opened: false,
@@ -767,9 +875,35 @@ impl HostWindow {
                 camera: tab.camera,
             });
         }
-        self.restart(specs, true);
-        self.settings.add_recent(&path);
-        self.flows.path = Some(path);
+        for (flag, wanted) in restoring.iter_mut().zip(&apps) {
+            if wanted.tabs.is_empty() {
+                *flag = false;
+            }
+        }
+        for spec in self.launch.clone() {
+            if specs.iter().any(|known| known.id == spec.id) {
+                continue;
+            }
+            specs.push(spec);
+            restoring.push(false);
+            apps.push(RestoreApp {
+                tabs: Vec::new(),
+                opened: false,
+                ids: None,
+            });
+        }
+        self.restart(specs, &restoring);
+        self.listed_projects = None;
+        self.project = Some(Project {
+            id: id.clone(),
+            name: file.name,
+            folders: file.folders,
+            workspace_open: file.workspace_open,
+        });
+        self.settings.choose_project(&id);
+        self.renaming = false;
+        self.sent_viewport = None;
+        self.failed_signature = None;
         self.chat.conversation.clear();
         let mut conversation = file.conversation;
         conversation.extend(notes);
@@ -781,6 +915,119 @@ impl HostWindow {
             mapped: false,
             cameras: Vec::new(),
         });
+    }
+
+    /// The current project, read from the settings, or the newest one, or a
+    /// new "Untitled Project" when there is none.
+    pub(super) fn open_current(&mut self) {
+        let Some(data) = self.data.clone() else {
+            return;
+        };
+        if let Some(id) = self.settings.project.clone() {
+            match ProjectFile::read(&workspace::project_path(&data, &id)) {
+                Ok(file) => {
+                    self.open_loaded(id, file);
+                    return;
+                }
+                Err(ReadError::Version(version)) => {
+                    self.open_fresh(Some(workspace::version_line(version)));
+                    return;
+                }
+                Err(ReadError::Other(_)) => {}
+            }
+        }
+        if let Some(listed) = workspace::list_projects(&data).into_iter().next() {
+            self.open_loaded(listed.id, listed.file);
+            return;
+        }
+        self.open_fresh(None);
+    }
+
+    fn open_fresh(&mut self, line: Option<String>) {
+        let Some(data) = self.data.clone() else {
+            return;
+        };
+        match workspace::create_project(&data) {
+            Ok((id, mut file)) => {
+                if let Some(line) = line {
+                    file.conversation.push(note(line));
+                    let _ = file.write(&workspace::project_path(&data, &id));
+                }
+                self.open_loaded(id, file);
+            }
+            Err(reason) => self.tell(format!("A project could not be started: {reason}")),
+        }
+    }
+
+    fn remove_current(&mut self) {
+        let Some(data) = self.data.clone() else {
+            return;
+        };
+        let Some(id) = self.project.as_ref().map(|project| project.id.clone()) else {
+            return;
+        };
+        if let Err(reason) = workspace::delete_project(&data, &id) {
+            self.tell(reason);
+            return;
+        }
+        self.project = None;
+        if let Some(listed) = workspace::list_projects(&data).into_iter().next() {
+            self.open_loaded(listed.id, listed.file);
+        } else {
+            self.open_fresh(None);
+        }
+    }
+
+    /// Stops every sub-application and starts these instead. `restoring` says
+    /// which ones wait to be given their tabs, instead of opening their own.
+    fn restart(&mut self, specs: Vec<AppSpec>, restoring: &[bool]) {
+        for started in std::mem::take(&mut self.apps) {
+            started.running.shutdown();
+        }
+        self.apps = specs
+            .into_iter()
+            .enumerate()
+            .map(|(index, spec)| {
+                let restore = restoring.get(index).copied().unwrap_or(false);
+                let dir = self
+                    .data
+                    .as_ref()
+                    .map(|data| data.join("apps").join(&spec.id))
+                    .or_else(|| crate::apps::data_dir(&spec.id));
+                let running = match &spec.executable {
+                    Some(executable) => Running::start(executable, dir, restore),
+                    None => Running::not_started(),
+                };
+                running.attach(&self.ctx);
+                Started {
+                    id: spec.id,
+                    name: spec.name,
+                    executable: spec.executable,
+                    running,
+                }
+            })
+            .collect();
+        self.selected = 0;
+        self.sent_viewport = None;
+        self.shown = None;
+        self.surface.reset();
+        self.live.reset();
+        self.panel_open = false;
+        self.routing = Default::default();
+        self.flows.settle = Settle::Waiting;
+    }
+
+    /// Every installed sub-application resolves its unsaved work, as when the
+    /// window closes. Each is asked again, even one that was ready before.
+    fn start_closing(&mut self, closing: Closing) {
+        self.flows.kept = Some(self.snapshot_tabs());
+        self.flows.save_paths.clear();
+        for started in &mut self.apps {
+            started.running.declared.quit_ready = false;
+            started.running.declared.tab_log = Some(Vec::new());
+            started.running.send(&HostMessage::Quit);
+        }
+        self.flows.closing = Some(closing);
     }
 
     /// Moves a restore on: once a restarted sub-application has declared
@@ -867,7 +1114,7 @@ impl HostWindow {
             }
             job.cameras = waiting;
             if job.cameras.is_empty() {
-                // Restored: what arrives now is the workspace as it was saved.
+                // Restored: what arrives now is the project as it was kept.
                 self.flows.settle = Settle::Waiting;
                 return;
             }

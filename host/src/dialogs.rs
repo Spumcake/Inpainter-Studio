@@ -1,6 +1,6 @@
-//! Native open and save dialogs, opened when a sub-application sends a
-//! `file` request. Frame tests answer requests themselves and do not call
-//! this module, so they never open a dialog.
+//! Native open, save, and folder dialogs, opened when a sub-application sends
+//! a `file` request or the project menu asks for a folder. Frame tests answer
+//! requests themselves and do not call this module, so they never open a dialog.
 
 use protocol::FileFilter;
 use std::path::{Path, PathBuf};
@@ -43,4 +43,31 @@ pub(crate) fn pick_files(parent: &eframe::Frame, filter: &FileFilter) -> Vec<Pat
         .set_parent(parent)
         .pick_files()
         .unwrap_or_default()
+}
+
+/// A folder to attach to the current project. It can be anywhere.
+pub(crate) fn pick_folder(parent: &eframe::Frame) -> Option<PathBuf> {
+    rfd::FileDialog::new().set_parent(parent).pick_folder()
+}
+
+/// The data folder cannot be used, so Studio shows the message and does not
+/// open a window. The same portal as the file dialogs.
+pub(crate) fn unavailable() {
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("Inpainter")
+        .set_description("The data folder is not available.")
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+}
+
+/// The second start: Studio is already open, so this one shows the message
+/// and does not open a window. The same portal as the file dialogs.
+pub(crate) fn already_open() {
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Info)
+        .set_title("Inpainter")
+        .set_description(crate::workspace::ALREADY_OPEN)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
 }

@@ -80,8 +80,21 @@ pub fn discover() -> Vec<App> {
     apps
 }
 
-/// The sub-applications to start: each one `--app <id>` names, in the order
-/// named, or, with no `--app`, the first by id. An unknown id starts nothing.
+/// The sub-applications to start. With no `--app`, every installed one, in id
+/// order. With `--app`, each one named, in the order named. An unknown id
+/// starts nothing.
+pub fn launch() -> Vec<App> {
+    let found = discover();
+    let requested = requested();
+    if requested.is_empty() {
+        found
+    } else {
+        choose(found, &requested)
+    }
+}
+
+/// The sub-applications `--app` names, in that order. An unknown id starts
+/// nothing. An empty `requested` is not used here: [`launch`] starts all of them.
 pub fn choose(apps: Vec<App>, requested: &[String]) -> Vec<App> {
     if requested.is_empty() {
         return apps.into_iter().take(1).collect();

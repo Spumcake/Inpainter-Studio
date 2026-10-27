@@ -1,8 +1,9 @@
-//! The assistant's chat panel, a white column at the window's left: the
-//! logo and its workspace menu, the conversation, and the input box with
-//! its attachments, model picker, microphone, and send. It is drawn with
-//! the shell's own widgets and colors, and knows no sub-application: what
-//! the assistant can do comes from what sub-applications declare.
+//! The assistant's conversation: the logo and its menu, the project's name
+//! and menu, the conversation, and the input box with its attachments, model
+//! picker, microphone, and send. It fills the window, or sits in a column
+//! when the workspace is shown. It is drawn with the shell's own widgets and
+//! colors, and knows no sub-application: what the assistant can do comes
+//! from what sub-applications declare.
 
 use crate::toolbar::{self, ICON};
 use crate::widgets::{self, BORDER, MUTED, SELECTED, TEXT};
@@ -69,18 +70,37 @@ pub(crate) struct Chat {
     pub models: Option<Result<Vec<Model>, String>>,
     pub model: Option<ModelChoice>,
     logo: Option<egui::TextureHandle>,
+    /// The input sits in the middle: the conversation is empty and fills the window.
+    pub input_centered: bool,
+    /// Messages sit in a centred column: the conversation fills the window.
+    pub centered_column: bool,
 }
 
-/// A row of the logo menu.
-#[derive(Debug, Clone, PartialEq)]
+/// The logo menu has one row.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum LogoChoice {
-    NewWindow,
-    Open,
-    Recent(PathBuf),
-    Save,
-    SaveAs,
-    Clear,
     Quit,
+}
+
+/// What the project menu offers, besides the name itself.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ProjectChoice {
+    Rename,
+    Switch(String),
+    New,
+    Remove,
+    AddFolder,
+    RemoveFolder(usize),
+}
+
+/// The project menu's contents for one frame.
+pub(crate) struct ProjectMenu {
+    pub name: String,
+    pub folders: Vec<String>,
+    /// Other projects: id, then the name the menu shows.
+    pub others: Vec<(String, String)>,
+    pub renaming: bool,
+    pub draft: String,
 }
 
 /// What the person did in the panel.
@@ -96,6 +116,10 @@ pub(crate) enum ChatEvent {
     ListModels,
     Model(Model),
     Logo(LogoChoice),
+    Project(ProjectChoice),
+    /// The name was typed.
+    Renamed(String),
+    CancelRename,
 }
 
 /// The panel's width: a quarter of the window, but never so narrow that a
@@ -104,32 +128,72 @@ pub(crate) fn width(window: f32) -> f32 {
     (window * 0.25).round().max(260.0).min(window * 0.5)
 }
 
+/// Messages in the conversation that fills the window sit in a column no
+/// wider than this, centred.
+const TALK_COLUMN: f32 = 720.0;
+
 /// The name the picker shows: the model's name without its maker's prefix.
 pub(crate) fn short_name(name: &str) -> &str {
     name.split_once(": ").map_or(name, |(_, rest)| rest)
 }
 
-/// Draws the panel in `rect` and returns what the person did.
+/// Draws the conversation in `rect` and returns what the person did.
+/// `fills` is the conversation taking the whole window.
 pub(crate) fn show(
     ui: &mut egui::Ui,
     rect: Rect,
     chat: &mut Chat,
-    recent: &[PathBuf],
+    project: &mut ProjectMenu,
+    fills: bool,
 ) -> Vec<ChatEvent> {
     let mut events = Vec::new();
     let painter = ui.painter().with_clip_rect(rect);
     painter.rect_filled(rect, 0.0, Color32::WHITE);
-    widgets::vertical_rule(&painter, rect.right() - 0.5, rect.top(), rect.bottom(), BORDER);
-    let inner = Rect::from_min_max(rect.min, pos2(rect.right() - 1.0, rect.bottom()));
+    if !fills {
+        widgets::vertical_rule(&painter, rect.right() - 0.5, rect.top(), rect.bottom(), BORDER);
+    }
+    let inner = if fills {
+        rect
+    } else {
+        Rect::from_min_max(rect.min, pos2(rect.right() - 1.0, rect.bottom()))
+    };
 
-    logo_row(ui, inner, chat, recent, &mut events);
-    let input_top = input_box(ui, inner, chat, &mut events);
-    let talk = Rect::from_min_max(
-        pos2(inner.left(), inner.top() + LOGO_ROW),
-        pos2(inner.right(), input_top - 8.0),
-    );
-    conversation(ui, talk, &chat.conversation);
+    let empty = !chat.conversation.iter().any(|entry| entry.role != Role::Tool);
+    let centered = fills && empty;
+    chat.input_centered = centered;
+    chat.centered_column = fills && !empty;
+    project_name(ui, inner, project, &mut events);
+
+    let column = if fills { talk_column(inner) } else { inner };
+    if centered {
+        let frame = input_box(ui, column, chat, true, &mut events);
+        let logo = Rect::from_center_size(
+            pos2(frame.center().x - 10.0, frame.top() - 28.0),
+            vec2(LOGO + 36.0, LOGO),
+        );
+        logo_button(ui, logo.center(), chat, &mut events);
+    } else {
+        logo_button(
+            ui,
+            pos2(inner.left() + 15.0 + LOGO / 2.0, inner.top() + LOGO_CENTER),
+            chat,
+            &mut events,
+        );
+        let frame = input_box(ui, column, chat, false, &mut events);
+        let talk = Rect::from_min_max(
+            pos2(column.left(), inner.top() + LOGO_ROW),
+            pos2(column.right(), frame.top() - 8.0),
+        );
+        conversation(ui, talk, &chat.conversation);
+    }
     events
+}
+
+/// The centred column messages use when the conversation fills the window.
+fn talk_column(rect: Rect) -> Rect {
+    let width = (rect.width() - 2.0 * SIDE).min(TALK_COLUMN).max(40.0);
+    let left = rect.center().x - width / 2.0;
+    Rect::from_min_size(pos2(left, rect.top()), vec2(width, rect.height()))
 }
 
 fn logo_texture(ui: &egui::Ui, chat: &mut Chat) -> Option<egui::TextureId> {
@@ -150,20 +214,13 @@ fn logo_texture(ui: &egui::Ui, chat: &mut Chat) -> Option<egui::TextureId> {
     chat.logo.as_ref().map(egui::TextureHandle::id)
 }
 
-/// The logo and its chevron, which open the workspace menu below them.
-fn logo_row(
-    ui: &mut egui::Ui,
-    rect: Rect,
-    chat: &mut Chat,
-    recent: &[PathBuf],
-    events: &mut Vec<ChatEvent>,
-) {
-    let center_y = rect.top() + LOGO_CENTER;
-    let logo = Rect::from_center_size(pos2(rect.left() + 15.0 + LOGO / 2.0, center_y), vec2(LOGO, LOGO));
-    let chevron = pos2(logo.right() + 20.0, center_y);
+/// The logo and its chevron, which open a menu with Quit.
+fn logo_button(ui: &mut egui::Ui, center: Pos2, chat: &mut Chat, events: &mut Vec<ChatEvent>) {
+    let logo = Rect::from_center_size(center, vec2(LOGO, LOGO));
+    let chevron = pos2(logo.right() + 16.0, center.y);
     let hit = Rect::from_min_max(
-        pos2(logo.left() - 5.0, center_y - 17.0),
-        pos2(chevron.x + 10.0, center_y + 17.0),
+        pos2(logo.left() - 5.0, center.y - 17.0),
+        pos2(chevron.x + 10.0, center.y + 17.0),
     );
     let response = ui
         .interact(hit, egui::Id::new("logo-menu"), Sense::click())
@@ -181,44 +238,128 @@ fn logo_row(
         );
     }
     widgets::chevron(ui.painter(), chevron, MUTED, widgets::Scale(1.15));
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Workspace"));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Inpainter"));
 
     let waits = !chat.working;
     egui::Popup::menu(&response).show(|ui| {
-        let items = [
-            item("New Window", true, false, false),
-            item("Open Workspace…", waits, false, true),
-            item("Recent Workspaces", waits && !recent.is_empty(), true, false),
-            item("Save Workspace", waits, false, false),
-            item("Save Workspace As…", waits, false, false),
-            item("Clear Workspace", waits, false, true),
-            item("Quit", waits, false, true),
-        ];
-        let names: Vec<String> = recent
-            .iter()
-            .map(|path| crate::workspace::name(Some(path)))
-            .collect();
-        let picked = widgets::menu_rows_with(ui, &items, |_, ui| {
-            let rows: Vec<widgets::MenuItem> = names
-                .iter()
-                .map(|name| item(name, true, false, false))
-                .collect();
-            widgets::menu_rows(ui, &rows)
-        });
-        let choice = match picked {
-            Some(widgets::MenuPick::Row(0)) => Some(LogoChoice::NewWindow),
-            Some(widgets::MenuPick::Row(1)) => Some(LogoChoice::Open),
-            Some(widgets::MenuPick::Row(3)) => Some(LogoChoice::Save),
-            Some(widgets::MenuPick::Row(4)) => Some(LogoChoice::SaveAs),
-            Some(widgets::MenuPick::Row(5)) => Some(LogoChoice::Clear),
-            Some(widgets::MenuPick::Row(6)) => Some(LogoChoice::Quit),
-            Some(widgets::MenuPick::Sub(index)) => recent.get(index).cloned().map(LogoChoice::Recent),
-            _ => None,
-        };
-        if let Some(choice) = choice {
-            events.push(ChatEvent::Logo(choice));
+        if widgets::menu_rows(ui, &[item("Quit", waits, false, false)]).is_some() {
+            events.push(ChatEvent::Logo(LogoChoice::Quit));
         }
     });
+}
+
+/// The project's name, centred at the top, which opens its menu.
+fn project_name(ui: &mut egui::Ui, rect: Rect, project: &mut ProjectMenu, events: &mut Vec<ChatEvent>) {
+    if project.name.is_empty() && !project.renaming {
+        return;
+    }
+    let center = pos2(rect.center().x, rect.top() + LOGO_CENTER);
+    if project.renaming {
+        let width = 240.0_f32.min(rect.width() - 24.0);
+        let field = Rect::from_center_size(center, vec2(width, 28.0));
+        let mut edit = ui.new_child(UiBuilder::new().max_rect(field));
+        let response = edit.add(
+            egui::TextEdit::singleline(&mut project.draft)
+                .id(egui::Id::new("project-rename"))
+                .hint_text("Project name")
+                .desired_width(width - 12.0)
+                .font(FontId::proportional(BODY)),
+        );
+        response.request_focus();
+        let enter = ui.input(|input| input.key_pressed(Key::Enter));
+        let escape = ui.input(|input| input.key_pressed(Key::Escape));
+        if enter {
+            events.push(ChatEvent::Renamed(project.draft.clone()));
+        } else if escape {
+            events.push(ChatEvent::CancelRename);
+        }
+        return;
+    }
+
+    let font = FontId::proportional(BODY);
+    let galley = ui.painter().layout_no_wrap(project.name.clone(), font, TEXT);
+    let chevron = pos2(center.x + galley.size().x / 2.0 + 12.0, center.y);
+    let hit = Rect::from_min_max(
+        pos2(center.x - galley.size().x / 2.0 - 8.0, center.y - 16.0),
+        pos2(chevron.x + 10.0, center.y + 16.0),
+    );
+    let response = ui
+        .interact(hit, egui::Id::new("project-menu"), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
+    if response.hovered() || open {
+        ui.painter().rect_filled(hit, 6.0, SELECTED);
+    }
+    ui.painter().galley(
+        pos2(center.x - galley.size().x / 2.0, center.y - galley.size().y / 2.0),
+        galley,
+        TEXT,
+    );
+    widgets::chevron(ui.painter(), chevron, MUTED, widgets::Scale(1.0));
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, project.name.as_str())
+    });
+
+    egui::Popup::menu(&response).show(|ui| project_menu(ui, project, events));
+}
+
+/// Rows under the name: the folders, then rename, switch, and new, then remove.
+fn project_menu(ui: &mut egui::Ui, project: &ProjectMenu, events: &mut Vec<ChatEvent>) {
+    let width = 220.0_f32;
+    for (index, folder) in project.folders.iter().enumerate() {
+        let name = Path::new(folder)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| folder.clone());
+        let (row, _) = ui.allocate_exact_size(vec2(width, 28.0), Sense::hover());
+        if ui.rect_contains_pointer(row) {
+            ui.painter().rect_filled(row, 4.0, SELECTED);
+        }
+        ui.painter().text(
+            pos2(row.left() + 10.0, row.center().y),
+            Align2::LEFT_CENTER,
+            name,
+            FontId::proportional(BODY),
+            TEXT,
+        );
+        let mark = Rect::from_center_size(pos2(row.right() - 16.0, row.center().y), vec2(18.0, 18.0));
+        let remove = ui
+            .interact(mark, egui::Id::new(("folder-remove", index)), Sense::click())
+            .on_hover_text("Remove");
+        let color = if remove.hovered() { toolbar::ICON_ACTIVE } else { MUTED };
+        toolbar::paint_icon(ui.painter(), mark.center(), "xmark", 12.0, color);
+        if remove.clicked() {
+            events.push(ChatEvent::Project(ProjectChoice::RemoveFolder(index)));
+            ui.close();
+        }
+    }
+    let rows = [
+        item("Add folder…", true, false, false),
+        item("Rename", true, false, true),
+        item("Switch", !project.others.is_empty(), true, false),
+        item("New Project", true, false, false),
+        item("Remove Project", true, false, true),
+    ];
+    // Switch is the row that opens the other projects.
+    let names: Vec<String> = project.others.iter().map(|(_, name)| name.clone()).collect();
+    let picked = widgets::menu_rows_with(ui, &rows, |index, ui| {
+        if index != 2 {
+            return None;
+        }
+        let items: Vec<widgets::MenuItem> = names.iter().map(|name| item(name, true, false, false)).collect();
+        widgets::menu_rows(ui, &items)
+    });
+    let choice = match picked {
+        Some(widgets::MenuPick::Row(0)) => Some(ProjectChoice::AddFolder),
+        Some(widgets::MenuPick::Row(1)) => Some(ProjectChoice::Rename),
+        Some(widgets::MenuPick::Row(3)) => Some(ProjectChoice::New),
+        Some(widgets::MenuPick::Row(4)) => Some(ProjectChoice::Remove),
+        Some(widgets::MenuPick::Sub(index)) => project.others.get(index).map(|(id, _)| ProjectChoice::Switch(id.clone())),
+        _ => None,
+    };
+    if let Some(choice) = choice {
+        events.push(ChatEvent::Project(choice));
+    }
 }
 
 fn item(label: &str, enabled: bool, submenu: bool, divider: bool) -> widgets::MenuItem<'_> {
@@ -231,8 +372,14 @@ fn item(label: &str, enabled: bool, submenu: bool, divider: bool) -> widgets::Me
     }
 }
 
-/// The input box at the panel's bottom. Returns its top.
-fn input_box(ui: &mut egui::Ui, rect: Rect, chat: &mut Chat, events: &mut Vec<ChatEvent>) -> f32 {
+/// The input box, at the bottom or in the middle. Returns its frame.
+fn input_box(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    chat: &mut Chat,
+    centered: bool,
+    events: &mut Vec<ChatEvent>,
+) -> Rect {
     let font = FontId::proportional(BODY);
     let left = rect.left() + SIDE;
     let right = rect.right() - SIDE;
@@ -267,7 +414,11 @@ fn input_box(ui: &mut egui::Ui, rect: Rect, chat: &mut Chat, events: &mut Vec<Ch
     };
 
     let height = BOX_TOP + chips_h + field_h + BOX_GAP + CONTROLS + BOX_BOTTOM;
-    let bottom = rect.bottom() - SIDE;
+    let bottom = if centered {
+        rect.center().y + height / 2.0
+    } else {
+        rect.bottom() - SIDE
+    };
     let frame = Rect::from_min_max(pos2(left, bottom - height), pos2(right, bottom));
     widgets::soft_shadow(ui.painter(), frame, BOX_RADIUS);
     widgets::outlined(ui.painter(), frame, BOX_RADIUS, Color32::WHITE, BORDER);
@@ -389,7 +540,7 @@ fn input_box(ui: &mut egui::Ui, rect: Rect, chat: &mut Chat, events: &mut Vec<Ch
             events.push(ChatEvent::Send);
         }
     }
-    frame.top()
+    frame
 }
 
 fn is_plain_enter(event: &Event) -> bool {

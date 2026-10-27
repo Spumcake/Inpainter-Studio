@@ -1,6 +1,6 @@
 # Inpainter Strategies
 
-Strategies are the assistant's skills about the workspace as a whole: how to use several of Inpainter's sub-applications together to solve a kind of problem. Each sub-application's own skills cover only its own work and stay with that sub-application. This repository holds the strategies, apart from Inpainter's code, so they can be refined as often as the work needs.
+Strategies are the assistant's skills about the work as a whole: how to use several of Inpainter's sub-applications together to solve a kind of problem. Each sub-application's own skills cover only its own work and stay with that sub-application. This repository holds the strategies, apart from Inpainter's code, so they can be refined as often as the work needs.
 
 ## Format
 

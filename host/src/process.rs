@@ -73,6 +73,9 @@ pub struct Declared {
     pub results: VecDeque<ToolResult>,
     /// Answers to `keep`: the tab, and its file or none when cancelled.
     pub kept: VecDeque<(String, Option<String>)>,
+    /// Every tab report, each as its tabs' ids and files, while the host
+    /// follows a quit. None when it is not following one.
+    pub tab_log: Option<Vec<Vec<(String, Option<String>, String)>>>,
 }
 
 /// The sub-application's process, or the record that it never started.
@@ -447,6 +450,14 @@ impl Running {
                 declared
                     .documents
                     .retain(|id, _| tabs.tabs.iter().any(|tab| tab.id == *id));
+                if let Some(log) = &mut declared.tab_log {
+                    log.push(
+                        tabs.tabs
+                            .iter()
+                            .map(|tab| (tab.id.clone(), tab.path.clone(), tab.label.clone()))
+                            .collect(),
+                    );
+                }
                 declared.tabs = Some(tabs);
             }
             AppMessage::Canvas(canvas) => declared.canvas = Some(canvas),

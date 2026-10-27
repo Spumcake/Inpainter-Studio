@@ -11,7 +11,7 @@ use crate::process::Running;
 use crate::route::{self, Routing};
 use crate::tablet::Tablet;
 use crate::tabs::{StripTab, TabEvent};
-use crate::workspace::{ModelChoice, Settings};
+use crate::workspace::{self, ModelChoice, Settings};
 use crate::{ask, grid, icons, panel, tabs, toolbar, widgets};
 use assistant::{Assistant, Command};
 use eframe::egui::{self, Color32, Event, Key, Rect};
@@ -19,6 +19,7 @@ use protocol::{Action, ContentsKind, FileKind, HostMessage, MenuEntry, PanelSide
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 mod flows;
 #[cfg(test)]
@@ -54,7 +55,17 @@ pub(crate) struct AppSpec {
     pub executable: Option<PathBuf>,
 }
 
-pub fn run(apps: Vec<Started>) -> eframe::Result<()> {
+/// The project open in this window. The host owns it; no sub-application sees it.
+struct Project {
+    id: String,
+    name: String,
+    /// Absolute paths, in the order the person attached them.
+    folders: Vec<String>,
+    /// The workspace is shown beside the conversation.
+    workspace_open: bool,
+}
+
+pub fn run(specs: Vec<AppSpec>) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Inpainter")
@@ -74,7 +85,7 @@ pub fn run(apps: Vec<Started>) -> eframe::Result<()> {
     eframe::run_native(
         "Inpainter",
         options,
-        Box::new(move |creation| Ok(Box::new(HostWindow::new(creation, apps)))),
+        Box::new(move |creation| Ok(Box::new(HostWindow::new(creation, specs)))),
     )
 }
 
@@ -89,8 +100,9 @@ struct HostWindow {
     /// The panel of a tab that declares the panel but no properties.
     panel_open: bool,
     viewport: [f64; 2],
-    /// Which sub-applications were told the contents area's size.
-    viewport_sent: Vec<bool>,
+    /// The contents size last sent to the sub-applications. Sent again when
+    /// the window's size changes, shown or hidden.
+    sent_viewport: Option<[f64; 2]>,
     /// File dialogs open in the real window. Frame tests answer them instead.
     native_dialogs: bool,
     /// Ctrl/Cmd+C, X, or V already arrived as a copy, cut, or paste event.
@@ -99,32 +111,49 @@ struct HostWindow {
     cut_press: bool,
     paste_press: bool,
     ctx: egui::Context,
-    /// The sub-applications started at launch, which Clear Workspace starts again.
+    /// The sub-applications installed at launch. Every project starts all of them.
     launch: Vec<AppSpec>,
     /// The contents and panel each sub-application declared for its first
     /// tab, by id, so its tabs keep them when it is started again to
-    /// restore a workspace and reports its tabs only later.
+    /// restore a project and reports its tabs only later.
     kinds: HashMap<String, (Option<ContentsKind>, bool)>,
     assistant: Assistant,
     chat: Chat,
     routing: Routing,
     settings: Settings,
+    /// Where projects are kept. None in frame tests, which never write one.
+    data: Option<PathBuf>,
+    project: Option<Project>,
+    /// The name is being typed.
+    renaming: bool,
+    rename_draft: String,
+    /// When the project file was last written, so a quiet change waits.
+    last_project_write: Option<Instant>,
+    /// The change a write failed on. It is tried again only after a new one.
+    failed_signature: Option<String>,
     flows: flows::Flows,
     /// The model list has been asked for.
     listed: bool,
+    /// The gray bar, last drawn, so a check can press it.
+    bar_rect: Rect,
+    /// Other projects for the menu. Read when the list changes, not each frame.
+    listed_projects: Option<Vec<(String, String)>>,
     /// Paths that frame tests give in place of file dialogs.
     #[cfg(test)]
     scripted_paths: std::collections::VecDeque<PathBuf>,
 }
 
 impl HostWindow {
-    fn new(creation: &eframe::CreationContext<'_>, apps: Vec<Started>) -> Self {
+    fn new(creation: &eframe::CreationContext<'_>, specs: Vec<AppSpec>) -> Self {
         // Safety: `on_exit` disconnects before eframe closes the display.
         let tablet = unsafe { Tablet::connect(creation) };
-        let mut window = Self::with_apps(&creation.egui_ctx, apps, tablet);
+        let mut window = Self::with_apps(&creation.egui_ctx, Vec::new(), tablet);
+        window.launch = specs;
         window.native_dialogs = true;
+        window.data = workspace::data_folder();
         window.settings = Settings::load(Settings::default_file());
         window.chat.model = window.settings.model.clone();
+        window.open_current();
         window
     }
 
@@ -139,7 +168,6 @@ impl HostWindow {
         for app in &apps {
             app.running.attach(ctx);
         }
-        let count = apps.len();
         let launch = apps
             .iter()
             .map(|started| AppSpec {
@@ -159,7 +187,7 @@ impl HostWindow {
             shown: None,
             panel_open: false,
             viewport: [0.0, 0.0],
-            viewport_sent: vec![false; count],
+            sent_viewport: None,
             native_dialogs: false,
             copy_press: false,
             cut_press: false,
@@ -171,8 +199,16 @@ impl HostWindow {
             chat: Chat::default(),
             routing: Routing::default(),
             settings: Settings::load(None),
+            data: None,
+            project: None,
+            renaming: false,
+            rename_draft: String::new(),
+            last_project_write: None,
+            failed_signature: None,
             flows: flows::Flows::default(),
             listed: false,
+            bar_rect: Rect::NOTHING,
+            listed_projects: None,
             #[cfg(test)]
             scripted_paths: std::collections::VecDeque::new(),
         }
@@ -241,6 +277,11 @@ impl HostWindow {
     fn send(&mut self, app: usize, message: HostMessage) {
         if self.locked() && waits_while_locked(&message) {
             return;
+        }
+        match &message {
+            HostMessage::FileResult { path: Some(path), .. } => self.note_save_path(app, path.clone()),
+            HostMessage::FileResult { path: None, .. } => self.note_save_cancelled(),
+            _ => {}
         }
         if let Some(started) = self.apps.get_mut(app) {
             started.running.send(&message);
@@ -340,7 +381,6 @@ impl HostWindow {
                         request.filter.as_ref(),
                     ),
                 };
-                self.flows.dialog_closed = Some(std::time::Instant::now());
                 self.send(
                     app,
                     HostMessage::FileResult {
@@ -352,8 +392,8 @@ impl HostWindow {
         }
     }
 
-    /// The one question shown: the host's own about the workspace, or else
-    /// the selected sub-application's first.
+    /// The one question shown: the host's own, or else the selected
+    /// sub-application's first.
     fn show_asks(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if self.show_question(ctx, frame) {
             return;
@@ -492,7 +532,7 @@ impl eframe::App for HostWindow {
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
         self.note_kinds();
         self.pump_assistant();
-        self.workspace_frame(&ctx, frame);
+        self.project_frame(&ctx, frame);
         self.resolve_dialogs(frame);
 
         let app = self.selected.min(self.apps.len().saturating_sub(1));
@@ -514,19 +554,53 @@ impl eframe::App for HostWindow {
         let mut chosen: Vec<Action> = Vec::new();
         let mut sent: Vec<Sent> = Vec::new();
         let mut talk: Vec<ChatEvent> = Vec::new();
+        let workspace_open = self.workspace_shown();
+        let mut menu = chat::ProjectMenu {
+            name: self
+                .project
+                .as_ref()
+                .map(|project| project.name.clone())
+                .unwrap_or_default(),
+            folders: self
+                .project
+                .as_ref()
+                .map(|project| project.folders.clone())
+                .unwrap_or_default(),
+            others: self.other_projects(),
+            renaming: self.renaming,
+            draft: self.rename_draft.clone(),
+        };
+        let mut bar_pressed = false;
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
                 let full = ui.max_rect();
-                let left = chat::width(full.width());
+                let left = if workspace_open {
+                    chat::width(full.width())
+                } else {
+                    full.width()
+                };
                 let chat_rect =
                     Rect::from_min_max(full.min, egui::pos2(full.left() + left, full.bottom()));
                 let shell = Rect::from_min_max(egui::pos2(chat_rect.right(), full.top()), full.max);
-                talk = chat::show(ui, chat_rect, &mut self.chat, &self.settings.recent);
-                ui.scope_builder(egui::UiBuilder::new().max_rect(shell), |ui| {
-                    self.shell(ui, &ctx, app, tab, dismissing, &mut chosen, &mut sent);
-                });
+                talk = chat::show(ui, chat_rect, &mut self.chat, &mut menu, !workspace_open);
+                if workspace_open {
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(shell), |ui| {
+                        self.shell(ui, &ctx, app, tab.clone(), dismissing, &mut chosen, &mut sent);
+                    });
+                } else {
+                    self.viewport = hidden_viewport(full, self.panel_width(app, tab.as_deref()));
+                }
+                let edge = if workspace_open { chat_rect.right() } else { full.right() };
+                let (rect, pressed) = workspace_bar(ui, edge, full);
+                self.bar_rect = rect;
+                bar_pressed = pressed;
             });
+        self.rename_draft = menu.draft;
+        if bar_pressed {
+            self.toggle_workspace();
+        }
+        self.publish_viewport();
 
         for action in chosen {
             self.run_action(&action);
@@ -557,6 +631,34 @@ impl eframe::App for HostWindow {
         }
         self.show_asks(&ctx, frame);
     }
+}
+
+/// The tab strip and the toolbar, which the contents area sits under.
+const WORKSPACE_CHROME: f32 = 90.0;
+/// The short gray bar that shows or hides the workspace.
+const BAR_GRAY: Color32 = Color32::from_rgb(186, 188, 192);
+
+/// The contents size the workspace would have if it were shown: the window
+/// minus the conversation column, this chrome, and an open properties panel.
+fn hidden_viewport(window: Rect, panel: f32) -> [f64; 2] {
+    let column = chat::width(window.width());
+    let shell_w = (window.width() - column).max(0.0);
+    let width = (shell_w - panel).max(0.0);
+    let height = (window.height() - WORKSPACE_CHROME).max(0.0);
+    [f64::from(width), f64::from(height)]
+}
+
+/// A short gray bar on `edge_x`, vertically centered. Returns its rect and
+/// whether it was clicked.
+fn workspace_bar(ui: &egui::Ui, edge_x: f32, bounds: Rect) -> (Rect, bool) {
+    let center = egui::pos2(edge_x - 8.0, bounds.center().y);
+    let bar = Rect::from_center_size(center, egui::vec2(5.0, 56.0));
+    let hit = bar.expand2(egui::vec2(8.0, 6.0));
+    ui.painter().rect_filled(bar, 3.0, BAR_GRAY);
+    let clicked = ui
+        .interact(hit, egui::Id::new("workspace-bar"), egui::Sense::click())
+        .clicked();
+    (bar, clicked)
 }
 
 /// While the assistant works, these wait: commands, gestures, selections,
@@ -675,6 +777,7 @@ impl HostWindow {
 
         let full = ui.available_rect_before_wrap();
         let Some(tab) = tab else {
+            self.viewport = [f64::from(full.width()), f64::from(full.height())];
             ui.painter().rect_filled(full, 0.0, CANVAS);
             return;
         };
@@ -709,14 +812,6 @@ impl HostWindow {
         };
         let rect = Rect::from_min_max(full.min, egui::pos2(right, full.bottom()));
         self.viewport = [f64::from(rect.width()), f64::from(rect.height())];
-        if self.viewport[0] > 1.0
-            && self.viewport[1] > 1.0
-            && !self.viewport_sent.get(app).copied().unwrap_or(true)
-        {
-            self.viewport_sent[app] = true;
-            let viewport = self.viewport;
-            self.send(app, HostMessage::Viewport { viewport });
-        }
 
         match self.contents(app, &tab) {
             Some(ContentsKind::Canvas) => self.show_canvas(ui, app, &tab, rect, dismissing),
@@ -909,7 +1004,94 @@ impl HostWindow {
                 self.settings.choose_model(choice);
             }
             ChatEvent::Logo(choice) => self.logo(choice, ctx, frame),
+            ChatEvent::Project(choice) => self.project_menu(choice, frame),
+            ChatEvent::Renamed(name) => self.commit_rename(name),
+            ChatEvent::CancelRename => self.renaming = false,
         }
+    }
+
+    /// The workspace is shown. With no project, the shell stays up, which is
+    /// how the frame checks draw it.
+    fn workspace_shown(&self) -> bool {
+        self.project
+            .as_ref()
+            .map(|project| project.workspace_open)
+            .unwrap_or(true)
+    }
+
+    /// Other projects, newest change first, for the menu's switch list.
+    /// The files are read when the list is first needed and after a project
+    /// opens, not on every frame.
+    fn other_projects(&mut self) -> Vec<(String, String)> {
+        if let Some(listed) = &self.listed_projects {
+            return listed.clone();
+        }
+        let listed = self.read_other_projects();
+        self.listed_projects = Some(listed.clone());
+        listed
+    }
+
+    fn read_other_projects(&self) -> Vec<(String, String)> {
+        let Some(data) = &self.data else {
+            return Vec::new();
+        };
+        let current = self.project.as_ref().map(|project| project.id.as_str());
+        workspace::list_projects(data)
+            .into_iter()
+            .filter(|listed| Some(listed.id.as_str()) != current)
+            .map(|listed| (listed.id, listed.file.name))
+            .collect()
+    }
+
+    /// The properties panel's width when the workspace is shown and it is open.
+    fn panel_width(&self, app: usize, tab: Option<&str>) -> f32 {
+        let Some(tab) = tab else {
+            return 0.0;
+        };
+        if !self.has_panel(app, tab) {
+            return 0.0;
+        }
+        let open = self
+            .apps
+            .get(app)
+            .and_then(|started| started.running.declared.properties.as_ref())
+            .map_or(self.panel_open, |properties| properties.open);
+        if open { panel::WIDTH } else { 0.0 }
+    }
+
+    /// Sends the contents size to every sub-application when it changes.
+    fn publish_viewport(&mut self) {
+        let viewport = self.viewport;
+        if viewport[0] <= 1.0 || viewport[1] <= 1.0 {
+            return;
+        }
+        let changed = self.sent_viewport.is_none_or(|sent| {
+            (sent[0] - viewport[0]).abs() > 0.5 || (sent[1] - viewport[1]).abs() > 0.5
+        });
+        if !changed {
+            return;
+        }
+        self.sent_viewport = Some(viewport);
+        for app in 0..self.apps.len() {
+            self.send(app, HostMessage::Viewport { viewport });
+        }
+    }
+
+    /// Keeps the running tabs as a project in `data`, without restarting them.
+    #[cfg(test)]
+    fn remember_in(&mut self, data: PathBuf) {
+        let _ = std::fs::create_dir_all(&data);
+        self.data = Some(data.clone());
+        self.settings = Settings::load(Some(data.join("settings.json")));
+        let (id, file) = workspace::create_project(&data).expect("a project");
+        self.project = Some(Project {
+            id: id.clone(),
+            name: file.name,
+            folders: file.folders,
+            workspace_open: true,
+        });
+        self.settings.choose_project(&id);
+        self.write_project(true);
     }
 
     /// The path a frame test gives in place of a file dialog.
@@ -1188,13 +1370,6 @@ mod tests {
             output.textures_delta.clear();
         }
 
-        /// A row of the logo menu.
-        fn choose(&mut self, choice: crate::chat::LogoChoice) {
-            let Self { ctx, app, frame, .. } = self;
-            app.logo(choice, &ctx.clone(), frame);
-            self.step(Vec::new());
-        }
-
         /// Frames until `done`, waiting for the assistant's thread.
         fn until(&mut self, done: impl Fn(&HostWindow) -> bool) {
             for _ in 0..200 {
@@ -1387,10 +1562,10 @@ mod tests {
         folder
     }
 
-    /// Catches a workspace that keeps its own copy of the work: the file
-    /// holds the tab's path, label, and camera, and none of the document.
+    /// Catches a project that keeps its own copy of the work: the file holds
+    /// the tab's path, label, and camera, and none of the document.
     #[test]
-    fn a_saved_workspace_holds_paths_not_work() {
+    fn a_project_holds_paths_not_work() {
         let mut harness = Harness::with(with_a_document());
         let mut tool = entry(assistant::Role::Tool, "");
         tool.tool = Some("fixture__edit__grow".into());
@@ -1401,13 +1576,12 @@ mod tests {
             entry(assistant::Role::Assistant, "Done."),
         ];
         let folder = scratch("save");
-        harness.app.scripted_paths.push_back(folder.join("mine"));
-        harness.choose(crate::chat::LogoChoice::SaveAs);
-        harness.step(Vec::new());
+        harness.app.remember_in(folder.clone());
 
-        let path = folder.join("mine.inpainter");
-        let text = std::fs::read_to_string(&path).expect("the workspace was written");
-        let file = crate::workspace::WorkspaceFile::parse(&text).unwrap();
+        let id = harness.app.project.as_ref().unwrap().id.clone();
+        let path = crate::workspace::project_path(&folder, &id);
+        let text = std::fs::read_to_string(&path).expect("the project was written");
+        let file = crate::workspace::ProjectFile::parse(&text).unwrap();
         assert_eq!(file.tabs.len(), 1);
         assert_eq!(file.tabs[0].app, "fixture");
         assert_eq!(file.tabs[0].path.as_deref(), Some("/somewhere/notes.file"));
@@ -1416,60 +1590,68 @@ mod tests {
         assert_eq!(file.selected, Some(0));
         assert_eq!(file.conversation, harness.app.chat.conversation);
         for word in ["Private Words", "nodes", "format_version", "\"41\"", "selection"] {
-            assert!(!text.contains(word), "the workspace holds {word:?}:\n{text}");
+            assert!(!text.contains(word), "the project holds {word:?}:\n{text}");
         }
-        assert_eq!(harness.app.flows.path.as_deref(), Some(path.as_path()));
-        assert!(!harness.app.workspace_dirty(), "a saved workspace has no changes");
+        assert!(!text.contains("\"input\"") && !text.contains("\"output\""));
+        assert!(!harness.app.project_dirty(), "a written project has no changes");
         std::fs::remove_dir_all(folder).unwrap();
     }
 
-    /// Catches a fresh workspace that asks before closing, and a changed one
-    /// that does not.
+    /// Closing does not ask to keep the project. The quit flow starts, and
+    /// the project is written when the sub-applications are ready.
     #[test]
-    fn only_a_changed_workspace_asks_before_closing() {
+    fn closing_writes_the_project_without_asking() {
         let mut fresh = Harness::new();
         fresh.step(Vec::new());
         fresh.close();
         assert!(fresh.app.flows.question_shown().is_none());
         assert!(fresh.app.flows.closing_started(), "the quit flow did not start");
 
-        let mut changed = Harness::new();
-        changed.step(Vec::new());
+        let mut changed = Harness::with(with_a_document());
+        let folder = scratch("close");
+        changed.app.remember_in(folder.clone());
         changed
             .app
             .chat
             .conversation
             .push(entry(assistant::Role::Person, "hello"));
         changed.close();
-        assert_eq!(
-            changed.app.flows.question_shown().as_deref(),
-            Some("Save this workspace?")
-        );
-        assert!(!changed.app.flows.closing_started());
+        assert!(changed.app.flows.question_shown().is_none());
+        assert!(changed.app.flows.closing_started());
+        changed.app.apps[0].running.declared.quit_ready = true;
+        changed.step(Vec::new());
+        let id = changed.app.project.as_ref().unwrap().id.clone();
+        let text = std::fs::read_to_string(crate::workspace::project_path(&folder, &id)).unwrap();
+        assert!(text.contains("hello"), "closing did not keep the conversation");
+        std::fs::remove_dir_all(folder).unwrap();
     }
 
-    /// Catches a reopened workspace that loses its conversation, or that
+    /// Catches a reopened project that loses its conversation, or that
     /// silently drops a tab whose sub-application is not installed.
     #[test]
-    fn opening_a_workspace_restores_the_conversation_and_says_what_was_left_out() {
+    fn opening_a_project_restores_the_conversation_and_says_what_was_left_out() {
         let folder = scratch("open");
-        let path = folder.join("old.inpainter");
-        let file = crate::workspace::WorkspaceFile {
+        let mut harness = Harness::new();
+        harness.step(Vec::new());
+        harness.app.remember_in(folder.clone());
+        let file = crate::workspace::ProjectFile {
             version: crate::workspace::VERSION,
-            tabs: vec![crate::workspace::WorkspaceTab {
+            name: "Older".into(),
+            folders: Vec::new(),
+            tabs: vec![crate::workspace::ProjectTab {
                 app: "no-such-app".into(),
                 path: None,
                 label: "Gone".into(),
                 camera: None,
             }],
             selected: Some(0),
+            workspace_open: false,
             conversation: vec![entry(assistant::Role::Person, "hello")],
         };
-        file.write(&path).unwrap();
+        file.write(&crate::workspace::project_path(&folder, "older")).unwrap();
 
-        let mut harness = Harness::new();
-        harness.step(Vec::new());
-        harness.choose(crate::chat::LogoChoice::Recent(path.clone()));
+        let Harness { app, frame, .. } = &mut harness;
+        app.project_menu(crate::chat::ProjectChoice::Switch("older".into()), frame);
         assert!(harness.app.flows.closing_started());
         // The sub-application has resolved its unsaved work.
         harness.app.apps[0].running.declared.quit_ready = true;
@@ -1478,7 +1660,7 @@ mod tests {
         let left_out = &harness.app.chat.conversation[1];
         assert_eq!(left_out.role, assistant::Role::Note);
         assert!(left_out.text.contains("Gone"), "{}", left_out.text);
-        assert_eq!(harness.app.flows.path.as_deref(), Some(path.as_path()));
+        assert_eq!(harness.app.project.as_ref().map(|project| project.id.as_str()), Some("older"));
         std::fs::remove_dir_all(folder).unwrap();
     }
 

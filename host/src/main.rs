@@ -18,19 +18,26 @@ mod window;
 mod workspace;
 
 fn main() -> eframe::Result<()> {
-    let requested = apps::requested();
-    let started = apps::choose(apps::discover(), &requested)
+    // The lock is taken here, outside the window, so the window's own checks
+    // never take it. The system releases it when this process ends.
+    let _lock = match workspace::acquire_lock() {
+        Ok(lock) => lock,
+        Err(fail) => {
+            if workspace::second_start_message(fail).is_some() {
+                dialogs::already_open();
+            } else {
+                dialogs::unavailable();
+            }
+            return Ok(());
+        }
+    };
+    let specs = apps::launch()
         .into_iter()
-        .map(|app| window::Started {
-            running: process::Running::start(
-                &app.executable,
-                apps::data_dir(&app.manifest.id),
-                false,
-            ),
+        .map(|app| window::AppSpec {
             id: app.manifest.id,
             name: app.manifest.name,
             executable: Some(app.executable),
         })
         .collect();
-    window::run(started)
+    window::run(specs)
 }

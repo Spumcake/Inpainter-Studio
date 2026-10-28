@@ -349,6 +349,10 @@ pub(crate) struct Settings {
     /// The current project's id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// The conversation panel's width beside the workspace, as the person
+    /// last dragged it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_width: Option<f32>,
     /// Where these settings live. None in frame tests, which never write.
     #[serde(skip)]
     file: Option<PathBuf>,
@@ -390,6 +394,7 @@ impl Settings {
             let fresh = Self::load(self.file.clone());
             self.project = fresh.project;
             self.model = fresh.model;
+            self.chat_width = fresh.chat_width;
         }
         change(self);
         self.write();
@@ -397,6 +402,10 @@ impl Settings {
 
     pub(crate) fn choose_model(&mut self, choice: ModelChoice) {
         self.update(|settings| settings.model = Some(choice));
+    }
+
+    pub(crate) fn choose_chat_width(&mut self, width: f32) {
+        self.update(|settings| settings.chat_width = Some(width));
     }
 
     pub(crate) fn choose_project(&mut self, id: &str) {

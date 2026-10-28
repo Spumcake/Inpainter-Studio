@@ -21,18 +21,25 @@ const HAIRLINE: Color32 = Color32::from_rgb(236, 237, 240);
 const SEPARATOR: Color32 = Color32::from_rgb(222, 225, 229);
 
 /// Every toolbar item is this tall and paints its content centered in it,
-/// so the whole row shares one vertical center.
-const ROW: f32 = 40.0;
+/// so the whole row shares one vertical center. As the owner set on
+/// 2026-10-28, the toolbar is a tenth smaller than the references show: its
+/// row, buttons, separators, and swatches shrink with its icons.
+const ROW: f32 = 36.0;
+/// Space above and below the row.
+const ROW_MARGIN: i8 = 5;
+/// The toolbar's whole height.
+pub(crate) const HEIGHT: f32 = ROW + 2.0 * ROW_MARGIN as f32;
 /// A toolbar button's width. Its hover plate is a square two points narrower,
 /// so neighboring plates keep a sliver of toolbar between them.
-pub(crate) const BUTTON_W: f32 = 36.0;
-const ICON_POINTS: f32 = 20.0;
-/// A swatch's width: room for the active swatch's ring, 28 points across.
-pub(crate) const SWATCH_W: f32 = 28.0;
+pub(crate) const BUTTON_W: f32 = 32.0;
+/// A toolbar icon's size.
+const ICON_POINTS: f32 = 18.0;
+/// A swatch's width: room for the active swatch's ring, 24.5 points across.
+pub(crate) const SWATCH_W: f32 = 26.0;
 /// A divider between toolbar groups, with its space on either side.
-pub(crate) const SEPARATOR_W: f32 = 13.0;
-/// Space before the first swatch, so the active swatch's ring, 28.5 points
-/// across, is not clipped at the row's left edge.
+pub(crate) const SEPARATOR_W: f32 = 11.0;
+/// Space before the first swatch, so the active swatch's ring is not
+/// clipped at the row's left edge.
 pub(crate) const SWATCH_INSET: f32 = 2.0;
 
 /// Inter's roman variable font. Weight only: this file has no italic axis.
@@ -310,7 +317,7 @@ pub(crate) fn show(ui: &mut egui::Ui, toolbar: Option<&Toolbar>) -> Vec<Action> 
     let toolbar = toolbar.unwrap_or(&empty);
     let bar = egui::Frame::new()
         .fill(Color32::WHITE)
-        .inner_margin(egui::Margin::symmetric(12, 5))
+        .inner_margin(egui::Margin::symmetric(12, ROW_MARGIN))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.set_height(ROW);
@@ -537,13 +544,13 @@ fn swatch_dot(
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(vec2(SWATCH_W, ROW), Sense::click_and_drag());
     let center = rect.center();
-    let fill = if selected { 10.5 } else { 9.0 };
+    let fill = if selected { 9.0 } else { 8.5 };
     let color = swatch_color(rgb, muted);
     if selected {
         // The ring takes the swatch's own color, with a sliver of toolbar
         // between it and the fill.
         ui.painter()
-            .circle_stroke(center, 13.5, Stroke::new(1.5, color));
+            .circle_stroke(center, 11.5, Stroke::new(1.5, color));
     }
     ui.painter().circle_filled(center, fill, color);
     // A near-white swatch, such as a text background, would vanish into the

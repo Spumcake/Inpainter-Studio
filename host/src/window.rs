@@ -687,7 +687,7 @@ impl eframe::App for HostWindow {
             .show(ui, |ui| {
                 let full = ui.max_rect();
                 let left = if workspace_open {
-                    chat::width(full.width())
+                    chat::width(full.width(), self.settings.chat_width)
                 } else {
                     full.width()
                 };
@@ -710,9 +710,12 @@ impl eframe::App for HostWindow {
                         self.shell(ui, &ctx, app, tab.clone(), dismissing, &mut chosen, &mut sent);
                     });
                 } else {
-                    self.viewport = hidden_viewport(full, self.panel_width(app, tab.as_deref()));
+                    self.viewport = hidden_viewport(full, self.settings.chat_width, self.panel_width(app, tab.as_deref()));
                 }
                 let edge = if workspace_open { chat_rect.right() } else { full.right() };
+                if workspace_open {
+                    self.drag_panel_edge(ui, edge, full);
+                }
                 let (rect, pressed) = workspace_bar(ui, edge, full);
                 self.bar_rect = rect;
                 bar_pressed = pressed;
@@ -1668,7 +1671,9 @@ impl HostWindow {
 }
 
 /// The tab strip and the toolbar, which the contents area sits under.
-const WORKSPACE_CHROME: f32 = 90.0;
+const WORKSPACE_CHROME: f32 = TAB_STRIP + crate::toolbar::HEIGHT;
+/// The tab strip's height.
+const TAB_STRIP: f32 = 40.0;
 /// A notebook: gray around a white column at most this wide, a margin for
 /// the bar and the "[n]", the gap between cells, and the active cell's blue.
 const NOTEBOOK_COLUMN: f32 = 880.0;
@@ -1683,12 +1688,34 @@ const BAR_GRAY: Color32 = Color32::from_rgb(186, 188, 192);
 
 /// The contents size the workspace would have if it were shown: the window
 /// minus the conversation column, this chrome, and an open properties panel.
-fn hidden_viewport(window: Rect, panel: f32) -> [f64; 2] {
-    let column = chat::width(window.width());
+fn hidden_viewport(window: Rect, chosen: Option<f32>, panel: f32) -> [f64; 2] {
+    let column = chat::width(window.width(), chosen);
     let shell_w = (window.width() - column).max(0.0);
     let width = (shell_w - panel).max(0.0);
     let height = (window.height() - WORKSPACE_CHROME).max(0.0);
     [f64::from(width), f64::from(height)]
+}
+
+impl HostWindow {
+    /// The panel's right edge, dragged to make the panel a little wider or
+    /// narrower. The width is remembered when the drag ends.
+    fn drag_panel_edge(&mut self, ui: &egui::Ui, edge_x: f32, bounds: Rect) {
+        let zone = Rect::from_min_max(egui::pos2(edge_x - 3.0, bounds.top()), egui::pos2(edge_x + 3.0, bounds.bottom()));
+        let response = ui
+            .interact(zone, egui::Id::new("chat-panel-edge"), egui::Sense::drag())
+            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+        if response.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            let now = chat::width(bounds.width(), self.settings.chat_width);
+            let wanted = (now + response.drag_delta().x).clamp(chat::PANEL_MIN, chat::PANEL_MAX);
+            self.settings.chat_width = Some(wanted);
+        }
+        if response.drag_stopped()
+            && let Some(width) = self.settings.chat_width
+        {
+            self.settings.choose_chat_width(width);
+        }
+    }
 }
 
 /// A short gray bar on `edge_x`, vertically centered. Returns its rect and
@@ -2473,10 +2500,10 @@ mod tests {
     }
 
     /// The panel tab's center: 18 points below the canvas top, which is under
-    /// the 40-point tab bar and the 50-point toolbar, and 11 points in from
-    /// the canvas's right edge.
+    /// the tab bar and the toolbar, and 11 points in from the canvas's right
+    /// edge.
     fn tab_center(canvas_right: f32) -> Pos2 {
-        Pos2::new(canvas_right - 11.0, 40.0 + 50.0 + 18.0 + 20.0)
+        Pos2::new(canvas_right - 11.0, super::WORKSPACE_CHROME + 18.0 + 20.0)
     }
 
     fn key_press(key: Key) -> Event {
@@ -2516,13 +2543,29 @@ mod tests {
         assert!(!harness.app.panel_open);
     }
 
+    /// Catches a conversation panel that cannot be resized, or one dragged
+    /// past its limits: its edge drags it a little wider, and the
+    /// workspace narrows by as much.
+    #[test]
+    fn the_panel_edge_drags_a_little() {
+        let mut harness = Harness::new();
+        let wide = harness.app.viewport[0];
+        let edge = crate::chat::width(SCREEN.x, None);
+        harness.drag(egui::pos2(edge, 200.0), egui::pos2(edge + 60.0, 200.0));
+        assert_eq!(harness.app.settings.chat_width, Some(edge + 60.0));
+        assert!((harness.app.viewport[0] - (wide - 60.0)).abs() < 1.0, "the workspace did not narrow");
+        let edge = edge + 60.0;
+        harness.drag(egui::pos2(edge, 200.0), egui::pos2(edge + 400.0, 200.0));
+        assert_eq!(harness.app.settings.chat_width, Some(crate::chat::PANEL_MAX));
+    }
+
     #[test]
     fn f4_opens_the_panel_and_narrows_the_canvas() {
         let mut harness = Harness::new();
         let wide = harness.app.viewport[0];
         assert!(!harness.app.panel_open);
         // The chat panel takes a quarter of the window on the left.
-        let shell = f64::from(SCREEN.x - crate::chat::width(SCREEN.x));
+        let shell = f64::from(SCREEN.x - crate::chat::width(SCREEN.x, None));
         assert!((wide - shell).abs() < 1.0, "canvas width {wide}");
 
         harness.step(vec![key_press(Key::F4)]);

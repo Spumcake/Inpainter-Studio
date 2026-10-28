@@ -4,46 +4,89 @@
 //! `.project/projects/inpainter-studio/documents/guides/conversation-guide.md`.
 
 use eframe::egui::{Color32, FontFamily, FontId};
+use std::cell::Cell;
 
 use crate::icons::{INTER_BOLD, INTER_BOLD_ITALIC, INTER_ITALIC};
 
+thread_local! {
+    /// Whether the conversation is being drawn as the panel beside the
+    /// workspace, where its text is a step smaller.
+    static PANEL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Draws in the panel's smaller sizes until the returned guard is dropped,
+/// when `panel` is true. Only the conversation, as the panel, uses it, as
+/// the owner set on 2026-10-28.
+pub(crate) fn panel_sizes(panel: bool) -> PanelSizes {
+    PanelSizes(PANEL.with(|cell| cell.replace(panel)))
+}
+
+pub(crate) struct PanelSizes(bool);
+
+impl Drop for PanelSizes {
+    fn drop(&mut self) {
+        PANEL.with(|cell| cell.set(self.0));
+    }
+}
+
+fn pick(full: f32, panel: f32) -> f32 {
+    if PANEL.with(Cell::get) { panel } else { full }
+}
+
 /// Prose, the person's messages, and a cell's result: Inter 14 on 21, a
 /// step down from the research's 15 so the conversation sits with the rest
-/// of Studio, as the owner set on 2026-10-28.
-pub(crate) const BODY: f32 = 14.0;
-pub(crate) const BODY_LINE: f32 = 21.0;
-/// Tool rows, actions, the turn's time line, captions: Inter 12 on 16.
-pub(crate) const SMALL: f32 = 12.0;
-pub(crate) const SMALL_LINE: f32 = 16.0;
-/// Inline code, code blocks, and a cell's prompt: Hack 13 on 20.
-pub(crate) const CODE: f32 = 13.0;
-pub(crate) const CODE_LINE: f32 = 20.0;
-/// A cell's kind and the project's name: Inter SemiBold 14.
-pub(crate) const TITLE: f32 = 14.0;
+/// of Studio, as the owner set on 2026-10-28. In the panel, 13 on 20.
+pub(crate) fn body_size() -> f32 {
+    pick(14.0, 13.0)
+}
+pub(crate) fn body_line() -> f32 {
+    pick(21.0, 20.0)
+}
+/// Tool rows, actions, the turn's time line, captions: Inter 12 on 16; in
+/// the panel, 11.5 on 15.
+pub(crate) fn small_size() -> f32 {
+    pick(12.0, 11.5)
+}
+pub(crate) fn small_line() -> f32 {
+    pick(16.0, 15.0)
+}
+/// Inline code, code blocks, and a cell's prompt: Hack 13 on 20; in the
+/// panel, 12 on 19.
+pub(crate) fn code_size() -> f32 {
+    pick(13.0, 12.0)
+}
+pub(crate) fn code_line() -> f32 {
+    pick(20.0, 19.0)
+}
+/// A cell's kind and the project's name: Inter SemiBold 14; in the panel, 13.
+pub(crate) fn title_size() -> f32 {
+    pick(14.0, 13.0)
+}
 
-/// A heading's size and line: close to body, as the guide sets.
+/// A heading's size and line: close to body, as the guide sets, and a step
+/// smaller in the panel.
 pub(crate) fn heading(level: usize) -> (f32, f32) {
     match level {
-        1 => (16.5, 23.0),
-        2 => (15.5, 21.0),
-        _ => (14.0, 21.0),
+        1 => (pick(16.5, 15.5), pick(23.0, 22.0)),
+        2 => (pick(15.5, 14.5), pick(21.0, 20.0)),
+        _ => (body_size(), body_line()),
     }
 }
 
 pub(crate) fn body() -> FontId {
-    FontId::proportional(BODY)
+    FontId::proportional(body_size())
 }
 
 pub(crate) fn small() -> FontId {
-    FontId::proportional(SMALL)
+    FontId::proportional(small_size())
 }
 
 pub(crate) fn code() -> FontId {
-    FontId::monospace(CODE)
+    FontId::monospace(code_size())
 }
 
 pub(crate) fn title() -> FontId {
-    crate::widgets::semibold(TITLE)
+    crate::widgets::semibold(title_size())
 }
 
 /// Inter in the weight and slant asked for.

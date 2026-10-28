@@ -25,7 +25,6 @@ const LOGO_CENTER: f32 = 6.0 + 17.0;
 const LOGO: f32 = 26.0;
 /// The space between the panel's edge and its contents.
 const SIDE: f32 = 14.0;
-const BODY: f32 = ts::BODY;
 /// Space inside a message's bubble or card.
 const BUBBLE_X: f32 = 12.0;
 const BUBBLE_Y: f32 = 9.0;
@@ -136,11 +135,20 @@ pub(crate) enum ChatEvent {
 
 /// The panel's width beside the workspace. It does not follow the window's
 /// width, as the owner set on 2026-10-28; only a window too narrow for it
-/// takes some back, so the workspace keeps half.
+/// takes some back, so the workspace keeps half. The person can drag its
+/// edge a little either way, as the owner set the same day.
 pub(crate) const PANEL_WIDTH: f32 = 420.0;
+pub(crate) const PANEL_MIN: f32 = 360.0;
+pub(crate) const PANEL_MAX: f32 = 520.0;
 
-pub(crate) fn width(window: f32) -> f32 {
-    PANEL_WIDTH.min((window * 0.5).round())
+/// The panel's width in a window `window` wide, for the width the person
+/// chose, if any.
+pub(crate) fn width(window: f32, chosen: Option<f32>) -> f32 {
+    chosen
+        .unwrap_or(PANEL_WIDTH)
+        .clamp(PANEL_MIN, PANEL_MAX)
+        .round()
+        .min((window * 0.5).round())
 }
 
 
@@ -161,6 +169,8 @@ pub(crate) fn show(
     cell_actions: &mut Vec<crate::cells::CardAction>,
 ) -> Vec<ChatEvent> {
     let mut events = Vec::new();
+    // As the panel, the conversation's text is a step smaller.
+    let _sizes = ts::panel_sizes(!fills);
     let painter = ui.painter().with_clip_rect(rect);
     painter.rect_filled(rect, 0.0, Color32::WHITE);
     if !fills {
@@ -369,7 +379,7 @@ fn input_box(
     centered: bool,
     events: &mut Vec<ChatEvent>,
 ) -> Rect {
-    let font = FontId::proportional(BODY);
+    let font = ts::body();
     // The box spans the conversation's column, edge to edge with the messages.
     let left = rect.left();
     let right = rect.right();
@@ -613,7 +623,7 @@ fn model_picker(
         .show(|ui| {
             ui.set_width(300.0);
             let note = |ui: &mut egui::Ui, text: &str| {
-                ui.add(egui::Label::new(egui::RichText::new(text).color(MUTED).size(BODY)).wrap());
+                ui.add(egui::Label::new(egui::RichText::new(text).color(MUTED).size(ts::body_size())).wrap());
             };
             match &chat.models {
                 None => note(ui, "Finding the models…"),
@@ -887,7 +897,7 @@ fn body_job(text: &str, color: Color32, wrap: f32) -> egui::text::LayoutJob {
         egui::TextFormat {
             font_id: ts::body(),
             color,
-            line_height: Some(ts::BODY_LINE),
+            line_height: Some(ts::body_line()),
             ..Default::default()
         },
     );
@@ -904,7 +914,7 @@ fn prose(ui: &mut egui::Ui, text: &str, width: f32, caret: bool) {
     laid.paint(&painter, row.min);
     if caret && let Some(end) = laid.end {
         let at = row.min + end.to_vec2();
-        painter.rect_filled(Rect::from_min_size(pos2(at.x + 2.0, at.y + 3.0), vec2(2.0, ts::BODY_LINE - 6.0)), 0.0, ts::TEXT);
+        painter.rect_filled(Rect::from_min_size(pos2(at.x + 2.0, at.y + 3.0), vec2(2.0, ts::body_line() - 6.0)), 0.0, ts::TEXT);
     }
 }
 
@@ -928,7 +938,7 @@ fn cell_card(
 /// One tool call: a Small row with its mark and what it did.
 fn tool_row(ui: &mut egui::Ui, entry: &Entry, width: f32) {
     let painter = ui.painter().clone();
-    let (row, _) = ui.allocate_exact_size(vec2(width, ts::SMALL_LINE), Sense::hover());
+    let (row, _) = ui.allocate_exact_size(vec2(width, ts::small_line()), Sense::hover());
     let (icon, color) = match entry.ok {
         Some(true) => ("check", ts::MUTED),
         Some(false) => ("xmark", ts::FAILED),
@@ -968,7 +978,7 @@ fn small_job(text: &str, color: Color32, wrap: f32) -> egui::text::LayoutJob {
         egui::TextFormat {
             font_id: ts::small(),
             color,
-            line_height: Some(ts::SMALL_LINE),
+            line_height: Some(ts::small_line()),
             ..Default::default()
         },
     );
@@ -988,7 +998,7 @@ fn action_word(ui: &mut egui::Ui, rect: Rect, word: &str, salt: &str) -> egui::R
 /// seconds the time so far.
 fn working_row(ui: &mut egui::Ui, started: Option<u64>, width: f32) {
     let painter = ui.painter().clone();
-    let (row, _) = ui.allocate_exact_size(vec2(width, ts::SMALL_LINE), Sense::hover());
+    let (row, _) = ui.allocate_exact_size(vec2(width, ts::small_line()), Sense::hover());
     let time = ui.input(|input| input.time);
     for dot in 0..3 {
         let phase = ((time * 3.0 - dot as f64 * 0.5).sin() * 0.5 + 0.5) as f32;
@@ -1004,7 +1014,7 @@ fn working_row(ui: &mut egui::Ui, started: Option<u64>, width: f32) {
 /// A muted Small caption, such as "Queued", under a message.
 fn caption(ui: &mut egui::Ui, words: &str, width: f32, right: bool) {
     ui.add_space(4.0);
-    let (row, _) = ui.allocate_exact_size(vec2(width, ts::SMALL_LINE), Sense::hover());
+    let (row, _) = ui.allocate_exact_size(vec2(width, ts::small_line()), Sense::hover());
     let (x, align) = if right { (row.right(), Align2::RIGHT_CENTER) } else { (row.left(), Align2::LEFT_CENTER) };
     ui.painter().text(pos2(x, row.center().y), align, words, ts::small(), ts::MUTED);
 }
@@ -1025,7 +1035,7 @@ struct Footer {
 /// when; its steps, folded; then Copy and Retry.
 fn footer(ui: &mut egui::Ui, width: f32, footer: Footer, events: &mut Vec<ChatEvent>) {
     let painter = ui.painter().clone();
-    let (row, _) = ui.allocate_exact_size(vec2(width, ts::SMALL_LINE), Sense::hover());
+    let (row, _) = ui.allocate_exact_size(vec2(width, ts::small_line()), Sense::hover());
     let lead = if footer.stopped {
         String::from("Stopped")
     } else if footer.failed {
@@ -1038,11 +1048,11 @@ fn footer(ui: &mut egui::Ui, width: f32, footer: Footer, events: &mut Vec<ChatEv
         words.push_str(&format!(" · {} step{}", footer.steps, if footer.steps == 1 { "" } else { "s" }));
     }
     let galley = painter.layout_no_wrap(words, ts::small(), ts::MUTED);
-    let line = Rect::from_min_size(row.min, vec2(galley.size().x, ts::SMALL_LINE));
+    let line = Rect::from_min_size(row.min, vec2(galley.size().x, ts::small_line()));
     painter.galley(pos2(row.left(), row.center().y - galley.size().y / 2.0), galley, ts::MUTED);
     let mut x = line.right() + 6.0;
     if footer.steps > 0 {
-        let chevron = Rect::from_min_size(pos2(x, row.top()), vec2(16.0, ts::SMALL_LINE));
+        let chevron = Rect::from_min_size(pos2(x, row.top()), vec2(16.0, ts::small_line()));
         let icon = if footer.open { "nav-arrow-up" } else { "nav-arrow-down" };
         toolbar::paint_icon(&painter, chevron.center(), icon, 12.0, ts::MUTED);
         let toggle = ui.interact(line.union(chevron), footer.open_id.with("toggle"), Sense::click());
@@ -1055,14 +1065,14 @@ fn footer(ui: &mut egui::Ui, width: f32, footer: Footer, events: &mut Vec<ChatEv
     // 2026-10-28, so they are always where the person looks for them.
     x += 10.0;
     if !footer.copy.trim().is_empty() {
-        let copy = Rect::from_min_size(pos2(x, row.top()), vec2(34.0, ts::SMALL_LINE));
+        let copy = Rect::from_min_size(pos2(x, row.top()), vec2(34.0, ts::small_line()));
         if action_word(ui, copy, "Copy", "turn-copy").clicked() {
             ui.ctx().copy_text(footer.copy.clone());
         }
         x = copy.right() + 10.0;
     }
     if let Some(retry) = footer.retry {
-        let again = Rect::from_min_size(pos2(x, row.top()), vec2(36.0, ts::SMALL_LINE));
+        let again = Rect::from_min_size(pos2(x, row.top()), vec2(36.0, ts::small_line()));
         if action_word(ui, again, "Retry", "turn-retry").clicked() {
             events.push(ChatEvent::Retry(retry));
         }
@@ -1198,9 +1208,13 @@ mod tests {
     /// Catches a panel that grows and shrinks with the window: it keeps one
     /// width, and gives some back only when the window is too narrow.
     fn the_panel_keeps_its_width() {
-        assert_eq!(width(1600.0), PANEL_WIDTH);
-        assert_eq!(width(2400.0), PANEL_WIDTH);
-        assert_eq!(width(700.0), 350.0);
+        assert_eq!(width(1600.0, None), PANEL_WIDTH);
+        assert_eq!(width(2400.0, None), PANEL_WIDTH);
+        assert_eq!(width(700.0, None), 350.0);
+        // Dragged only a little either way.
+        assert_eq!(width(1600.0, Some(480.0)), 480.0);
+        assert_eq!(width(1600.0, Some(900.0)), PANEL_MAX);
+        assert_eq!(width(1600.0, Some(100.0)), PANEL_MIN);
         assert_eq!(short_name("Anthropic: Claude Sonnet 4.5"), "Claude Sonnet 4.5");
     }
 

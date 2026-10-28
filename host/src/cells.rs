@@ -213,7 +213,7 @@ pub(crate) fn prompt_job(text: &str, width: f32, markdown: bool) -> egui::text::
         let mut format = egui::TextFormat {
             font_id: ts::code(),
             color: TEXT,
-            line_height: Some(ts::CODE_LINE),
+            line_height: Some(ts::code_line()),
             ..Default::default()
         };
         match token {
@@ -252,7 +252,7 @@ fn layout(ui: &egui::Ui, cell: &Cell, draft: &str, live: Option<&str>, running: 
     let painter = ui.painter();
     let markdown = cell.kind == protocol::MARKDOWN_KIND;
     let text = painter.layout_job(prompt_job(draft, inner_w - GUTTER - 12.0, markdown)).size().y;
-    let input = text.max(ts::CODE_LINE * MIN_LINES as f32) + 24.0;
+    let input = text.max(ts::code_line() * MIN_LINES as f32) + 24.0;
     let output = output_text(cell, live, running).map(|(text, color)| crate::markdown::lay_out(painter, &text, color, inner_w));
     let below = output.as_ref().map_or(0.0, |output| output.height + 2.0 * OUTPUT_PAD);
     Layout {

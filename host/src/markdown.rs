@@ -178,7 +178,7 @@ pub(crate) fn lay_out(painter: &Painter, text: &str, color: Color32, width: f32)
                 y += h;
             }
             Block::Paragraph(words) => {
-                let galley = painter.layout_job(inline(words, color, ts::BODY, ts::BODY_LINE, false, width));
+                let galley = painter.layout_job(inline(words, color, ts::body_size(), ts::body_line(), false, width));
                 end = Some(caret_end(&galley, vec2(0.0, y)));
                 let h = galley.size().y;
                 pieces.push(Piece::Text(vec2(0.0, y), galley));
@@ -186,14 +186,14 @@ pub(crate) fn lay_out(painter: &Painter, text: &str, color: Color32, width: f32)
             }
             Block::Item(depth, number, words) => {
                 let indent = ts::LIST_INDENT * (*depth as f32 + 1.0);
-                let galley = painter.layout_job(inline(words, color, ts::BODY, ts::BODY_LINE, false, width - indent));
+                let galley = painter.layout_job(inline(words, color, ts::body_size(), ts::body_line(), false, width - indent));
                 match number {
                     Some(number) => {
-                        let mark = painter.layout_job(inline(&format!("{number}."), color, ts::BODY, ts::BODY_LINE, false, 60.0));
+                        let mark = painter.layout_job(inline(&format!("{number}."), color, ts::body_size(), ts::body_line(), false, 60.0));
                         let at = vec2(indent - 6.0 - mark.size().x, y);
                         pieces.push(Piece::Text(at, mark));
                     }
-                    None => pieces.push(Piece::Disc(pos2(indent - 10.0, y + ts::BODY_LINE / 2.0))),
+                    None => pieces.push(Piece::Disc(pos2(indent - 10.0, y + ts::body_line() / 2.0))),
                 }
                 end = Some(caret_end(&galley, vec2(indent, y)));
                 let h = galley.size().y;
@@ -201,7 +201,7 @@ pub(crate) fn lay_out(painter: &Painter, text: &str, color: Color32, width: f32)
                 y += h;
             }
             Block::Quote(words) => {
-                let galley = painter.layout_job(inline(words, ts::MUTED, ts::BODY, ts::BODY_LINE, false, width - 14.0));
+                let galley = painter.layout_job(inline(words, ts::MUTED, ts::body_size(), ts::body_line(), false, width - 14.0));
                 let h = galley.size().y;
                 pieces.push(Piece::Bar(Rect::from_min_size(pos2(0.0, y), vec2(3.0, h))));
                 end = Some(caret_end(&galley, vec2(14.0, y)));
@@ -209,7 +209,7 @@ pub(crate) fn lay_out(painter: &Painter, text: &str, color: Color32, width: f32)
                 y += h;
             }
             Block::Code(code) => {
-                let mut job = LayoutJob::single_section(code.clone(), format(ts::code(), color, ts::CODE_LINE, Color32::TRANSPARENT));
+                let mut job = LayoutJob::single_section(code.clone(), format(ts::code(), color, ts::code_line(), Color32::TRANSPARENT));
                 job.wrap.max_width = width - 2.0 * ts::CODE_PAD;
                 let galley = painter.layout_job(job);
                 let h = galley.size().y + 2.0 * ts::CODE_PAD;
@@ -241,7 +241,7 @@ fn table(painter: &Painter, rows: &[Vec<String>], color: Color32, width: f32, to
     for (row_index, row) in rows.iter().enumerate() {
         for (index, cell) in row.iter().enumerate() {
             // The header row is bold, so it is measured bold.
-            let w = painter.layout_job(inline(cell, color, ts::BODY, ts::BODY_LINE, row_index == 0, f32::INFINITY)).size().x + 2.0 * pad + 1.0;
+            let w = painter.layout_job(inline(cell, color, ts::body_size(), ts::body_line(), row_index == 0, f32::INFINITY)).size().x + 2.0 * pad + 1.0;
             natural[index] = natural[index].max(w);
         }
     }
@@ -257,7 +257,7 @@ fn table(painter: &Painter, rows: &[Vec<String>], color: Color32, width: f32, to
         let mut laid = Vec::new();
         for (column, cell) in row.iter().enumerate() {
             let w = widths.get(column).copied().unwrap_or(32.0);
-            let galley = painter.layout_job(inline(cell, color, ts::BODY, ts::BODY_LINE, header, w - 2.0 * pad));
+            let galley = painter.layout_job(inline(cell, color, ts::body_size(), ts::body_line(), header, w - 2.0 * pad));
             tallest = tallest.max(galley.size().y);
             laid.push((x + pad, galley));
             x += w;
@@ -594,12 +594,12 @@ mod tests {
     /// its code size, and the marks are gone.
     #[test]
     fn inline_text_uses_the_type_scale() {
-        let job = inline("He **answers** a *ship* with `code`.", ts::TEXT, ts::BODY, ts::BODY_LINE, false, 400.0);
+        let job = inline("He **answers** a *ship* with `code`.", ts::TEXT, ts::body_size(), ts::body_line(), false, 400.0);
         assert!(!job.text.contains('*') && !job.text.contains('`'));
         for section in &job.sections {
             let size = section.format.font_id.size;
-            assert!(size == ts::BODY || size == ts::CODE, "an off-scale size {size}");
-            assert_eq!(section.format.line_height, Some(ts::BODY_LINE));
+            assert!(size == ts::body_size() || size == ts::code_size(), "an off-scale size {size}");
+            assert_eq!(section.format.line_height, Some(ts::body_line()));
         }
     }
 }

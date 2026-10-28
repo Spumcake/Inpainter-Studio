@@ -33,7 +33,44 @@ pub struct Cell {
     /// A sentence when the cell failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Every run, oldest first. A run always exists: nothing removes one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub versions: Vec<CellVersion>,
+    /// The version the cell shows. The top-level `endpoint`, `model`,
+    /// `output`, `state`, and `error` always equal it; only `input` may
+    /// differ, as an edit not yet run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<usize>,
 }
+
+/// One run of a cell, kept for good.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CellVersion {
+    /// Unique everywhere, so a later version can name one run as context.
+    pub id: String,
+    /// The prompt that ran.
+    #[serde(default)]
+    pub input: Vec<CellPart>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub output: Vec<CellPart>,
+    /// Done, failed, or stopped.
+    pub state: CellState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Seconds since the Unix epoch.
+    #[serde(default)]
+    pub time: u64,
+}
+
+/// The kind of a cell that sends its prompt to a language model.
+pub const TEXT_KIND: &str = "text";
+/// The kind of a cell of Markdown, which runs by showing its source as rich
+/// text, calls nothing, and has no versions.
+pub const MARKDOWN_KIND: &str = "markdown";
 
 /// One part of a cell's prompt or result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -76,7 +113,46 @@ impl Cell {
             output: Vec::new(),
             state: CellState::Idle,
             error: None,
+            versions: Vec::new(),
+            current: None,
         }
+    }
+
+    /// A Markdown cell showing its source.
+    pub fn markdown(id: impl Into<String>, source: impl Into<String>) -> Self {
+        let mut cell = Self::text(id, source);
+        cell.kind = String::from(MARKDOWN_KIND);
+        cell
+    }
+
+    /// Makes the top level agree with the current version, as the rule
+    /// between the two copies says. A current index past the last version
+    /// points at the last one.
+    pub fn agree(&mut self) {
+        if self.versions.is_empty() {
+            self.current = None;
+            return;
+        }
+        let index = self.current.unwrap_or(self.versions.len() - 1).min(self.versions.len() - 1);
+        self.current = Some(index);
+        let version = &self.versions[index];
+        self.endpoint = version.endpoint.clone();
+        self.model = version.model.clone();
+        self.output = version.output.clone();
+        self.state = version.state;
+        self.error = version.error.clone();
+    }
+
+    /// Makes version `index` current: its prompt and result both show,
+    /// replacing an edit not yet run.
+    pub fn show_version(&mut self, index: usize) -> bool {
+        let Some(version) = self.versions.get(index) else {
+            return false;
+        };
+        self.input = version.input.clone();
+        self.current = Some(index);
+        self.agree();
+        true
     }
 
     /// The text parts of the prompt, joined.

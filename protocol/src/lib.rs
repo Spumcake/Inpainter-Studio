@@ -178,10 +178,15 @@ pub enum HostMessage {
         cell: String,
         input: Vec<CellPart>,
     },
-    /// A run finished, failed, or was stopped. One undo step.
+    /// A run finished, failed, or was stopped. The owner keeps it as a new
+    /// version, made from `input`, the prompt that actually ran. A run is
+    /// never an undo step. A Markdown cell's run has no input or output: it
+    /// shows the cell rendered and makes no version.
     CellResult {
         tab: String,
         cell: String,
+        #[serde(default)]
+        input: Vec<CellPart>,
         endpoint: String,
         model: String,
         state: CellState,
@@ -189,14 +194,25 @@ pub enum HostMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
-    /// A dragged cell, already given a new id and `from` by the host.
+    /// A dragged cell, already given a new id and `from` by the host, or,
+    /// with no cell, an empty one the owner makes, of the kind it would add.
     InsertCell {
         tab: String,
         index: usize,
-        cell: Cell,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cell: Option<Cell>,
     },
     /// The cell the person selected.
     SelectCell { tab: String, cell: String },
+    /// Make that version of the cell current. One undo step.
+    SetVersion { tab: String, cell: String, index: usize },
+    /// Move the cell to that position. One undo step.
+    MoveCell { tab: String, cell: String, to: usize },
+    /// Delete the cell. One undo step. Deleting the last cell leaves an
+    /// empty one.
+    DeleteCell { tab: String, cell: String },
+    /// A Markdown cell shows its source again. Not an undo step.
+    ShowSource { tab: String, cell: String },
     /// Asks whether `path` is this application's own work.
     Claim { id: String, path: String },
 }
@@ -652,6 +668,17 @@ mod tests {
             }],
             state: CellState::Done,
             error: None,
+            versions: vec![CellVersion {
+                id: "33333333-3333-4333-8333-333333333333".into(),
+                input: vec![CellPart::Text { text: "Describe this.".into() }],
+                endpoint: Some("openrouter".into()),
+                model: Some("stand-in/model".into()),
+                output: vec![CellPart::Path { path: "/tmp/out.png".into(), media_type: "image/png".into() }],
+                state: CellState::Done,
+                error: None,
+                time: 1_793_146_000,
+            }],
+            current: Some(0),
         };
         let unknown = Cell {
             id: "22222222-2222-4222-8222-222222222222".into(),
@@ -663,6 +690,8 @@ mod tests {
             output: Vec::new(),
             state: CellState::Idle,
             error: None,
+            versions: Vec::new(),
+            current: None,
         };
         round_trip_app(AppMessage::Cells {
             tab: "book".into(),
@@ -672,11 +701,17 @@ mod tests {
         round_trip_host(HostMessage::InsertCell {
             tab: "book".into(),
             index: 1,
-            cell: unknown,
+            cell: Some(unknown),
         });
+        round_trip_host(HostMessage::InsertCell { tab: "book".into(), index: 2, cell: None });
+        round_trip_host(HostMessage::SetVersion { tab: "book".into(), cell: path.id.clone(), index: 0 });
+        round_trip_host(HostMessage::MoveCell { tab: "book".into(), cell: path.id.clone(), to: 1 });
+        round_trip_host(HostMessage::DeleteCell { tab: "book".into(), cell: path.id.clone() });
+        round_trip_host(HostMessage::ShowSource { tab: "book".into(), cell: path.id.clone() });
         round_trip_host(HostMessage::CellResult {
             tab: "book".into(),
             cell: path.id.clone(),
+            input: path.input.clone(),
             endpoint: "openrouter".into(),
             model: "stand-in/model".into(),
             state: CellState::Failed,

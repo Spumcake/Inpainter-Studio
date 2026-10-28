@@ -39,8 +39,13 @@ pub(crate) const SWATCH_INSET: f32 = 2.0;
 const INTER: &[u8] = include_bytes!("../assets/fonts/Inter-Variable.ttf");
 /// Inter's italic variable font. Italic and bold italic are this file at two weights.
 const INTER_ITALIC_FONT: &[u8] = include_bytes!("../assets/fonts/Inter-Italic-Variable.ttf");
+/// Google's monochrome Noto Emoji, a variable font by weight, for emoji
+/// newer than egui's own emoji face knows.
+const NOTO_EMOJI: &[u8] = include_bytes!("../assets/fonts/NotoEmoji-Variable.ttf");
+const EMOJI: &str = "Noto Emoji";
+const EMOJI_BOLD: &str = "Noto Emoji Bold";
 
-fn inter_weight(bytes: &'static [u8], weight: f32) -> egui::FontData {
+fn at_weight(bytes: &'static [u8], weight: f32) -> egui::FontData {
     let mut data = egui::FontData::from_static(bytes);
     data.tweak.coords = egui::epaint::text::VariationCoords::new([(b"wght", weight)]);
     data
@@ -55,17 +60,17 @@ fn install_face(fonts: &mut egui::FontDefinitions, name: &str, data: egui::FontD
 
 pub(crate) fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    install_face(&mut fonts, icons::INTER, inter_weight(INTER, 400.0));
-    install_face(&mut fonts, icons::INTER_BOLD, inter_weight(INTER, 700.0));
+    install_face(&mut fonts, icons::INTER, at_weight(INTER, 400.0));
+    install_face(&mut fonts, icons::INTER_BOLD, at_weight(INTER, 700.0));
     install_face(
         &mut fonts,
         icons::INTER_ITALIC,
-        inter_weight(INTER_ITALIC_FONT, 400.0),
+        at_weight(INTER_ITALIC_FONT, 400.0),
     );
     install_face(
         &mut fonts,
         icons::INTER_BOLD_ITALIC,
-        inter_weight(INTER_ITALIC_FONT, 700.0),
+        at_weight(INTER_ITALIC_FONT, 700.0),
     );
     fonts
         .families
@@ -74,7 +79,7 @@ pub(crate) fn install_fonts(ctx: &egui::Context) {
         .insert(0, icons::INTER.into());
     fonts.font_data.insert(
         widgets::SEMIBOLD.into(),
-        Arc::new(inter_weight(INTER, 600.0)),
+        Arc::new(at_weight(INTER, 600.0)),
     );
     fonts.families.insert(
         FontFamily::Name(widgets::SEMIBOLD.into()),
@@ -90,6 +95,30 @@ pub(crate) fn install_fonts(ctx: &egui::Context) {
             .entry(egui::FontFamily::Name(font.family.into()))
             .or_default()
             .insert(0, font.family.to_string());
+    }
+    // Every face falls back to Noto Emoji, at the face's weight, then to
+    // egui's own emoji faces, or emoji draw as "?".
+    fonts.font_data.insert(EMOJI.into(), Arc::new(at_weight(NOTO_EMOJI, 400.0)));
+    fonts.font_data.insert(EMOJI_BOLD.into(), Arc::new(at_weight(NOTO_EMOJI, 700.0)));
+    let older: Vec<String> = ["NotoEmoji-Regular", "emoji-icon-font"]
+        .into_iter()
+        .filter(|name| fonts.font_data.contains_key(*name))
+        .map(String::from)
+        .collect();
+    for (family, emoji) in [
+        (FontFamily::Proportional, EMOJI),
+        (FontFamily::Monospace, EMOJI),
+        (FontFamily::Name(icons::INTER.into()), EMOJI),
+        (FontFamily::Name(icons::INTER_ITALIC.into()), EMOJI),
+        (FontFamily::Name(icons::INTER_BOLD.into()), EMOJI_BOLD),
+        (FontFamily::Name(icons::INTER_BOLD_ITALIC.into()), EMOJI_BOLD),
+        (FontFamily::Name(widgets::SEMIBOLD.into()), EMOJI_BOLD),
+    ] {
+        if let Some(faces) = fonts.families.get_mut(&family) {
+            faces.retain(|face| !older.contains(face));
+            faces.push(emoji.to_string());
+            faces.extend(older.iter().cloned());
+        }
     }
     ctx.set_fonts(fonts);
 }
@@ -254,7 +283,7 @@ pub(crate) fn glyph_button(
     }
 }
 
-fn icon_button(
+pub(crate) fn icon_button(
     ui: &mut egui::Ui,
     name: &str,
     tip: Option<&str>,
@@ -542,6 +571,29 @@ fn context_menu(
     rows: &[MenuEntry],
     chosen: &mut Vec<Action>,
 ) {
+    // A menu with no icon shows its label as text in a bordered box, a
+    // dropdown such as a notebook's cell kind.
+    if icon.is_empty() {
+        let font = egui::FontId::proportional(13.0);
+        let text_w = ui.painter().layout_no_wrap(label.to_string(), font.clone(), widgets::TEXT).size().x;
+        let (rect, response) = ui.allocate_exact_size(vec2(text_w + 46.0, ROW), Sense::click());
+        let field = Rect::from_center_size(rect.center(), vec2(rect.width() - 4.0, ROW - 10.0));
+        let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
+        let color = if !enabled { ICON_QUIET } else if open || response.hovered() { ICON_ACTIVE } else { ICON };
+        widgets::outlined(ui.painter(), field, 6.0, Color32::WHITE, widgets::BORDER);
+        ui.painter().text(pos2(field.left() + 12.0, field.center().y), egui::Align2::LEFT_CENTER, label, font, widgets::TEXT);
+        paint_icon(ui.painter(), pos2(field.right() - 14.0, field.center().y), CHEVRON_ICON, 12.0, color);
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, enabled, label));
+        if !enabled {
+            return;
+        }
+        egui::Popup::menu(&response).show(|ui| {
+            if let Some(action) = widgets::entry_rows(ui, rows).and_then(|row| row.action.clone()) {
+                chosen.push(action);
+            }
+        });
+        return;
+    }
     let (rect, response) =
         ui.allocate_exact_size(vec2(BUTTON_W + CHEVRON_W, ROW), Sense::click_and_drag());
     let side = BUTTON_W - 2.0;

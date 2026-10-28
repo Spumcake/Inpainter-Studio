@@ -276,7 +276,11 @@ impl Server {
             HostMessage::EditCell { .. }
             | HostMessage::CellResult { .. }
             | HostMessage::InsertCell { .. }
-            | HostMessage::SelectCell { .. } => {}
+            | HostMessage::SelectCell { .. }
+            | HostMessage::SetVersion { .. }
+            | HostMessage::MoveCell { .. }
+            | HostMessage::DeleteCell { .. }
+            | HostMessage::ShowSource { .. } => {}
         }
         self.session.poll_recovery(Instant::now());
         self.session.publish_emergency();

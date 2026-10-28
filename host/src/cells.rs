@@ -22,6 +22,10 @@ pub(crate) enum CardAction {
     Select(String),
     /// The person started dragging this cell.
     Drag(Cell),
+    /// The card's "…" was clicked, at this place.
+    More(String, Rect),
+    /// A rendered Markdown cell was double-clicked: show its source.
+    ShowSource(String),
 }
 
 pub(crate) enum Piece {
@@ -41,6 +45,9 @@ pub(crate) struct Run {
     /// The assistant call this conversation cell answers, when it has one.
     pub call: Option<String>,
     pub model: String,
+    /// The prompt as it was when the run began: the version the run makes
+    /// holds this, whatever is typed meanwhile.
+    pub prompt: String,
     pub text: String,
     pub rx: Receiver<Piece>,
     /// Set when the run has reported its end and the host has answered it.
@@ -58,6 +65,14 @@ pub(crate) struct Board {
     pub card_rect: Option<Rect>,
     /// The cells area last drawn, so a check can drop on it.
     pub drop_rect: Option<Rect>,
+    /// Each notebook card last drawn, by cell id, so a check can press its
+    /// buttons.
+    pub cards: Vec<(String, Rect)>,
+    /// The cell drawn with the blue border last frame, if any.
+    pub bordered: Option<String>,
+    /// The open cell menu's buttons last frame, by name, so a check can
+    /// press them.
+    pub menu_buttons: Vec<(&'static str, Rect)>,
 }
 
 impl Default for Board {
@@ -68,6 +83,9 @@ impl Default for Board {
             runs: Vec::new(),
             card_rect: None,
             drop_rect: None,
+            cards: Vec::new(),
+            bordered: None,
+            menu_buttons: Vec::new(),
         }
     }
 }
@@ -140,7 +158,22 @@ fn stream_into(base: String, key: String, model: String, prompt: String, tx: Sen
 /// named it on 2026-10-27; anything else is the kind as stored, including a
 /// kind this build does not run.
 pub(crate) fn kind_label(kind: &str) -> &str {
-    if kind == "text" { "LLM" } else { kind }
+    match kind {
+        protocol::TEXT_KIND => "LLM",
+        protocol::MARKDOWN_KIND => "Markdown",
+        other => other,
+    }
+}
+
+/// Kinds this build can run: an LLM cell calls its model; a Markdown cell
+/// shows its source rendered, calling nothing.
+pub(crate) fn runs(kind: &str) -> bool {
+    kind == protocol::TEXT_KIND || kind == protocol::MARKDOWN_KIND
+}
+
+/// A Markdown cell that has run shows as rendered text, not a card.
+pub(crate) fn rendered(cell: &Cell) -> bool {
+    cell.kind == protocol::MARKDOWN_KIND && cell.state == CellState::Done
 }
 
 const PAD: f32 = 16.0;
@@ -166,30 +199,59 @@ struct Layout {
 /// shares its line's baseline, right-aligned to `right`, with its line's top
 /// at `top`.
 fn number_at(painter: &egui::Painter, right: f32, top: f32, number: usize) {
-    let mut job = prompt_job(&number.to_string(), f32::INFINITY);
+    let mut job = prompt_job(&number.to_string(), f32::INFINITY, false);
     job.sections[0].format.color = MUTED;
     let galley = painter.layout_job(job);
     painter.galley(pos2(right - galley.size().x, top), galley, MUTED);
 }
 
 /// The prompt laid out as the text box shows it: Hack 13 on 20, wrapped.
-pub(crate) fn prompt_job(text: &str, width: f32) -> egui::text::LayoutJob {
-    let mut job = egui::text::LayoutJob::single_section(
-        text.to_string(),
-        egui::TextFormat {
+/// A Markdown cell's source is coloured as Jupyter colours it.
+pub(crate) fn prompt_job(text: &str, width: f32, markdown: bool) -> egui::text::LayoutJob {
+    let format = |token: crate::markdown::Token| {
+        use crate::markdown::Token;
+        let mut format = egui::TextFormat {
             font_id: ts::code(),
             color: TEXT,
             line_height: Some(ts::CODE_LINE),
             ..Default::default()
-        },
-    );
+        };
+        match token {
+            Token::Plain => {}
+            // No face draws these; drawn tiny and clear, they take no room
+            // and the cursor still counts them.
+            Token::Hidden => {
+                format.font_id.size = 0.01;
+                format.color = Color32::TRANSPARENT;
+            }
+            Token::Link => {
+                format.color = crate::markdown::token_color(token);
+                format.underline = egui::Stroke::new(1.0, format.color);
+            }
+            _ => format.color = crate::markdown::token_color(token),
+        }
+        format
+    };
+    let mut job = egui::text::LayoutJob::default();
+    let spans = if markdown {
+        crate::markdown::source_tokens(text)
+    } else {
+        crate::markdown::source_tokens_plain(text)
+    };
+    for (range, token) in spans {
+        job.append(&text[range], 0.0, format(token));
+    }
+    if job.sections.is_empty() {
+        job.append("", 0.0, format(crate::markdown::Token::Plain));
+    }
     job.wrap.max_width = width;
     job
 }
 
 fn layout(ui: &egui::Ui, cell: &Cell, draft: &str, live: Option<&str>, running: bool, inner_w: f32) -> Layout {
     let painter = ui.painter();
-    let text = painter.layout_job(prompt_job(draft, inner_w - GUTTER - 12.0)).size().y;
+    let markdown = cell.kind == protocol::MARKDOWN_KIND;
+    let text = painter.layout_job(prompt_job(draft, inner_w - GUTTER - 12.0, markdown)).size().y;
     let input = text.max(ts::CODE_LINE * MIN_LINES as f32) + 24.0;
     let output = output_text(cell, live, running).map(|(text, color)| crate::markdown::lay_out(painter, &text, color, inner_w));
     let below = output.as_ref().map_or(0.0, |output| output.height + 2.0 * OUTPUT_PAD);
@@ -288,31 +350,27 @@ pub(crate) fn paint_card(
             MUTED,
         );
     }
-    let more = Rect::from_center_size(pos2(card.right() - PAD - 8.0, mid), vec2(22.0, 22.0));
+    let more = more_button(card);
     toolbar::paint_icon(&painter, more.center(), "more-horiz", 16.0, TEXT);
+    if ui.interact(more, egui::Id::new(("cell-more", &cell.id)), Sense::click()).clicked() {
+        actions.push(CardAction::More(cell.id.clone(), more));
+    }
     let menu = Rect::from_min_size(pos2(more.left() - 10.0 - BUTTON_H, mid - BUTTON_H / 2.0), vec2(BUTTON_H, BUTTON_H));
     widgets::outlined(&painter, menu, 7.0, Color32::WHITE, BORDER);
     toolbar::paint_icon(&painter, menu.center(), "nav-arrow-down", 14.0, TEXT);
 
-    let can_run = cell.kind == "text" && !draft.trim().is_empty() && !running;
+    let can_run = runs(&cell.kind) && !draft.trim().is_empty() && !running;
     let enabled = running || can_run;
-    let (icon, word) = if running { ("square", "Stop") } else { ("flash", "Generate") };
+    // Every cell runs from play, as the owner set on 2026-10-28; while it
+    // runs, play is stop.
+    let (icon, word) = if running { ("square", "Stop") } else { ("play", "Run") };
     let ink = if enabled { TEXT } else { DISABLED };
-    let word_w = painter.layout_no_wrap(word.into(), ts::small(), ink).size().x;
-    let button = Rect::from_min_size(
-        pos2(menu.left() - 6.0 - (word_w + 44.0), mid - BUTTON_H / 2.0),
-        vec2(word_w + 44.0, BUTTON_H),
-    );
+    let button = run_button(card);
     widgets::outlined(&painter, button, 7.0, Color32::WHITE, BORDER);
-    toolbar::paint_icon(&painter, pos2(button.left() + 18.0, mid), icon, 15.0, ink);
-    painter.text(
-        pos2(button.left() + 32.0, mid),
-        Align2::LEFT_CENTER,
-        word,
-        ts::small(),
-        ink,
-    );
-    let pressed = ui.interact(button, egui::Id::new(("cell-generate", &cell.id)), Sense::click());
+    toolbar::paint_icon(&painter, button.center(), icon, 15.0, ink);
+    let pressed = ui
+        .interact(button, egui::Id::new(("cell-generate", &cell.id)), Sense::click())
+        .on_hover_text(word);
     if pressed.clicked() && enabled {
         actions.push(if running {
             CardAction::Stop(cell.id.clone())
@@ -333,7 +391,8 @@ pub(crate) fn paint_card(
     // Input: the prompt, as a text box with line numbers.
     let input = Rect::from_min_size(pos2(card.left() + PAD, header_line + 12.0), vec2(inner_w, plan.input - 24.0));
     let text_left = input.left() + GUTTER + 12.0;
-    let numbers = painter.layout_job(prompt_job(draft, input.right() - text_left));
+    let markdown = cell.kind == protocol::MARKDOWN_KIND;
+    let numbers = painter.layout_job(prompt_job(draft, input.right() - text_left, markdown));
     let mut line = 1;
     let mut starts = true;
     for row in &numbers.rows {
@@ -353,12 +412,12 @@ pub(crate) fn paint_card(
         egui::TextEdit::multiline(draft)
             .id(egui::Id::new(("cell-prompt", &cell.id)))
             // A kind this build cannot run is shown, never edited.
-            .interactive(cell.kind == "text")
+            .interactive(runs(&cell.kind))
             .frame(egui::Frame::NONE)
             .margin(egui::Margin::ZERO)
             .desired_width(field.width())
             .layouter(&mut |ui: &egui::Ui, text: &dyn egui::TextBuffer, width: f32| {
-                ui.fonts_mut(|fonts| fonts.layout_job(prompt_job(text.as_str(), width)))
+                ui.fonts_mut(|fonts| fonts.layout_job(prompt_job(text.as_str(), width, markdown)))
             }),
     );
     if response.lost_focus() {
@@ -396,6 +455,40 @@ fn model_name(ctx: &egui::Context, id: &str) -> String {
     });
     known.unwrap_or_else(|| id.rsplit('/').next().unwrap_or(id).to_string())
 }
+
+/// Where a card's "…" is, from the card's rect.
+pub(crate) fn more_button(card: Rect) -> Rect {
+    Rect::from_center_size(pos2(card.right() - PAD - 8.0, card.top() + HEADER / 2.0), vec2(22.0, 22.0))
+}
+
+/// Where a card's play button is, from the card's rect.
+pub(crate) fn run_button(card: Rect) -> Rect {
+    let mid = card.top() + HEADER / 2.0;
+    let more_left = card.right() - PAD - 8.0 - 11.0;
+    let menu_left = more_left - 10.0 - BUTTON_H;
+    Rect::from_min_size(pos2(menu_left - 6.0 - BUTTON_H, mid - BUTTON_H / 2.0), vec2(BUTTON_H, BUTTON_H))
+}
+
+/// A rendered Markdown cell: its source as rich text, with no card. A
+/// double-click shows its source; a click selects it.
+pub(crate) fn rendered_height(ui: &egui::Ui, cell: &Cell, width: f32) -> f32 {
+    crate::markdown::lay_out(ui.painter(), &cell.prompt(), TEXT, (width - 2.0 * PAD).max(60.0)).height + 2.0 * RENDERED_PAD
+}
+
+pub(crate) fn paint_rendered(ui: &mut egui::Ui, row: Rect, cell: &Cell, actions: &mut Vec<CardAction>) -> Rect {
+    let ui = &mut ui.new_child(egui::UiBuilder::new().max_rect(row));
+    let laid = crate::markdown::lay_out(ui.painter(), &cell.prompt(), TEXT, (row.width() - 2.0 * PAD).max(60.0));
+    laid.paint(ui.painter(), pos2(row.left() + PAD, row.top() + RENDERED_PAD));
+    let response = ui.interact(row, egui::Id::new(("cell-rendered", &cell.id)), Sense::click());
+    if response.double_clicked() {
+        actions.push(CardAction::ShowSource(cell.id.clone()));
+    } else if response.clicked() {
+        actions.push(CardAction::Select(cell.id.clone()));
+    }
+    row
+}
+
+const RENDERED_PAD: f32 = 12.0;
 
 /// The height a card needs at `width`, with its prompt and result laid out,
 /// so a list gives each card its own height. `numbered` leaves the margin a
@@ -502,12 +595,8 @@ mod tests {
         cell.kind = "plot".into();
         let ctx = egui::Context::default();
         crate::toolbar::install_fonts(&ctx);
-        let (shapes, _, _) = paint(&ctx, &cell, 320.0, Vec::new());
-        let (_, run) = texts(&shapes)
-            .into_iter()
-            .find(|(text, _)| text == "Generate")
-            .expect("the card has no Generate button");
-        let at = run.center();
+        let (_, _, card) = paint(&ctx, &cell, 320.0, Vec::new());
+        let at = run_button(card).center();
         let press = |pressed| egui::Event::PointerButton {
             pos: at,
             button: egui::PointerButton::Primary,

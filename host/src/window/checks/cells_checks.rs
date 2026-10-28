@@ -100,6 +100,14 @@ fn book_cells(app: &crate::window::HostWindow) -> Vec<protocol::Cell> {
         .unwrap_or_default()
 }
 
+fn book_selected(app: &crate::window::HostWindow) -> Option<String> {
+    app.apps
+        .iter()
+        .find(|started| started.id == "mission-control")
+        .and_then(|started| started.running.declared.cells.values().next())
+        .and_then(|(_, selected)| selected.clone())
+}
+
 fn conversation_cell(app: &crate::window::HostWindow) -> protocol::Cell {
     app.chat
         .conversation
@@ -316,70 +324,42 @@ fn a_mission_book_adds_runs_and_undoes_a_cell() {
         .unwrap()
         .label
         .clone();
-    assert_eq!(label, "Untitled Mission Book");
-    assert!(book_cells(&window.app).is_empty());
+    assert_eq!(label, "Untitled Notebook");
+    // A new notebook has one empty cell, active.
+    assert_eq!(book_cells(&window.app).len(), 1);
     command(&mut window, "mission-control", "add_cell");
-    window.until(|app| book_cells(app).len() == 1);
+    window.until(|app| book_cells(app).len() == 2);
     command(&mut window, "mission-control", "undo");
-    window.until(|app| book_cells(app).is_empty());
-    command(&mut window, "mission-control", "redo");
     window.until(|app| book_cells(app).len() == 1);
-    let id = book_cells(&window.app)[0].id.clone();
+    command(&mut window, "mission-control", "redo");
+    window.until(|app| book_cells(app).len() == 2);
+    let id = book_cells(&window.app)[1].id.clone();
     type_prompt(&mut window, &id, "A keeper at the lamp.");
     window.until(|app| book_cells(app).iter().any(|cell| cell.prompt() == "A keeper at the lamp."));
     command(&mut window, "mission-control", "undo");
-    window.until(|app| book_cells(app).iter().any(|cell| cell.prompt().is_empty()));
+    window.until(|app| book_cells(app)[1].prompt().is_empty());
     command(&mut window, "mission-control", "redo");
     window.until(|app| book_cells(app).iter().any(|cell| cell.prompt() == "A keeper at the lamp."));
     command(&mut window, "mission-control", "run");
-    let mut saw_part = window.app.board.runs.iter().any(|run| !run.text.is_empty() && run.text != PIECE);
-    let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_secs(20) {
-        for started in &mut window.app.apps {
-            started.running.poll();
-        }
-        window.step();
-        if window.app.board.runs.iter().any(|run| !run.text.is_empty() && run.text != PIECE) {
-            saw_part = true;
-        }
-        if book_cells(&window.app).iter().any(|cell| cell.result_text() == PIECE) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(saw_part, "the book's result did not arrive in parts");
-    window.until(|app| {
-        app.apps.iter().any(|started| {
-            started.running.declared.cells.values().any(|(cells, _)| {
-                cells.iter().any(|cell| cell.result_text() == PIECE && cell.state == CellState::Done)
-            })
-        })
-    });
+    window.until(|app| book_cells(app).iter().any(|cell| cell.result_text() == PIECE && cell.state == CellState::Done));
     let ran = book_cells(&window.app);
-    assert_eq!(ran[0].prompt(), "A keeper at the lamp.");
-    assert_eq!(ran[0].model.as_deref(), Some("stand-in/model"));
+    assert_eq!(ran[1].prompt(), "A keeper at the lamp.");
+    assert_eq!(ran[1].model.as_deref(), Some("stand-in/model"));
+    assert_eq!(ran[1].versions.len(), 1, "the run made no version");
+    assert_eq!(ran[1].versions[0].input, ran[1].input, "the version does not hold the prompt that ran");
+    // Undo takes back the edit, never the run: the result stays.
     command(&mut window, "mission-control", "undo");
-    window.until(|app| {
-        app.apps.iter().any(|started| {
-            started.running.declared.cells.values().any(|(cells, _)| {
-                cells.iter().any(|cell| cell.output.is_empty() && cell.prompt() == "A keeper at the lamp.")
-            })
-        })
-    });
+    window.until(|app| book_cells(app)[1].prompt().is_empty());
+    assert_eq!(book_cells(&window.app)[1].versions.len(), 1, "undo removed a run");
+    assert_eq!(book_cells(&window.app)[1].result_text(), PIECE);
     command(&mut window, "mission-control", "redo");
-    window.until(|app| {
-        app.apps.iter().any(|started| {
-            started.running.declared.cells.values().any(|(cells, _)| {
-                cells.iter().any(|cell| cell.result_text() == PIECE)
-            })
-        })
-    });
+    window.until(|app| book_cells(app)[1].prompt() == "A keeper at the lamp.");
     command(&mut window, "mission-control", "delete_cell");
-    window.until(|app| book_cells(app).is_empty());
+    window.until(|app| book_cells(app).len() == 1);
     command(&mut window, "mission-control", "undo");
-    window.until(|app| book_cells(app).iter().any(|cell| cell.result_text() == PIECE));
+    window.until(|app| book_cells(app).iter().any(|cell| cell.result_text() == PIECE && cell.versions.len() == 1));
     command(&mut window, "mission-control", "redo");
-    window.until(|app| book_cells(app).is_empty());
+    window.until(|app| book_cells(app).len() == 1);
     command(&mut window, "mission-control", "new_book");
     window.until(|app| {
         app.apps.iter().any(|started| {
@@ -499,8 +479,6 @@ fn a_book_and_a_conversation_cell_come_back_with_the_project() {
     });
     window.select("mission-control");
     show_workspace(&mut window);
-    command(&mut window, "mission-control", "add_cell");
-    window.until(|app| book_cells(app).len() == 1);
     let cell = book_cells(&window.app)[0].id.clone();
     type_prompt(&mut window, &cell, "Saved from the book.");
     window.until(|app| book_cells(app).iter().any(|cell| cell.prompt() == "Saved from the book."));
@@ -592,15 +570,15 @@ fn closing_a_changed_book_asks_first() {
     window.select("mission-control");
     show_workspace(&mut window);
     command(&mut window, "mission-control", "add_cell");
-    window.until(|app| book_cells(app).len() == 1);
+    window.until(|app| book_cells(app).len() == 2);
     command(&mut window, "mission-control", "close_tab");
     window.until(|app| {
         app.apps.iter().any(|started| {
-            started.running.declared.ask.as_ref().is_some_and(|ask| ask.title == "Keep this book?")
+            started.running.declared.ask.as_ref().is_some_and(|ask| ask.title == "Keep this notebook?")
         })
     });
     answer(&mut window, "cancel");
-    window.until(|app| book_cells(app).len() == 1 && app.apps.iter().all(|started| started.running.declared.ask.is_none()));
+    window.until(|app| book_cells(app).len() == 2 && app.apps.iter().all(|started| started.running.declared.ask.is_none()));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -627,12 +605,15 @@ fn a_stand_in_that_keeps_cells_gets_drawing_run_and_drag() {
     show_workspace(&mut window);
     let slate = window.app.board.drop_rect.expect("the stand-in's cells were not drawn");
     // Run, clicked in the stand-in's own card, as a person clicks it.
+    let _ = slate;
     let run = window
-        .texts
+        .app
+        .board
+        .cards
         .iter()
-        .find(|(text, rect)| text == "Generate" && slate.contains_rect(*rect))
-        .map(|(_, rect)| rect.center())
-        .expect("the stand-in's card has no Generate button");
+        .find(|(id, _)| id == "slate-1")
+        .map(|(_, card)| crate::cells::run_button(*card).center())
+        .expect("the stand-in's card was not drawn");
     window.events.push(egui::Event::PointerMoved(run));
     window.events.push(egui::Event::PointerButton {
         pos: run,
@@ -730,7 +711,13 @@ fn the_application_that_claims_a_file_opens_it() {
     command(&mut window, "simple-sketch", "open");
     window.until(|app| app.apps.iter().any(|started| !started.running.declared.files.is_empty()));
     window.answer_saves(&book);
-    window.until(|app| book_cells(app).iter().any(|cell| cell.prompt() == "From the book."));
+    // Mission Control now has two tabs: the new notebook, and the one opened.
+    window.until(|app| {
+        app.apps.iter().any(|started| {
+            started.id == "mission-control"
+                && started.running.declared.cells.values().any(|(cells, _)| cells.iter().any(|cell| cell.prompt() == "From the book."))
+        })
+    });
     assert!(window.app.apps.iter().find(|started| started.id == "simple-sketch").unwrap().running.tabs().0.iter().all(|tab| {
         tab.path.as_deref() != Some(book.to_str().unwrap())
     }));
@@ -816,5 +803,310 @@ fn a_message_sent_while_a_request_runs_is_sent_after_it() {
         .map(|entry| entry.text.as_str())
         .collect();
     assert_eq!(order, ["First question.", "First answer.", "Second question.", "Second answer."]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn key(window: &mut Window, key: egui::Key, modifiers: egui::Modifiers) {
+    window.events.push(egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    });
+    window.step();
+}
+
+fn click(window: &mut Window, at: Pos2) {
+    window.events.push(egui::Event::PointerMoved(at));
+    for pressed in [true, false] {
+        window.events.push(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        });
+        window.step();
+    }
+}
+
+fn card_of(window: &Window, id: &str) -> egui::Rect {
+    window.app.board.cards.iter().find(|(cell, _)| cell == id).map(|(_, card)| *card).expect("the cell was not drawn")
+}
+
+fn notebook(window: &mut Window) {
+    window.select("mission-control");
+    show_workspace(window);
+    window.app.notebook_focus = true;
+    window.step();
+}
+
+/// N-5. A version holds the prompt that ran: an edit made while the run
+/// streams goes to the cell, not to the version.
+#[test]
+fn a_version_holds_the_prompt_that_ran() {
+    let dir = scratch("ran");
+    let stand_in = StandIn::start(vec![text_reply(PIECE)]);
+    let mut window = project_window(apps(), &stand_in, &dir);
+    notebook(&mut window);
+    let id = book_cells(&window.app)[0].id.clone();
+    type_prompt(&mut window, &id, "What ran.");
+    window.until(|app| book_cells(app)[0].prompt() == "What ran.");
+    stand_in.hold();
+    command(&mut window, "mission-control", "run");
+    window.until(|app| app.board.runs.iter().any(|run| !run.settled && !run.text.is_empty()));
+    // The first part shows in the notebook's card while the run goes on.
+    assert!(window.app.board.running(&id).is_some_and(|run| run.text != PIECE));
+    type_prompt(&mut window, &id, " Edited meanwhile.");
+    window.until(|app| book_cells(app)[0].prompt().ends_with("Edited meanwhile."));
+    stand_in.release();
+    window.until(|app| book_cells(app)[0].versions.len() == 1);
+    let cell = &book_cells(&window.app)[0];
+    assert_eq!(cell.versions[0].input, vec![protocol::CellPart::Text { text: "What ran.".into() }]);
+    assert!(cell.prompt().ends_with("Edited meanwhile."), "the edit was lost");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// N-4 and N-3. A Markdown cell renders when run, with no model and no
+/// version, and Enter shows its source; Shift+Enter at the last cell adds
+/// one; Up and Down change the active cell; D D deletes.
+#[test]
+fn notebook_keys_and_the_markdown_swap() {
+    let dir = scratch("keys");
+    let stand_in = StandIn::start(Vec::new());
+    let mut window = project_window(apps(), &stand_in, &dir);
+    notebook(&mut window);
+    command(&mut window, "mission-control", "kind_markdown");
+    command(&mut window, "mission-control", "add_cell");
+    window.until(|app| book_cells(app).len() == 2);
+    let notes = book_cells(&window.app)[1].id.clone();
+    type_prompt(&mut window, &notes, "# The Last Signal");
+    window.until(|app| book_cells(app)[1].prompt() == "# The Last Signal");
+    window.app.notebook_focus = true;
+    key(&mut window, egui::Key::Enter, egui::Modifiers::COMMAND);
+    window.until(|app| book_cells(app)[1].state == CellState::Done);
+    assert!(book_cells(&window.app)[1].versions.is_empty(), "rendering made a version");
+    assert!(stand_in.requests().is_empty(), "a Markdown cell called a model");
+    window.step();
+    assert!(window.texts.iter().any(|(text, _)| text == "The Last Signal"), "the cell is not rendered");
+    key(&mut window, egui::Key::Enter, egui::Modifiers::NONE);
+    window.until(|app| book_cells(app)[1].state == CellState::Idle);
+
+    // Shift+Enter on the last cell runs it and adds a cell after it.
+    window.app.notebook_focus = true;
+    key(&mut window, egui::Key::Escape, egui::Modifiers::NONE);
+    key(&mut window, egui::Key::Enter, egui::Modifiers::SHIFT);
+    window.until(|app| book_cells(app).len() == 3);
+    let added = book_cells(&window.app)[2].id.clone();
+    window.until(|app| selected_cell(app).as_deref() == Some(added.as_str()));
+
+    // Up makes the cell above active; D D deletes it.
+    window.app.notebook_focus = true;
+    key(&mut window, egui::Key::ArrowUp, egui::Modifiers::NONE);
+    window.until(|app| selected_cell(app).as_deref() == Some(notes.as_str()));
+    // One D alone deletes nothing.
+    key(&mut window, egui::Key::D, egui::Modifiers::NONE);
+    for _ in 0..20 {
+        window.step();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(book_cells(&window.app).len(), 3, "a single D deleted a cell");
+    key(&mut window, egui::Key::D, egui::Modifiers::NONE);
+    window.until(|app| book_cells(app).len() == 2 && book_cells(app).iter().all(|cell| cell.id != notes));
+    for _ in 0..20 {
+        window.step();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(book_cells(&window.app).len(), 2, "D D deleted more than one cell");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn selected_cell(app: &crate::window::HostWindow) -> Option<String> {
+    app.apps
+        .iter()
+        .find(|started| started.id == "mission-control")
+        .and_then(|started| started.running.declared.cells.values().next())
+        .and_then(|(_, selected)| selected.clone())
+}
+
+/// N-5. The "…" opens the cell's menu, which shows "n/N" and switches the
+/// version; the prompt and result switch together.
+#[test]
+fn the_cell_menu_switches_versions() {
+    let dir = scratch("menu");
+    let stand_in = StandIn::start(vec![text_reply("One."), text_reply("Two.")]);
+    let mut window = project_window(apps(), &stand_in, &dir);
+    notebook(&mut window);
+    let id = book_cells(&window.app)[0].id.clone();
+    type_prompt(&mut window, &id, "First prompt.");
+    command(&mut window, "mission-control", "run");
+    window.until(|app| book_cells(app)[0].versions.len() == 1);
+    type_prompt(&mut window, &id, " Second.");
+    window.until(|app| book_cells(app)[0].prompt().ends_with("Second."));
+    command(&mut window, "mission-control", "run");
+    window.until(|app| book_cells(app)[0].versions.len() == 2 && book_cells(app)[0].result_text() == "Two.");
+    window.step();
+    let more = crate::cells::more_button(card_of(&window, &id)).center();
+    click(&mut window, more);
+    window.step();
+    let (_, count) = window.texts.iter().find(|(text, _)| text == "2/2").cloned().expect("the menu shows no 2/2");
+    // Back is the icon just left of the count.
+    click(&mut window, Pos2::new(count.left() - crate::toolbar::BUTTON_W / 2.0 - 4.0, count.center().y));
+    window.until(|app| book_cells(app)[0].current == Some(0));
+    let cell = &book_cells(&window.app)[0];
+    assert_eq!((cell.prompt().as_str(), cell.result_text().as_str()), ("First prompt.", "One."));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// N-10. A stand-in nothing was written for keeps an LLM cell with two
+/// versions and a rendered Markdown cell, and answers the protocol's own
+/// messages. The host's menu and keys drive it by real clicks: a version,
+/// a move, the Markdown swap, and a delete. A stand-in that ignores
+/// `set_version` keeps showing its version: the host never switches
+/// versions from its own copy.
+const PAD_APP: &str = r###"#!/bin/sh
+V1='{"id":"v-1","input":[{"text":"Old."}],"output":[{"text":"First."}],"state":"done","time":1}'
+V2='{"id":"v-2","input":[{"text":"New."}],"output":[{"text":"Second."}],"state":"done","time":2}'
+CUR=1; IN=New.; OUT=Second.; MD=done; ORDER=12; SEL=pad-1
+emit() {
+  ONE="{\"id\":\"pad-1\",\"kind\":\"text\",\"input\":[{\"text\":\"$IN\"}],\"output\":[{\"text\":\"$OUT\"}],\"state\":\"done\",\"versions\":[$V1,$V2],\"current\":$CUR}"
+  TWO="{\"id\":\"pad-md\",\"kind\":\"markdown\",\"input\":[{\"text\":\"## Pad notes\"}],\"state\":\"$MD\"}"
+  case "$ORDER" in
+    12) LIST="$ONE,$TWO" ;;
+    21) LIST="$TWO,$ONE" ;;
+    2) LIST="$TWO" ;;
+  esac
+  echo "{\"type\":\"cells\",\"tab\":\"p1\",\"cells\":[$LIST],\"selected\":\"$SEL\"}"
+}
+echo '{"type":"hello","protocol":1}'
+echo '{"type":"tab","id":"p1","label":"Pad"}'
+echo '{"type":"contents","tab":"p1","kind":"cells"}'
+echo '{"type":"end"}'
+echo '{"type":"tabs","tabs":[{"id":"p1","label":"Pad","saves":true}],"active":"p1"}'
+emit
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"ping"'*) echo '{"type":"pong"}' ;;
+    *'"type":"shutdown"'*) exit 0 ;;
+    *'"type":"quit"'*) echo '{"type":"quit_ready"}' ;;
+    *'"type":"set_version"'*'"index":0'*) [ "$IGNORE" = 1 ] || { CUR=0; IN=Old.; OUT=First.; emit; } ;;
+    *'"type":"move_cell"'*'"to":1'*) ORDER=21; emit ;;
+    *'"type":"show_source"'*'pad-md'*) MD=idle; emit ;;
+    *'"type":"select_cell"'*'pad-md'*) SEL=pad-md; emit ;;
+    *'"type":"select_cell"'*'pad-1'*) SEL=pad-1; emit ;;
+    *'"type":"delete_cell"'*'pad-1'*) ORDER=2; emit ;;
+  esac
+done
+"###;
+
+fn pad_program(dir: &Path, ignore: bool) -> std::path::PathBuf {
+    let path = dir.join(if ignore { "pad-deaf" } else { "pad" });
+    let script = if ignore { PAD_APP.replacen("#!/bin/sh\n", "#!/bin/sh\nIGNORE=1\n", 1) } else { PAD_APP.to_string() };
+    std::fs::write(&path, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path
+}
+
+fn pad_cells(app: &crate::window::HostWindow) -> Vec<protocol::Cell> {
+    app.apps[0].running.declared.cells.values().next().map(|(cells, _)| cells.clone()).unwrap_or_default()
+}
+
+fn menu_button(window: &Window, name: &str) -> Pos2 {
+    window.app.board.menu_buttons.iter().find(|(button, _)| *button == name).map(|(_, rect)| rect.center()).unwrap_or_else(|| panic!("the menu has no {name}"))
+}
+
+fn open_menu(window: &mut Window, id: &str) {
+    window.step();
+    let more = crate::cells::more_button(card_of(window, id)).center();
+    click(window, more);
+    window.step();
+}
+
+#[test]
+fn any_application_that_keeps_cells_gets_the_notebook() {
+    for ignore in [false, true] {
+        let dir = scratch(if ignore { "pad-deaf" } else { "pad" });
+        let program = pad_program(&dir, ignore);
+        let stand_in = StandIn::start(Vec::new());
+        let mut window = project_window(vec![spec("pad", "Pad", &program)], &stand_in, &dir);
+        window.select("pad");
+        show_workspace(&mut window);
+        window.until(|app| pad_cells(app).len() == 2);
+        open_menu(&mut window, "pad-1");
+        assert!(window.texts.iter().any(|(text, _)| text == "2/2"), "the menu shows no 2/2");
+        let at = menu_button(&window, "nav-arrow-left");
+        click(&mut window, at);
+        for _ in 0..30 {
+            window.step();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let shown = pad_cells(&window.app)[0].clone();
+        if ignore {
+            // The owner did not switch, so the host shows what it was sent.
+            assert_eq!((shown.current, shown.result_text().as_str()), (Some(1), "Second."));
+            assert!(window.texts.iter().any(|(text, _)| text.contains("Second.")), "the host switched the version itself");
+            let _ = std::fs::remove_dir_all(dir);
+            continue;
+        }
+        assert_eq!((shown.current, shown.result_text().as_str()), (Some(0), "First."));
+        // Move down, from the same menu.
+        let at = menu_button(&window, "arrow-down");
+        click(&mut window, at);
+        window.until(|app| pad_cells(app).first().is_some_and(|cell| cell.id == "pad-md"));
+        // A click makes the rendered Markdown cell active and gives the
+        // notebook the keyboard; Enter shows its source.
+        window.step();
+        let md = card_of(&window, "pad-md").center();
+        click(&mut window, md);
+        window.until(|app| app.apps[0].running.declared.cells.values().next().is_some_and(|(_, selected)| selected.as_deref() == Some("pad-md")));
+        key(&mut window, egui::Key::Enter, egui::Modifiers::NONE);
+        window.until(|app| pad_cells(app).iter().any(|cell| cell.id == "pad-md" && cell.state == CellState::Idle));
+        // Delete, from the menu's trash.
+        open_menu(&mut window, "pad-1");
+        let at = menu_button(&window, "trash");
+        click(&mut window, at);
+        window.until(|app| pad_cells(app).iter().all(|cell| cell.id != "pad-1"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// N-3. A click on the active cell shows its border. A click away from it,
+/// in the notebook's empty space or outside the notebook, takes the border
+/// away and the bar stays. A new active cell shows the border again.
+#[test]
+fn the_border_goes_on_a_click_away_and_the_bar_stays() {
+    let dir = scratch("border");
+    let stand_in = StandIn::start(Vec::new());
+    let mut window = project_window(apps(), &stand_in, &dir);
+    window.select("mission-control");
+    show_workspace(&mut window);
+    window.step();
+    let id = book_cells(&window.app)[0].id.clone();
+    let card = card_of(&window, &id);
+    click(&mut window, card.center());
+    window.step();
+    assert_eq!(window.app.board.bordered.as_deref(), Some(id.as_str()), "a click on the cell did not show its border");
+    click(&mut window, Pos2::new(120.0, 300.0));
+    window.step();
+    assert_eq!(window.app.board.bordered, None, "a click outside the notebook left the border");
+    click(&mut window, card.center());
+    window.step();
+    assert_eq!(window.app.board.bordered.as_deref(), Some(id.as_str()), "a second click did not bring the border back");
+    // Empty space in the notebook, below the only cell: the notebook keeps
+    // the keyboard.
+    click(&mut window, Pos2::new(card.center().x, card.bottom() + 120.0));
+    window.step();
+    assert_eq!(window.app.board.bordered, None, "a click in the notebook's empty space left the border");
+    assert_eq!(book_selected(&window.app).as_deref(), Some(id.as_str()), "a click away changed the active cell");
+    // Adding a cell makes it active, and selected.
+    key(&mut window, egui::Key::B, egui::Modifiers::NONE);
+    window.until(|app| book_cells(app).len() == 2);
+    window.step();
+    let added = book_cells(&window.app)[1].id.clone();
+    assert_eq!(window.app.board.bordered.as_deref(), Some(added.as_str()), "a new active cell has no border");
     let _ = std::fs::remove_dir_all(dir);
 }

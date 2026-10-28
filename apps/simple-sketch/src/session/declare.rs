@@ -160,6 +160,7 @@ impl Session {
                 };
                 Some(Binding {
                     chord: chord(&binding.chord),
+                    then: Vec::new(),
                     action,
                 })
             })

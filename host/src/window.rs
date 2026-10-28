@@ -143,6 +143,24 @@ struct HostWindow {
     openrouter_key: Option<String>,
     /// A conversation cell the person is dragging.
     dragging: Option<protocol::Cell>,
+    /// A notebook cell's "…" menu, open under that rect.
+    cell_menu: Option<(String, Rect)>,
+    /// The notebook has the keyboard: its keys act on the active cell.
+    notebook_focus: bool,
+    /// The active cell is selected and shows its border: a click on it,
+    /// or the active cell changing, selects it; any other click clears it.
+    /// The bar stays either way.
+    cell_selected: bool,
+    /// The active cell last drawn, so a change of it selects it.
+    shown_active: Option<String>,
+    /// Where the open "…" menu was drawn, so a click in it keeps the
+    /// border.
+    cell_menu_rect: Option<Rect>,
+    /// A cell whose prompt takes the keyboard on the next frame.
+    focus_prompt: Option<String>,
+    /// A declared key sequence partly pressed: the binding, how many of its
+    /// chords are done, and when the last one was.
+    sequence: Option<(usize, usize, std::time::Instant)>,
     /// The pointer was released on this cells tab.
     drop_target: Option<(usize, String)>,
     claim: Option<ClaimJob>,
@@ -234,6 +252,13 @@ impl HostWindow {
             openrouter_url,
             openrouter_key,
             dragging: None,
+            cell_menu: None,
+            notebook_focus: false,
+            cell_selected: false,
+            shown_active: None,
+            cell_menu_rect: None,
+            focus_prompt: None,
+            sequence: None,
             drop_target: None,
             claim: None,
             claim_seq: 0,
@@ -498,13 +523,7 @@ impl HostWindow {
         }
         let shift = ctx.input(|input| input.modifiers.shift);
         let mut actions = clipboard.clone();
-        let pressed: Vec<Action> = ctx.input(|input| {
-            keys.bindings
-                .iter()
-                .filter(|binding| icons::chord_pressed(input, &binding.chord))
-                .map(|binding| binding.action.clone())
-                .collect()
-        });
+        let pressed: Vec<Action> = self.pressed_bindings(ctx, &keys.bindings);
         for action in pressed {
             // The window never delivers the key-down for these three. When a
             // frame does, the clipboard path above already ran them.
@@ -534,6 +553,46 @@ impl HostWindow {
             actions.retain(|action| Doc::moves_camera_only(&action.id));
         }
         actions
+    }
+}
+
+impl HostWindow {
+    /// The declared actions whose keys were pressed this frame. A binding
+    /// with chords to follow, such as D D, waits for each in turn, at most a
+    /// second apart; any other key in between cancels it.
+    fn pressed_bindings(&mut self, ctx: &egui::Context, bindings: &[protocol::Binding]) -> Vec<Action> {
+        const BETWEEN: std::time::Duration = std::time::Duration::from_secs(1);
+        let now = std::time::Instant::now();
+        let mut fired = Vec::new();
+        let any_key = ctx.input(|input| input.events.iter().any(|event| matches!(event, egui::Event::Key { pressed: true, .. })));
+        if let Some((index, done, at)) = self.sequence.take()
+            && now.duration_since(at) <= BETWEEN
+            && let Some(binding) = bindings.get(index)
+        {
+            let next = &binding.then[done - 1];
+            if ctx.input(|input| icons::chord_pressed(input, next)) {
+                if done == binding.then.len() {
+                    fired.push(binding.action.clone());
+                } else {
+                    self.sequence = Some((index, done + 1, now));
+                }
+                return fired;
+            }
+            if !any_key {
+                self.sequence = Some((index, done, at));
+            }
+        }
+        for (index, binding) in bindings.iter().enumerate() {
+            if !ctx.input(|input| icons::chord_pressed(input, &binding.chord)) {
+                continue;
+            }
+            if binding.then.is_empty() {
+                fired.push(binding.action.clone());
+            } else {
+                self.sequence = Some((index, 1, now));
+            }
+        }
+        fired
     }
 }
 
@@ -945,11 +1004,24 @@ impl HostWindow {
     fn note_cell_actions(&mut self, actions: Vec<crate::cells::CardAction>) {
         for action in actions {
             match action {
-                crate::cells::CardAction::Drag(cell) => self.dragging = Some(cell),
+                // Only a conversation cell is dragged, into a notebook; a
+                // notebook's own cells move from their menu.
+                crate::cells::CardAction::Drag(cell) => {
+                    if self.cell_home(&cell.id).is_none() {
+                        self.dragging = Some(cell);
+                    }
+                }
                 crate::cells::CardAction::Edit(id, input) => self.edit_prompt(&id, input),
                 crate::cells::CardAction::Run(id) => self.run_from_card(&id),
                 crate::cells::CardAction::Stop(id) => self.stop_one(&id),
                 crate::cells::CardAction::Select(id) => self.select_one(&id),
+                // The "…" opens the cell's own menu, in a notebook only.
+                crate::cells::CardAction::More(id, at) => {
+                    if self.cell_home(&id).is_some() {
+                        self.cell_menu = Some((id, at));
+                    }
+                }
+                crate::cells::CardAction::ShowSource(id) => self.show_source(&id),
             }
         }
     }
@@ -990,6 +1062,17 @@ impl HostWindow {
         self.start_book_run(app, &tab, id);
     }
 
+    /// A rendered Markdown cell shows its source, and its prompt takes the
+    /// keyboard.
+    fn show_source(&mut self, id: &str) {
+        let Some((app, tab)) = self.cell_home(id) else {
+            return;
+        };
+        self.send(app, HostMessage::SelectCell { tab: tab.clone(), cell: id.to_string() });
+        self.send(app, HostMessage::ShowSource { tab, cell: id.to_string() });
+        self.focus_prompt = Some(id.to_string());
+    }
+
     fn select_one(&mut self, id: &str) {
         let Some((app, tab)) = self.cell_home(id) else {
             return;
@@ -1028,11 +1111,13 @@ impl HostWindow {
     ) {
         self.board.runs.retain(|run| run.id != id);
         let rx = crate::cells::start_run(&self.openrouter_url, self.openrouter_key.as_deref(), &model, &prompt);
+        let prompt = prompt.clone();
         self.board.runs.push(crate::cells::Run {
             place,
             id,
             call,
             model,
+            prompt,
             text: String::new(),
             rx,
             settled: false,
@@ -1077,7 +1162,7 @@ impl HostWindow {
         }) else {
             return;
         };
-        if cell.kind != "text" {
+        if !crate::cells::runs(&cell.kind) {
             return;
         }
         let prompt = self.board.drafts.get(id).cloned().unwrap_or_else(|| cell.prompt());
@@ -1093,6 +1178,24 @@ impl HostWindow {
                     input: vec![protocol::CellPart::Text { text: prompt.clone() }],
                 },
             );
+        }
+        // A Markdown cell runs here and now: it shows rendered, calls
+        // nothing, and makes no version.
+        if cell.kind == protocol::MARKDOWN_KIND {
+            self.send(
+                app,
+                HostMessage::CellResult {
+                    tab: tab.to_string(),
+                    cell: id.to_string(),
+                    input: Vec::new(),
+                    endpoint: String::new(),
+                    model: String::new(),
+                    state: protocol::CellState::Done,
+                    output: Vec::new(),
+                    error: None,
+                },
+            );
+            return;
         }
         self.launch_run(
             crate::cells::Place::Book {
@@ -1167,6 +1270,7 @@ impl HostWindow {
         let id = run.id.clone();
         let text = run.text.clone();
         let model = run.model.clone();
+        let ran = vec![protocol::CellPart::Text { text: run.prompt.clone() }];
         let call = run.call.clone();
         let place = match &run.place {
             crate::cells::Place::Conversation => None,
@@ -1209,6 +1313,7 @@ impl HostWindow {
                     HostMessage::CellResult {
                         tab,
                         cell: id,
+                        input: ran,
                         endpoint: String::from("openrouter"),
                         model,
                         state,
@@ -1226,85 +1331,312 @@ impl HostWindow {
         })
     }
 
-    /// The cells a tab keeps, drawn with the same card as the conversation.
+    /// A tab that keeps cells, drawn as a notebook: a white column at most
+    /// 880 wide on gray, each cell with its "[n]" in the margin, the active
+    /// cell marked by a blue bar its full height and, until a click away
+    /// from it, a blue border. Cells are the conversation's cards; a
+    /// Markdown cell that has run shows as rendered text.
     fn show_cells(&mut self, ui: &mut egui::Ui, app: usize, tab: &str, rect: Rect) {
-        let label = self
-            .apps
-            .get(app)
-            .and_then(|started| {
-                started
-                    .running
-                    .tabs()
-                    .0
-                    .into_iter()
-                    .find(|known| known.id == tab)
-                    .map(|known| known.label)
-            })
-            .unwrap_or_default();
-        let listed = self
+        let (listed, selected) = self
             .apps
             .get(app)
             .and_then(|started| started.running.declared.cells.get(tab).cloned())
-            .map(|(cells, _)| cells)
             .unwrap_or_default();
-        ui.painter().with_clip_rect(rect).rect_filled(rect, 0.0, Color32::WHITE);
-        ui.painter().text(
-            egui::pos2(rect.left() + 16.0, rect.top() + 12.0),
-            egui::Align2::LEFT_TOP,
-            label,
-            egui::FontId::proportional(16.0),
-            crate::widgets::TEXT,
+        let painter = ui.painter().with_clip_rect(rect);
+        painter.rect_filled(rect, 0.0, NOTEBOOK_GRAY);
+        let width = (rect.width() - 2.0 * crate::typescale::GUTTER).min(NOTEBOOK_COLUMN).max(200.0);
+        let column = Rect::from_min_max(
+            egui::pos2(rect.center().x - width / 2.0, rect.top() + 16.0),
+            egui::pos2(rect.center().x + width / 2.0, rect.bottom()),
         );
-        let body = Rect::from_min_max(egui::pos2(rect.left(), rect.top() + 36.0), rect.max);
-        self.board.drop_rect = Some(body);
+        painter.rect_filled(column, 0.0, Color32::WHITE);
+        self.board.drop_rect = Some(column);
         if ui.input(|input| input.pointer.any_released())
-            && ui.input(|input| input.pointer.interact_pos()).is_some_and(|pos| body.contains(pos))
+            && ui.input(|input| input.pointer.interact_pos()).is_some_and(|pos| column.contains(pos))
         {
             self.drop_target = Some((app, tab.to_string()));
         }
+        // A press inside the notebook gives it the keyboard; one elsewhere
+        // takes it away.
+        if let Some(pos) = ui.input(|input| input.pointer.press_origin()).filter(|_| ui.input(|input| input.pointer.any_pressed())) {
+            self.notebook_focus = rect.contains(pos);
+        }
+        let active = selected.as_deref().and_then(|id| listed.iter().position(|cell| cell.id == id));
+        let editing = listed
+            .iter()
+            .any(|cell| ui.memory(|memory| memory.has_focus(egui::Id::new(("cell-prompt", &cell.id)))));
+        self.notebook_keys(ui, app, tab, &listed, active, editing);
+        if let Some(id) = self.focus_prompt.take() {
+            ui.memory_mut(|memory| memory.request_focus(egui::Id::new(("cell-prompt", &id))));
+            self.notebook_focus = true;
+        }
+        // A new active cell, by a click, a key, or adding one, is selected.
+        if selected != self.shown_active {
+            self.shown_active = selected.clone();
+            self.cell_selected = true;
+        }
+        let press = ui
+            .input(|input| input.pointer.press_origin())
+            .filter(|_| ui.input(|input| input.pointer.any_pressed()));
+        let mut pressed_cell = false;
+
         let mut actions = Vec::new();
-        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(body));
-        egui::ScrollArea::vertical().id_salt(("cells", tab)).show(&mut child, |ui| {
-            for (index, cell) in listed.iter().enumerate() {
-                let focused = ui.memory(|memory| memory.has_focus(egui::Id::new(("cell-prompt", &cell.id))));
-                let prompt = cell.prompt();
-                let committed = self
-                    .board
-                    .committed
-                    .entry(cell.id.clone())
-                    .or_insert_with(|| prompt.clone())
-                    .clone();
-                let mut draft = self.board.drafts.get(&cell.id).cloned().unwrap_or_else(|| prompt.clone());
-                if !focused && prompt != committed {
-                    draft = prompt.clone();
-                    self.board.committed.insert(cell.id.clone(), prompt);
+        self.board.cards.clear();
+        self.board.bordered = None;
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(column));
+        egui::ScrollArea::vertical()
+            .id_salt(("cells", tab))
+            .auto_shrink([false, false])
+            .show(&mut child, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.add_space(NOTEBOOK_GAP);
+                let inner = ui.available_width();
+                for (index, cell) in listed.iter().enumerate() {
+                    if index > 0 {
+                        ui.add_space(NOTEBOOK_GAP);
+                    }
+                    let focused = ui.memory(|memory| memory.has_focus(egui::Id::new(("cell-prompt", &cell.id))));
+                    let prompt = cell.prompt();
+                    let committed = self
+                        .board
+                        .committed
+                        .entry(cell.id.clone())
+                        .or_insert_with(|| prompt.clone())
+                        .clone();
+                    let mut draft = self.board.drafts.get(&cell.id).cloned().unwrap_or_else(|| prompt.clone());
+                    if !focused && prompt != committed {
+                        draft = prompt.clone();
+                        self.board.committed.insert(cell.id.clone(), prompt);
+                    }
+                    let live = self.board.running(&cell.id).map(|run| run.text.clone());
+                    let card_width = inner - NOTEBOOK_MARGIN - NOTEBOOK_RIGHT;
+                    let rendered = crate::cells::rendered(cell) && !focused;
+                    let height = if rendered {
+                        crate::cells::rendered_height(ui, cell, card_width)
+                    } else {
+                        crate::cells::card_height(ui, cell, &draft, live.as_deref(), live.is_some(), card_width, false)
+                    };
+                    let (row, _) = ui.allocate_exact_size(egui::vec2(inner, height), egui::Sense::hover());
+                    if press.is_some_and(|pos| row.contains(pos) && ui.clip_rect().contains(pos)) {
+                        pressed_cell = true;
+                    }
+                    let card_row = Rect::from_min_size(
+                        egui::pos2(row.left() + NOTEBOOK_MARGIN, row.top()),
+                        egui::vec2(card_width, height),
+                    );
+                    let card = if rendered {
+                        crate::cells::paint_rendered(ui, card_row, cell, &mut actions)
+                    } else {
+                        crate::cells::paint_card(ui, card_row, cell, &mut draft, live.as_deref(), live.is_some(), None, &mut actions)
+                    };
+                    self.board.drafts.insert(cell.id.clone(), draft);
+                    self.board.cards.push((cell.id.clone(), card));
+                    let painter = ui.painter();
+                    painter.text(
+                        egui::pos2(card.left() - 10.0, card.top() + 16.0),
+                        egui::Align2::RIGHT_CENTER,
+                        format!("[{}]", index + 1),
+                        crate::typescale::code(),
+                        crate::typescale::MUTED,
+                    );
+                    if Some(index) == active {
+                        // The bar marks the active cell always; the border,
+                        // while it is selected or edited.
+                        painter.rect_filled(
+                            Rect::from_min_size(egui::pos2(row.left() + 6.0, card.top()), egui::vec2(4.0, card.height())),
+                            2.0,
+                            NOTEBOOK_BLUE,
+                        );
+                        if self.cell_selected || focused {
+                            self.board.bordered = Some(cell.id.clone());
+                            painter.rect_stroke(
+                                card,
+                                12.0,
+                                egui::Stroke::new(1.0, NOTEBOOK_BLUE),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                    }
+                    // A click anywhere on a cell makes it active.
+                    if ui.input(|input| input.pointer.primary_clicked())
+                        && ui.input(|input| input.pointer.interact_pos()).is_some_and(|pos| row.contains(pos))
+                        && Some(index) != active
+                    {
+                        actions.push(crate::cells::CardAction::Select(cell.id.clone()));
+                    }
                 }
-                let live = self.board.running(&cell.id).map(|run| run.text.clone());
-                let width = ui.available_width();
-                let height = crate::cells::card_height(
-                    ui,
-                    cell,
-                    &draft,
-                    live.as_deref(),
-                    live.is_some(),
-                    width,
-                    true,
-                );
-                let (row, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-                crate::cells::paint_card(
-                    ui,
-                    row,
-                    cell,
-                    &mut draft,
-                    live.as_deref(),
-                    live.is_some(),
-                    Some(index + 1),
-                    &mut actions,
-                );
-                self.board.drafts.insert(cell.id.clone(), draft);
+                ui.add_space(NOTEBOOK_GAP);
+            });
+        // A click on a cell selects it; one anywhere else, in the notebook
+        // or out of it, clears the border, except in the open "…" menu.
+        if let Some(pos) = press {
+            let in_menu = self.cell_menu.is_some() && self.cell_menu_rect.is_some_and(|menu| menu.contains(pos));
+            if !in_menu && self.cell_selected != pressed_cell {
+                // The cells were drawn before the click was known.
+                self.cell_selected = pressed_cell;
+                ui.ctx().request_repaint();
             }
-        });
+        }
         self.note_cell_actions(actions);
+        self.cell_menu_popup(ui, app, tab, &listed);
+    }
+
+    /// The notebook's own keys, as Jupyter has them, acting on any tab that
+    /// keeps cells through the protocol alone. While a prompt is edited,
+    /// Escape stops editing and Shift+Enter or Ctrl+Enter runs; otherwise
+    /// Enter edits, Up and Down change the active cell, and Shift+Enter and
+    /// Ctrl+Enter run.
+    fn notebook_keys(
+        &mut self,
+        ui: &egui::Ui,
+        app: usize,
+        tab: &str,
+        listed: &[protocol::Cell],
+        active: Option<usize>,
+        editing: bool,
+    ) {
+        if !self.notebook_focus && !editing {
+            return;
+        }
+        let Some(index) = active else {
+            return;
+        };
+        let id = listed[index].id.clone();
+        let take = |modifiers: egui::Modifiers, key: egui::Key| ui.input_mut(|input| input.consume_key(modifiers, key));
+        let run_down = take(egui::Modifiers::SHIFT, egui::Key::Enter);
+        let run_here = take(egui::Modifiers::COMMAND, egui::Key::Enter);
+        if run_down || run_here {
+            if editing {
+                // The edit ends first, so the run takes the typed prompt.
+                ui.memory_mut(|memory| memory.surrender_focus(egui::Id::new(("cell-prompt", &id))));
+                self.commit_draft(app, tab, &listed[index]);
+            }
+            self.start_book_run(app, tab, &id);
+            if run_down {
+                match listed.get(index + 1) {
+                    Some(next) => self.send(app, HostMessage::SelectCell { tab: tab.to_string(), cell: next.id.clone() }),
+                    None => self.send(app, HostMessage::InsertCell { tab: tab.to_string(), index: listed.len(), cell: None }),
+                }
+            }
+            return;
+        }
+        if editing {
+            if take(egui::Modifiers::NONE, egui::Key::Escape) {
+                ui.memory_mut(|memory| memory.surrender_focus(egui::Id::new(("cell-prompt", &id))));
+                self.commit_draft(app, tab, &listed[index]);
+            }
+            return;
+        }
+        if take(egui::Modifiers::NONE, egui::Key::Enter) {
+            if crate::cells::rendered(&listed[index]) {
+                self.send(app, HostMessage::ShowSource { tab: tab.to_string(), cell: id.clone() });
+            }
+            self.focus_prompt = Some(id);
+            return;
+        }
+        let step: isize = if take(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+            -1
+        } else if take(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+            1
+        } else {
+            0
+        };
+        if step != 0
+            && let Some(next) = index.checked_add_signed(step).and_then(|next| listed.get(next))
+        {
+            self.send(app, HostMessage::SelectCell { tab: tab.to_string(), cell: next.id.clone() });
+        }
+    }
+
+    /// Sends a cell's typed prompt to its owner, when it differs.
+    fn commit_draft(&mut self, app: usize, tab: &str, cell: &protocol::Cell) {
+        let Some(draft) = self.board.drafts.get(&cell.id).cloned() else {
+            return;
+        };
+        if draft != cell.prompt() {
+            self.send(
+                app,
+                HostMessage::EditCell {
+                    tab: tab.to_string(),
+                    cell: cell.id.clone(),
+                    input: vec![protocol::CellPart::Text { text: draft }],
+                },
+            );
+        }
+    }
+
+    /// The "…" menu of a notebook cell: back, "n/N", forward, up, down, and
+    /// delete, each a protocol message to the cell's owner.
+    fn cell_menu_popup(&mut self, ui: &mut egui::Ui, app: usize, tab: &str, listed: &[protocol::Cell]) {
+        let Some((id, at)) = self.cell_menu.clone() else {
+            return;
+        };
+        let Some(index) = listed.iter().position(|cell| cell.id == id) else {
+            self.cell_menu = None;
+            return;
+        };
+        let cell = &listed[index];
+        let count = cell.versions.len();
+        let current = cell.current.unwrap_or(0);
+        let mut chosen: Option<HostMessage> = None;
+        let mut close = false;
+        let mut buttons: Vec<(&'static str, Rect)> = Vec::new();
+        let area = egui::Area::new(egui::Id::new(("cell-menu", &id)))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(at.right() - CELL_MENU_W + 8.0, at.bottom() + 6.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(Color32::WHITE)
+                    .corner_radius(8.0)
+                    .inner_margin(egui::Margin::symmetric(8, 4))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let mut icon = |ui: &mut egui::Ui, name: &'static str, tip: &str, enabled: bool| {
+                                let response = crate::toolbar::icon_button(ui, name, Some(tip), enabled, false);
+                                buttons.push((name, response.rect));
+                                response.clicked() && enabled
+                            };
+                            if icon(ui, "nav-arrow-left", "Previous version", count > 0 && current > 0) {
+                                chosen = Some(HostMessage::SetVersion { tab: tab.to_string(), cell: id.clone(), index: current - 1 });
+                            }
+                            let shown = if count == 0 { String::from("0/0") } else { format!("{}/{}", current + 1, count) };
+                            ui.label(egui::RichText::new(shown).font(crate::typescale::small()).color(crate::typescale::MUTED));
+                            if icon(ui, "nav-arrow-right", "Next version", current + 1 < count) {
+                                chosen = Some(HostMessage::SetVersion { tab: tab.to_string(), cell: id.clone(), index: current + 1 });
+                            }
+                            ui.separator();
+                            if icon(ui, "arrow-up", "Move up", index > 0) {
+                                chosen = Some(HostMessage::MoveCell { tab: tab.to_string(), cell: id.clone(), to: index - 1 });
+                            }
+                            if icon(ui, "arrow-down", "Move down", index + 1 < listed.len()) {
+                                chosen = Some(HostMessage::MoveCell { tab: tab.to_string(), cell: id.clone(), to: index + 1 });
+                            }
+                            ui.separator();
+                            if icon(ui, "trash", "Delete cell", true) {
+                                chosen = Some(HostMessage::DeleteCell { tab: tab.to_string(), cell: id.clone() });
+                                close = true;
+                            }
+                        });
+                    });
+            });
+        // A press outside the menu, and away from the "…" that opened it,
+        // closes it.
+        if ui.input(|input| input.pointer.any_pressed())
+            && ui
+                .input(|input| input.pointer.interact_pos())
+                .is_some_and(|pos| !area.response.rect.contains(pos) && !at.contains(pos))
+        {
+            close = true;
+        }
+        self.board.menu_buttons = buttons;
+        self.cell_menu_rect = Some(area.response.rect);
+        if let Some(message) = chosen {
+            self.send(app, message);
+        }
+        if close {
+            self.cell_menu = None;
+            self.board.menu_buttons.clear();
+        }
     }
 
     fn finish_drag(&mut self, ctx: &egui::Context) {
@@ -1330,13 +1662,22 @@ impl HostWindow {
             .unwrap_or(0);
         self.send(
             app,
-            HostMessage::InsertCell { tab, index, cell },
+            HostMessage::InsertCell { tab, index, cell: Some(cell) },
         );
     }
 }
 
 /// The tab strip and the toolbar, which the contents area sits under.
 const WORKSPACE_CHROME: f32 = 90.0;
+/// A notebook: gray around a white column at most this wide, a margin for
+/// the bar and the "[n]", the gap between cells, and the active cell's blue.
+const NOTEBOOK_COLUMN: f32 = 880.0;
+const NOTEBOOK_MARGIN: f32 = 52.0;
+const NOTEBOOK_RIGHT: f32 = 20.0;
+const NOTEBOOK_GAP: f32 = 16.0;
+const NOTEBOOK_GRAY: Color32 = Color32::from_rgb(0xF3, 0xF4, 0xF6);
+const NOTEBOOK_BLUE: Color32 = Color32::from_rgb(0x25, 0x63, 0xEB);
+const CELL_MENU_W: f32 = 236.0;
 /// The short gray bar that shows or hides the workspace.
 const BAR_GRAY: Color32 = Color32::from_rgb(186, 188, 192);
 

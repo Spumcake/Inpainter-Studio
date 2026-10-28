@@ -149,6 +149,7 @@ fn cells(row: &str) -> Vec<String> {
 
 /// `text` laid out to `width`, in `color`.
 pub(crate) fn lay_out(painter: &Painter, text: &str, color: Color32, width: f32) -> Laid {
+    let text = &visible(text);
     let width = width.max(40.0);
     let mut pieces = Vec::new();
     let mut y = 0.0;
@@ -347,8 +348,230 @@ fn inline(text: &str, color: Color32, size: f32, line: f32, strong: bool, width:
     job
 }
 
+/// What a stretch of Markdown source is, for colouring it as Jupyter's
+/// editor does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Token {
+    Plain,
+    Heading,
+    Quote,
+    /// The `*` and `_` that mark emphasis.
+    Mark,
+    Link,
+    Code,
+    /// U+FE0E and U+FE0F, which pick an emoji's style and draw nothing.
+    Hidden,
+}
+
+/// Jupyter's (CodeMirror's) colours for Markdown source.
+pub(crate) fn token_color(token: Token) -> Color32 {
+    match token {
+        Token::Plain | Token::Hidden => ts::TEXT,
+        Token::Heading => Color32::from_rgb(0x00, 0x00, 0xFF),
+        Token::Quote => Color32::from_rgb(0x00, 0x99, 0x00),
+        Token::Mark => Color32::from_rgb(0xAA, 0x22, 0xFF),
+        Token::Link => Color32::from_rgb(0x00, 0x00, 0xCC),
+        Token::Code => Color32::from_rgb(0x77, 0x00, 0x88),
+    }
+}
+
+fn hidden(c: char) -> bool {
+    c == '\u{FE0E}' || c == '\u{FE0F}'
+}
+
+/// The text with the characters that pick an emoji's style removed, since
+/// no face draws them.
+pub(crate) fn visible(text: &str) -> String {
+    text.chars().filter(|c| !hidden(*c)).collect()
+}
+
+/// Markdown source cut into stretches that cover every byte once, in
+/// order: whole lines for headings, quotes, and fenced code, and within
+/// other lines, links, inline code, and emphasis marks.
+pub(crate) fn source_tokens(text: &str) -> Vec<(std::ops::Range<usize>, Token)> {
+    let mut spans: Vec<(std::ops::Range<usize>, Token)> = Vec::new();
+    let mut push = |range: std::ops::Range<usize>, token: Token| {
+        if range.is_empty() {
+            return;
+        }
+        match spans.last_mut() {
+            Some((last, kind)) if *kind == token && last.end == range.start => last.end = range.end,
+            _ => spans.push((range, token)),
+        }
+    };
+    let mut fenced = false;
+    let mut start = 0;
+    for line in text.split_inclusive('\n') {
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        let body = &line[indent.min(3)..];
+        let fence = indent <= 3 && (body.starts_with("```") || body.starts_with("~~~"));
+        let hashes = body.chars().take_while(|c| *c == '#').count();
+        let heading = indent <= 3
+            && (1..=6).contains(&hashes)
+            && body[hashes..].chars().next().is_none_or(|c| c == ' ' || c == '\n');
+        let whole = if fence || fenced {
+            Some(Token::Code)
+        } else if heading {
+            Some(Token::Heading)
+        } else {
+            None
+        };
+        if fence {
+            fenced = !fenced;
+        }
+        match whole {
+            Some(token) => line_with_hidden(&mut push, start, line, token),
+            None => {
+                let base = if indent <= 3 && body.starts_with('>') { Token::Quote } else { Token::Plain };
+                inline_tokens(&mut push, start, line, base);
+            }
+        }
+        start += line.len();
+    }
+    spans
+}
+
+/// Any other prompt: plain, with only the emoji style selectors hidden.
+pub(crate) fn source_tokens_plain(text: &str) -> Vec<(std::ops::Range<usize>, Token)> {
+    let mut spans: Vec<(std::ops::Range<usize>, Token)> = Vec::new();
+    line_with_hidden(
+        &mut |range: std::ops::Range<usize>, token: Token| match spans.last_mut() {
+            Some((last, kind)) if *kind == token && last.end == range.start => last.end = range.end,
+            _ => spans.push((range, token)),
+        },
+        0,
+        text,
+        Token::Plain,
+    );
+    spans
+}
+
+fn line_with_hidden(push: &mut impl FnMut(std::ops::Range<usize>, Token), start: usize, line: &str, token: Token) {
+    for (at, c) in line.char_indices() {
+        let kind = if hidden(c) { Token::Hidden } else { token };
+        push(start + at..start + at + c.len_utf8(), kind);
+    }
+}
+
+/// One line that is not a heading or code: links and inline code in their
+/// colours, emphasis marks in theirs (or the quote's), the rest in `base`.
+fn inline_tokens(push: &mut impl FnMut(std::ops::Range<usize>, Token), start: usize, line: &str, base: Token) {
+    let chars: Vec<(usize, char)> = line.char_indices().collect();
+    let at = |index: usize| chars.get(index).map_or(line.len(), |(offset, _)| *offset);
+    let lead = chars.iter().take_while(|(_, c)| *c == ' ').count();
+    let mut index = 0;
+    while index < chars.len() {
+        let c = chars[index].1;
+        // Inline code: a run of backticks up to the same run.
+        if c == '`' {
+            let run = chars[index..].iter().take_while(|(_, c)| *c == '`').count();
+            let close = (index + run..chars.len()).find(|&k| {
+                chars[k..].iter().take_while(|(_, c)| *c == '`').count() == run
+                    && (k == 0 || chars[k - 1].1 != '`')
+            });
+            if let Some(close) = close {
+                line_with_hidden(push, start + at(index), &line[at(index)..at(close + run)], Token::Code);
+                index = close + run;
+                continue;
+            }
+        }
+        // A link, or an image: [text](target) on one line.
+        if c == '[' || (c == '!' && chars.get(index + 1).is_some_and(|(_, c)| *c == '[')) {
+            let open = if c == '!' { index + 1 } else { index };
+            if let Some(middle) = (open + 1..chars.len().saturating_sub(1))
+                .find(|&k| chars[k].1 == ']' && chars[k + 1].1 == '(')
+                && let Some(end) = (middle + 2..chars.len()).find(|&k| chars[k].1 == ')')
+            {
+                line_with_hidden(push, start + at(index), &line[at(index)..at(end + 1)], Token::Link);
+                index = end + 1;
+                continue;
+            }
+        }
+        if c == '*' || c == '_' {
+            let run = chars[index..].iter().take_while(|(_, other)| *other == c).count();
+            let before = index.checked_sub(1).map(|k| chars[k].1);
+            let after = chars.get(index + run).map(|(_, c)| *c);
+            let bullet = c == '*' && index == lead && run == 1 && after == Some(' ');
+            let inside_word = c == '_'
+                && before.is_some_and(char::is_alphanumeric)
+                && after.is_some_and(char::is_alphanumeric);
+            let mark = if base == Token::Quote { Token::Quote } else { Token::Mark };
+            let token = if bullet || inside_word || run > 3 { base } else { mark };
+            push(start + at(index)..start + at(index + run), token);
+            index += run;
+            continue;
+        }
+        push(start + at(index)..start + at(index + 1), if hidden(c) { Token::Hidden } else { base });
+        index += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{Token, source_tokens, visible};
+
+    fn tokens(text: &str) -> Vec<(&str, Token)> {
+        source_tokens(text).into_iter().map(|(range, token)| (&text[range], token)).collect()
+    }
+
+    #[test]
+    fn markdown_source_is_coloured_as_jupyter_colours_it() {
+        let text = "# Intro ✨\n> **See** [it](https://x)\nA **bold** `code` [link](u) snake_case\n* item\n```\nlet a\n```\n";
+        let spans = source_tokens(text);
+        // Every byte once, in order, so the editor's cursor is unchanged.
+        let mut next = 0;
+        for (range, _) in &spans {
+            assert_eq!(range.start, next);
+            next = range.end;
+        }
+        assert_eq!(next, text.len());
+        let found = tokens(text);
+        assert!(found.contains(&("# Intro ✨\n", Token::Heading)));
+        assert!(found.contains(&("> **See** ", Token::Quote)));
+        assert!(found.contains(&("[it](https://x)", Token::Link)));
+        assert!(found.contains(&("**", Token::Mark)));
+        assert!(found.contains(&("`code`", Token::Code)));
+        assert!(found.contains(&("[link](u)", Token::Link)));
+        assert!(found.iter().any(|(text, token)| text.contains("snake_case") && *token == Token::Plain));
+        assert!(found.iter().any(|(text, token)| text.contains("* item") && *token == Token::Plain));
+        assert!(found.contains(&("```\nlet a\n```\n", Token::Code)));
+    }
+
+    /// Catches emoji drawn as "?": every face Studio writes in, bold
+    /// headings and code included, has newer emoji such as the test tube.
+    #[test]
+    fn every_face_draws_emoji() {
+        let ctx = egui::Context::default();
+        crate::toolbar::install_fonts(&ctx);
+        ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+        let faces = [
+            egui::FontFamily::Proportional,
+            egui::FontFamily::Monospace,
+            egui::FontFamily::Name(crate::icons::INTER_BOLD.into()),
+            egui::FontFamily::Name(crate::icons::INTER_ITALIC.into()),
+            egui::FontFamily::Name(crate::widgets::SEMIBOLD.into()),
+        ];
+        // egui's own `has_glyph` is wrong for a character in the face that
+        // also draws its "missing" mark, so compare the drawn glyphs.
+        let glyph = |font: &egui::FontId, c: char| {
+            let galley = ctx.fonts_mut(|fonts| fonts.layout_no_wrap(c.to_string(), font.clone(), Color32::BLACK));
+            galley.rows[0].glyphs[0].uv_rect
+        };
+        for family in faces {
+            let font = egui::FontId::new(14.0, family.clone());
+            let missing = glyph(&font, '\u{10FFFD}');
+            for emoji in ['⚠', '✨', '📓', '🧪', '🫠'] {
+                assert_ne!(glyph(&font, emoji), missing, "{emoji} is missing in {family:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_emoji_style_selector_draws_nothing() {
+        assert_eq!(visible("⚠\u{FE0F} Experimental"), "⚠ Experimental");
+        assert!(tokens("⚠\u{FE0F}").contains(&("\u{FE0F}", Token::Hidden)));
+    }
+
     use super::*;
 
     /// Catches Markdown shown as written, or parsed into the wrong blocks.

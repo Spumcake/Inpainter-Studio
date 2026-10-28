@@ -70,6 +70,10 @@ pub struct Chord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Binding {
     pub chord: Chord,
+    /// Chords pressed in turn after `chord`, each within a second, such as
+    /// the second D of D D. Empty for a single chord.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub then: Vec<Chord>,
     pub action: Action,
 }
 

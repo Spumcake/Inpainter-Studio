@@ -1,17 +1,21 @@
-//! A mission book: the cells, which one is selected, the file, and the undo.
+//! A notebook: the cells, which one is active, every cell's runs, the file,
+//! and the undo.
 //!
 //! The host draws the cells and runs them. This process only keeps them.
+//! A run is kept for good: the runs live apart from the undo history, so no
+//! undo or redo ever adds or removes one, as the owner set on 2026-10-28.
 
 use protocol::{
-    Action, AppMessage, Ask, AskButton, Cell, CellPart, CellState, Chord, ContentsKind, FileFilter,
-    FileKind, HostMessage, Keys, MenuEntry, TabEntry, Tabs, ToolItem, ToolResult,
-    Toolbar,
+    Action, AppMessage, Ask, AskButton, Cell, CellPart, CellState, CellVersion, Chord,
+    ContentsKind, FileFilter, FileKind, HostMessage, Keys, MARKDOWN_KIND, MenuEntry, TEXT_KIND,
+    TabEntry, Tabs, ToolItem, ToolResult, Toolbar,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-const VERSION: u32 = 1;
-const KIND: &str = "text";
+const VERSION: u32 = 2;
+const UNTITLED: &str = "Untitled Notebook";
 
 #[derive(Clone)]
 struct Snap {
@@ -25,6 +29,9 @@ struct Book {
     path: Option<PathBuf>,
     cells: Vec<Cell>,
     selected: Option<String>,
+    /// Every run of every cell, by cell id, including cells since deleted,
+    /// so undoing a delete brings a cell back with all its runs.
+    runs: HashMap<String, Vec<CellVersion>>,
     undo: Vec<Snap>,
     redo: Vec<Snap>,
     dirty: bool,
@@ -51,12 +58,24 @@ pub struct Session {
     /// The file request's id, when one is open.
     file_id: Option<String>,
     next_file: u64,
+    /// The kind + adds, which the toolbar's dropdown shows.
+    adding: String,
+    /// The cell cut or copied last, with its runs.
+    clipboard: Option<Cell>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct BookFile {
     version: u32,
     cells: Vec<Cell>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    selected: Option<String>,
+}
+
+/// A notebook as read from its file: its cells and its active cell.
+pub struct Read {
+    pub cells: Vec<Cell>,
+    pub selected: Option<String>,
 }
 
 impl Session {
@@ -84,6 +103,8 @@ impl Session {
             saving: None,
             file_id: None,
             next_file: 1,
+            adding: String::from(TEXT_KIND),
+            clipboard: None,
         }
     }
 
@@ -104,7 +125,13 @@ impl Session {
         // No skills yet: the assistant reading or changing a book comes later.
         messages.push(AppMessage::Skills { skills: Vec::new() });
         messages.push(AppMessage::End);
-        if !self.books.is_empty() {
+        if let Some(book) = self.books.first() {
+            // A new notebook's first cell, so the host draws it at once.
+            messages.push(AppMessage::Cells {
+                tab: book.id.clone(),
+                cells: book.cells.clone(),
+                selected: book.selected.clone(),
+            });
             messages.extend(self.declared());
         }
         messages
@@ -128,14 +155,19 @@ impl Session {
             HostMessage::CellResult {
                 tab,
                 cell,
+                input,
                 endpoint,
                 model,
                 state,
                 output,
                 error,
-            } => self.finish(&tab, &cell, endpoint, model, state, output, error, &mut out),
+            } => self.finish(&tab, &cell, Run { input, endpoint, model, state, output, error }, &mut out),
             HostMessage::InsertCell { tab, index, cell } => self.insert(&tab, index, cell, &mut out),
             HostMessage::SelectCell { tab, cell } => self.select(&tab, &cell, &mut out),
+            HostMessage::SetVersion { tab, cell, index } => self.set_version(&tab, &cell, index, &mut out),
+            HostMessage::MoveCell { tab, cell, to } => self.move_cell(&tab, &cell, to, &mut out),
+            HostMessage::DeleteCell { tab, cell } => self.delete(&tab, &cell, &mut out),
+            HostMessage::ShowSource { tab, cell } => self.show_source(&tab, &cell, &mut out),
             HostMessage::Claim { id, path } => out.push(AppMessage::Claimed {
                 id,
                 yours: claims(Path::new(&path)),
@@ -154,8 +186,29 @@ impl Session {
         match id {
             "new_book" => {
                 self.push_book(None);
+                out.push(AppMessage::Contents {
+                    tab: self.books[self.active].id.clone(),
+                    kind: ContentsKind::Cells,
+                });
+                // Its first cell, so the host draws it at once.
+                self.emit_cells(out);
+            }
+            "add_above" => self.add_near(0, out),
+            "add_below" => self.add_near(1, out),
+            "kind_text" => {
+                self.adding = String::from(TEXT_KIND);
                 out.extend(self.declared());
             }
+            "kind_markdown" => {
+                self.adding = String::from(MARKDOWN_KIND);
+                out.extend(self.declared());
+            }
+            "cut" => {
+                self.copy_active();
+                self.delete_cell(out);
+            }
+            "copy" => self.copy_active(),
+            "paste" => self.paste(out),
             "open" => self.ask_file(FileKind::Open, None, false, out),
             "save" => self.save_active(false, out),
             "save_as" => self.save_active(true, out),
@@ -182,19 +235,29 @@ impl Session {
         let label = path
             .as_ref()
             .map(|path| file_title(path))
-            .unwrap_or_else(|| String::from("Untitled Mission Book"));
+            .unwrap_or_else(|| String::from(UNTITLED));
+        // A new notebook opens with one empty cell, which is active.
+        let first = self.empty_cell();
         self.books.push(Book {
             id,
             label,
             path,
-            cells: Vec::new(),
-            selected: None,
+            selected: Some(first.id.clone()),
+            cells: vec![first],
+            runs: HashMap::new(),
             undo: Vec::new(),
             redo: Vec::new(),
             dirty: false,
         });
         self.active = self.books.len() - 1;
         self.active
+    }
+
+    /// An empty cell of the kind + adds.
+    fn empty_cell(&self) -> Cell {
+        let mut cell = Cell::text(protocol::cell_id(), "");
+        cell.kind = self.adding.clone();
+        cell
     }
 
     fn book_mut(&mut self, tab: &str) -> Option<&mut Book> {
@@ -207,16 +270,128 @@ impl Session {
         }
     }
 
+    /// + adds an empty cell of the dropdown's kind below the active cell.
     fn add_cell(&mut self, out: &mut Vec<AppMessage>) {
+        self.add_near(1, out);
+    }
+
+    /// An empty cell above (`after` 0) or below (`after` 1) the active cell,
+    /// which becomes active.
+    fn add_near(&mut self, after: usize, out: &mut Vec<AppMessage>) {
+        let cell = self.empty_cell();
         let Some(book) = self.books.get_mut(self.active) else {
             return;
         };
         book.snapshot();
-        let cell = Cell::text(protocol::cell_id(), "");
+        let at = book.active_index().map_or(book.cells.len(), |index| index + after);
         book.selected = Some(cell.id.clone());
-        book.cells.push(cell);
+        book.cells.insert(at.min(book.cells.len()), cell);
         book.dirty = true;
         self.emit_cells(out);
+    }
+
+    fn copy_active(&mut self) {
+        let Some(book) = self.books.get(self.active) else {
+            return;
+        };
+        if let Some(index) = book.active_index() {
+            self.clipboard = Some(book.cells[index].clone());
+        }
+    }
+
+    /// A copy of the clipboard's cell below the active cell, with a new id,
+    /// `from` naming the cell it came from, and its runs under new ids.
+    fn paste(&mut self, out: &mut Vec<AppMessage>) {
+        let Some(source) = self.clipboard.clone() else {
+            return;
+        };
+        let Some(book) = self.books.get_mut(self.active) else {
+            return;
+        };
+        let mut cell = source.clone();
+        cell.id = protocol::cell_id();
+        cell.from = Some(source.id.clone());
+        for version in &mut cell.versions {
+            version.id = protocol::cell_id();
+        }
+        book.snapshot();
+        book.runs.insert(cell.id.clone(), cell.versions.clone());
+        let at = book.active_index().map_or(book.cells.len(), |index| index + 1);
+        book.selected = Some(cell.id.clone());
+        book.cells.insert(at.min(book.cells.len()), cell);
+        book.dirty = true;
+        self.emit_cells(out);
+    }
+
+    fn set_version(&mut self, tab: &str, id: &str, index: usize, out: &mut Vec<AppMessage>) {
+        let Some(book) = self.book_mut(tab) else {
+            return;
+        };
+        let Some(position) = book.cells.iter().position(|cell| cell.id == id) else {
+            return;
+        };
+        if book.cells[position].current == Some(index) && book.cells[position].input == book.cells[position].versions.get(index).map(|v| v.input.clone()).unwrap_or_default() {
+            return;
+        }
+        if index >= book.cells[position].versions.len() {
+            return;
+        }
+        book.snapshot();
+        book.cells[position].show_version(index);
+        book.selected = Some(id.to_string());
+        book.dirty = true;
+        let tab = tab.to_string();
+        self.emit_tab(&tab, out);
+    }
+
+    fn move_cell(&mut self, tab: &str, id: &str, to: usize, out: &mut Vec<AppMessage>) {
+        let Some(book) = self.book_mut(tab) else {
+            return;
+        };
+        let Some(from) = book.cells.iter().position(|cell| cell.id == id) else {
+            return;
+        };
+        let to = to.min(book.cells.len() - 1);
+        if from == to {
+            return;
+        }
+        book.snapshot();
+        let cell = book.cells.remove(from);
+        book.cells.insert(to, cell);
+        book.selected = Some(id.to_string());
+        book.dirty = true;
+        let tab = tab.to_string();
+        self.emit_tab(&tab, out);
+    }
+
+    fn delete(&mut self, tab: &str, id: &str, out: &mut Vec<AppMessage>) {
+        if let Some(index) = self.books.iter().position(|book| book.id == tab) {
+            self.active = index;
+        }
+        let Some(book) = self.books.get_mut(self.active) else {
+            return;
+        };
+        if !book.cells.iter().any(|cell| cell.id == id) {
+            return;
+        }
+        book.selected = Some(id.to_string());
+        self.delete_cell(out);
+    }
+
+    /// A rendered Markdown cell shows its source again. Not an undo step.
+    fn show_source(&mut self, tab: &str, id: &str, out: &mut Vec<AppMessage>) {
+        let Some(book) = self.book_mut(tab) else {
+            return;
+        };
+        let Some(cell) = book.cells.iter_mut().find(|cell| cell.id == id && cell.kind == MARKDOWN_KIND) else {
+            return;
+        };
+        if cell.state == CellState::Idle {
+            return;
+        }
+        cell.state = CellState::Idle;
+        let tab = tab.to_string();
+        self.emit_tab(&tab, out);
     }
 
     fn delete_cell(&mut self, out: &mut Vec<AppMessage>) {
@@ -231,8 +406,15 @@ impl Session {
         };
         book.snapshot();
         book.cells.remove(index);
-        book.selected = book.cells.get(index).or_else(|| book.cells.last()).map(|cell| cell.id.clone());
         book.dirty = true;
+        // There is always one active cell: the last one deleted leaves an
+        // empty one.
+        if book.cells.is_empty() {
+            let mut cell = Cell::text(protocol::cell_id(), "");
+            cell.kind = self.adding.clone();
+            book.cells.push(cell);
+        }
+        book.selected = book.cells.get(index).or_else(|| book.cells.last()).map(|cell| cell.id.clone());
         self.emit_cells(out);
     }
 
@@ -254,44 +436,67 @@ impl Session {
         self.emit_tab(&tab, out);
     }
 
-    fn finish(
-        &mut self,
-        tab: &str,
-        id: &str,
-        endpoint: String,
-        model: String,
-        state: CellState,
-        output: Vec<CellPart>,
-        error: Option<String>,
-        out: &mut Vec<AppMessage>,
-    ) {
+    /// A run ended. A Markdown cell shows rendered. Any other cell keeps the
+    /// run for good as a new version, made from the prompt that actually ran,
+    /// and shows it. A run is never an undo step.
+    fn finish(&mut self, tab: &str, id: &str, run: Run, out: &mut Vec<AppMessage>) {
         let Some(book) = self.book_mut(tab) else {
             return;
         };
-        if !book.cells.iter().any(|cell| cell.id == id) {
+        let Some(cell) = book.cells.iter_mut().find(|cell| cell.id == id) else {
+            // The cell was deleted while it ran. The run is still kept, so
+            // undoing the delete brings it back with this run.
+            if run.endpoint.is_empty() {
+                return;
+            }
+            book.runs.entry(id.to_string()).or_default().push(CellVersion {
+                id: protocol::cell_id(),
+                input: run.input,
+                endpoint: Some(run.endpoint),
+                model: Some(run.model),
+                output: run.output,
+                state: run.state,
+                error: run.error,
+                time: now(),
+            });
+            book.dirty = true;
             return;
+        };
+        if cell.kind == MARKDOWN_KIND {
+            cell.state = CellState::Done;
+        } else {
+            let runs = book.runs.entry(id.to_string()).or_default();
+            runs.push(CellVersion {
+                id: protocol::cell_id(),
+                input: run.input,
+                endpoint: Some(run.endpoint),
+                model: Some(run.model),
+                output: run.output,
+                state: run.state,
+                error: run.error,
+                time: now(),
+            });
+            cell.versions = runs.clone();
+            cell.current = Some(cell.versions.len() - 1);
+            cell.agree();
+            book.dirty = true;
         }
-        book.snapshot();
-        if let Some(cell) = book.cells.iter_mut().find(|cell| cell.id == id) {
-            cell.endpoint = Some(endpoint);
-            cell.model = Some(model);
-            cell.state = state;
-            cell.output = output;
-            cell.error = error;
-        }
-        book.dirty = true;
         let tab = tab.to_string();
         self.emit_tab(&tab, out);
     }
 
-    fn insert(&mut self, tab: &str, index: usize, cell: Cell, out: &mut Vec<AppMessage>) {
+    /// A dragged cell, or, with none, an empty one of the dropdown's kind,
+    /// as Shift+Enter at the last cell asks for.
+    fn insert(&mut self, tab: &str, index: usize, cell: Option<Cell>, out: &mut Vec<AppMessage>) {
+        let cell = cell.unwrap_or_else(|| self.empty_cell());
         let Some(book) = self.book_mut(tab) else {
             return;
         };
-        if cell.kind != KIND && cell.kind.is_empty() {
+        if cell.kind.is_empty() {
             return;
         }
         book.snapshot();
+        book.runs.insert(cell.id.clone(), cell.versions.clone());
         let index = index.min(book.cells.len());
         book.selected = Some(cell.id.clone());
         book.cells.insert(index, cell);
@@ -322,7 +527,8 @@ impl Session {
         let Some(cell) = book.cells.iter().find(|cell| cell.id == id) else {
             return;
         };
-        if cell.kind != KIND || cell.prompt().trim().is_empty() {
+        let runs = cell.kind == MARKDOWN_KIND || (cell.kind == TEXT_KIND && !cell.prompt().trim().is_empty());
+        if !runs {
             return;
         }
         out.push(AppMessage::RunCell {
@@ -357,6 +563,7 @@ impl Session {
         });
         book.cells = snap.cells;
         book.selected = snap.selected;
+        book.attach_runs();
         book.dirty = true;
         self.emit_cells(out);
     }
@@ -374,6 +581,7 @@ impl Session {
         });
         book.cells = snap.cells;
         book.selected = snap.selected;
+        book.attach_runs();
         book.dirty = true;
         self.emit_cells(out);
     }
@@ -420,7 +628,7 @@ impl Session {
             .path
             .as_ref()
             .map(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| Some(String::from("Untitled Mission Book.smx")));
+            .unwrap_or_else(|| Some(format!("{UNTITLED}.smx")));
         self.ask_file(FileKind::Save, name, false, out);
     }
 
@@ -440,7 +648,7 @@ impl Session {
             name,
             folder: None,
             filter: Some(FileFilter {
-                name: "Mission book".into(),
+                name: "Notebook".into(),
                 extensions: vec!["smx".into()],
             }),
         });
@@ -465,12 +673,9 @@ impl Session {
         }
         // An Open.
         match read_book(&path) {
-            Ok(cells) => {
+            Ok(read) => {
                 let index = self.push_book(Some(path));
-                self.books[index].cells = cells;
-                if let Some(first) = self.books[index].cells.first() {
-                    self.books[index].selected = Some(first.id.clone());
-                }
+                self.books[index].load(read);
                 out.push(AppMessage::Contents {
                     tab: self.books[index].id.clone(),
                     kind: ContentsKind::Cells,
@@ -479,7 +684,7 @@ impl Session {
             }
             Err(reason) => out.push(AppMessage::Ask(Ask {
                 id: "book-unreadable".into(),
-                title: "This book could not be opened".into(),
+                title: "This notebook could not be opened".into(),
                 lines: vec![reason],
                 buttons: vec![AskButton {
                     id: "ok".into(),
@@ -494,10 +699,10 @@ impl Session {
         let Some(book) = self.books.get(index) else {
             return;
         };
-        if let Err(reason) = write_book(path, &book.cells) {
+        if let Err(reason) = write_book(path, &book.cells, book.selected.as_deref()) {
             out.push(AppMessage::Ask(Ask {
                 id: "book-unwritten".into(),
-                title: "This book could not be saved".into(),
+                title: "This notebook could not be saved".into(),
                 lines: vec![reason],
                 buttons: vec![AskButton {
                     id: "ok".into(),
@@ -568,7 +773,7 @@ impl Session {
             self.write_at(self.active, &path, self.quitting, out);
             return;
         }
-        let name = Some(String::from("Untitled Mission Book.smx"));
+        let name = Some(format!("{UNTITLED}.smx"));
         self.ask_file(FileKind::Save, name, self.quitting, out);
     }
 
@@ -606,15 +811,14 @@ impl Session {
                 tab: self.books[self.active].id.clone(),
                 kind: ContentsKind::Cells,
             });
-            out.extend(self.declared());
+            self.emit_cells(out);
             return;
         };
         let path = PathBuf::from(path);
         match read_book(&path) {
-            Ok(cells) => {
+            Ok(read) => {
                 let index = self.push_book(Some(path));
-                self.books[index].cells = cells;
-                self.books[index].selected = self.books[index].cells.first().map(|cell| cell.id.clone());
+                self.books[index].load(read);
                 out.push(AppMessage::Contents {
                     tab: self.books[index].id.clone(),
                     kind: ContentsKind::Cells,
@@ -623,7 +827,7 @@ impl Session {
             }
             Err(reason) => out.push(AppMessage::Ask(Ask {
                 id: "book-unreadable".into(),
-                title: "This book could not be opened".into(),
+                title: "This notebook could not be opened".into(),
                 lines: vec![reason],
                 buttons: vec![AskButton {
                     id: "ok".into(),
@@ -665,7 +869,7 @@ impl Session {
 
     fn declared(&self) -> Vec<AppMessage> {
         let mut messages = vec![
-            AppMessage::Toolbar(toolbar()),
+            AppMessage::Toolbar(toolbar(&self.adding)),
             AppMessage::Menu { rows: menu() },
             AppMessage::Keys(keys()),
         ];
@@ -685,14 +889,70 @@ impl Session {
                     .collect(),
                 active: book.id.clone(),
                 new_tab: Some(Action::new("new_book")),
-                new_tab_tip: "New book".into(),
+                new_tab_tip: "New notebook".into(),
             }));
         }
         messages
     }
 }
 
+/// A run as the host reports it.
+struct Run {
+    input: Vec<CellPart>,
+    endpoint: String,
+    model: String,
+    state: CellState,
+    output: Vec<CellPart>,
+    error: Option<String>,
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
 impl Book {
+    fn active_index(&self) -> Option<usize> {
+        let selected = self.selected.as_deref()?;
+        self.cells.iter().position(|cell| cell.id == selected)
+    }
+
+    /// Every cell carries all its runs, whatever snapshot it came back
+    /// from, and agrees with its current one.
+    fn attach_runs(&mut self) {
+        for cell in &mut self.cells {
+            let runs = self.runs.get(&cell.id).cloned().unwrap_or_default();
+            // A run made after this snapshot stays current: undo takes back
+            // the steps around a run, never the run itself, so the newest
+            // result keeps showing. Only a step that switched versions puts
+            // an older one back.
+            if runs.len() > cell.versions.len() {
+                cell.current = Some(runs.len() - 1);
+            }
+            cell.versions = runs;
+            cell.agree();
+        }
+        if self.active_index().is_none() {
+            self.selected = self.cells.first().map(|cell| cell.id.clone());
+        }
+    }
+
+    /// A notebook read from its file.
+    fn load(&mut self, read: Read) {
+        self.runs = read
+            .cells
+            .iter()
+            .map(|cell| (cell.id.clone(), cell.versions.clone()))
+            .collect();
+        if !read.cells.is_empty() {
+            self.cells = read.cells;
+        }
+        self.selected = read.selected;
+        self.attach_runs();
+    }
+
     fn snapshot(&mut self) {
         self.undo.push(Snap {
             cells: self.cells.clone(),
@@ -705,8 +965,8 @@ impl Book {
 fn keep_ask() -> Ask {
     Ask {
         id: "keep-book".into(),
-        title: "Keep this book?".into(),
-        lines: vec!["The book has changes that are not saved.".into()],
+        title: "Keep this notebook?".into(),
+        lines: vec!["The notebook has changes that are not saved.".into()],
         buttons: vec![
             AskButton {
                 id: "save".into(),
@@ -725,52 +985,57 @@ fn keep_ask() -> Ask {
     }
 }
 
-fn toolbar() -> Toolbar {
+/// The toolbar, as the owner's reference binds it from its start up to the
+/// type dropdown: the pointer, +, cut, copy, paste, delete, run, stop, Run
+/// All, and the dropdown, which shows the kind + adds.
+fn toolbar(adding: &str) -> Toolbar {
+    let button = |icon: &str, tip: &str, action: Option<&str>, enabled: bool, selected: bool| ToolItem::Button {
+        icon: icon.into(),
+        tip: tip.into(),
+        enabled,
+        selected,
+        action: action.map(Action::new),
+        menu: Vec::new(),
+    };
     Toolbar {
         items: vec![
-            ToolItem::Button {
-                icon: "plus".into(),
-                tip: "Add cell".into(),
+            // The only tool for now, always selected.
+            button("cursor-pointer", "Select", None, true, true),
+            button("plus", "Add cell", Some("add_cell"), true, false),
+            ToolItem::Separator,
+            button("scissor", "Cut cell", Some("cut"), true, false),
+            button("copy", "Copy cell", Some("copy"), true, false),
+            button("paste-clipboard", "Paste cell", Some("paste"), true, false),
+            button("trash", "Delete cell", Some("delete_cell"), true, false),
+            ToolItem::Separator,
+            button("play", "Run", Some("run"), true, false),
+            button("square", "Stop", Some("stop"), true, false),
+            // Run All waits for a later version.
+            button("forward", "Run all", None, false, false),
+            ToolItem::Separator,
+            ToolItem::Menu {
+                icon: String::new(),
+                label: kind_label(adding).into(),
                 enabled: true,
-                selected: false,
-                action: Some(Action::new("add_cell")),
-                menu: Vec::new(),
-            },
-            ToolItem::Button {
-                icon: "trash".into(),
-                tip: "Delete cell".into(),
-                enabled: true,
-                selected: false,
-                action: Some(Action::new("delete_cell")),
-                menu: Vec::new(),
-            },
-            ToolItem::Button {
-                icon: "play".into(),
-                tip: "Run".into(),
-                enabled: true,
-                selected: false,
-                action: Some(Action::new("run")),
-                menu: Vec::new(),
-            },
-            ToolItem::Button {
-                icon: "square".into(),
-                tip: "Stop".into(),
-                enabled: true,
-                selected: false,
-                action: Some(Action::new("stop")),
-                menu: Vec::new(),
+                rows: vec![row("LLM", "kind_text"), row("Markdown", "kind_markdown")],
             },
         ],
         trailing: Vec::new(),
     }
 }
 
+fn kind_label(kind: &str) -> &'static str {
+    if kind == MARKDOWN_KIND { "Markdown" } else { "LLM" }
+}
+
 fn menu() -> Vec<MenuEntry> {
     vec![
-        row("New book", "new_book"),
+        row("New notebook", "new_book"),
         row("Open", "open"),
         row("Save", "save"),
         row("Save As", "save_as"),
+        row("Undo", "undo"),
+        row("Redo", "redo"),
     ]
 }
 
@@ -786,31 +1051,35 @@ fn row(label: &str, id: &str) -> MenuEntry {
     }
 }
 
+/// The notebook's own keys, as Jupyter's command mode has them. The host
+/// sends them only while no text is being edited.
 fn keys() -> Keys {
+    let chord = |key: &str, command: bool, shift: bool| Chord {
+        key: key.into(),
+        command,
+        shift: Some(shift),
+        alt: false,
+    };
+    let bind = |chord: Chord, then: Vec<Chord>, action: &str| protocol::Binding {
+        chord,
+        then,
+        action: Action::new(action),
+    };
     Keys {
         bindings: vec![
-            protocol::Binding {
-                chord: Chord {
-                    key: "Z".into(),
-                    command: true,
-                    shift: Some(false),
-                    alt: false,
-                },
-                action: Action::new("undo"),
-            },
-            protocol::Binding {
-                chord: Chord {
-                    key: "Z".into(),
-                    command: true,
-                    shift: Some(true),
-                    alt: false,
-                },
-                action: Action::new("redo"),
-            },
+            bind(chord("Z", true, false), Vec::new(), "undo"),
+            bind(chord("Z", true, true), Vec::new(), "redo"),
+            bind(chord("Z", false, false), Vec::new(), "undo"),
+            bind(chord("Z", false, true), Vec::new(), "redo"),
+            bind(chord("A", false, false), Vec::new(), "add_above"),
+            bind(chord("B", false, false), Vec::new(), "add_below"),
+            bind(chord("M", false, false), Vec::new(), "kind_markdown"),
+            bind(chord("L", false, false), Vec::new(), "kind_text"),
+            bind(chord("D", false, false), vec![chord("D", false, false)], "delete_cell"),
         ],
-        copy: None,
-        cut: None,
-        paste: None,
+        copy: Some(Action::new("copy")),
+        cut: Some(Action::new("cut")),
+        paste: Some(Action::new("paste")),
     }
 }
 
@@ -818,35 +1087,61 @@ fn file_title(path: &Path) -> String {
     path.file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .filter(|stem| !stem.is_empty())
-        .unwrap_or_else(|| String::from("Untitled Mission Book"))
+        .unwrap_or_else(|| String::from(UNTITLED))
 }
 
-/// True when the file is a mission book this application can open.
+/// True when the file is a notebook this application can open.
 pub fn claims(path: &Path) -> bool {
     read_book(path).is_ok()
 }
 
-pub fn read_book(path: &Path) -> Result<Vec<Cell>, String> {
+/// A notebook file: version 2, or a 0.5 mission book, version 1, whose
+/// cells with a result each become one run.
+pub fn read_book(path: &Path) -> Result<Read, String> {
     let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
     let file: BookFile = serde_json::from_str(&text).map_err(|_| {
-        String::from("It is not a mission book, or it is damaged.")
+        String::from("It is not a notebook, or it is damaged.")
     })?;
-    if file.version != VERSION {
-        return Err(format!(
-            "It is version {} of a mission book, and this Mission Control reads version {VERSION}.",
-            file.version
-        ));
+    let mut cells = file.cells;
+    match file.version {
+        1 => {
+            for cell in &mut cells {
+                if cell.versions.is_empty() && !cell.output.is_empty() {
+                    cell.versions.push(CellVersion {
+                        id: protocol::cell_id(),
+                        input: cell.input.clone(),
+                        endpoint: cell.endpoint.clone(),
+                        model: cell.model.clone(),
+                        output: cell.output.clone(),
+                        state: cell.state,
+                        error: cell.error.clone(),
+                        time: 0,
+                    });
+                    cell.current = Some(0);
+                }
+            }
+        }
+        VERSION => {}
+        other => {
+            return Err(format!(
+                "It is version {other} of a notebook, and this Mission Control reads version {VERSION}."
+            ));
+        }
     }
-    Ok(file.cells)
+    for cell in &mut cells {
+        cell.agree();
+    }
+    Ok(Read { cells, selected: file.selected })
 }
 
-pub fn write_book(path: &Path, cells: &[Cell]) -> Result<(), String> {
+pub fn write_book(path: &Path, cells: &[Cell], selected: Option<&str>) -> Result<(), String> {
     if let Some(folder) = path.parent() {
         std::fs::create_dir_all(folder).map_err(|error| error.to_string())?;
     }
     let file = BookFile {
         version: VERSION,
         cells: cells.to_vec(),
+        selected: selected.map(String::from),
     };
     let text = serde_json::to_string_pretty(&file).map_err(|error| error.to_string())?;
     let mut partial = path.as_os_str().to_owned();
@@ -889,11 +1184,51 @@ mod tests {
         }
     }
 
-    /// No host: create a book, add a cell, set its prompt, deliver a result,
-    /// undo, save, and reopen. Every reply is the protocol's, and the file
-    /// holds the cells.
+    fn command(session: &mut Session, id: &str) -> Vec<AppMessage> {
+        session.handle(HostMessage::Command {
+            id: id.into(),
+            tab: Some("1".into()),
+            arg: None,
+            node: None,
+            viewport: [800.0, 600.0],
+        })
+    }
+
+    /// The last cells report, and the selected cell's id.
+    fn last_cells(messages: &[AppMessage]) -> (Vec<Cell>, Option<String>) {
+        messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                AppMessage::Cells { cells, selected, .. } => Some((cells.clone(), selected.clone())),
+                _ => None,
+            })
+            .expect("no cells report")
+    }
+
+    fn text(words: &str) -> Vec<CellPart> {
+        vec![CellPart::Text { text: words.into() }]
+    }
+
+    fn run(session: &mut Session, cell: &str, prompt: &str, result: &str) -> Vec<AppMessage> {
+        session.handle(HostMessage::CellResult {
+            tab: "1".into(),
+            cell: cell.into(),
+            input: text(prompt),
+            endpoint: "openrouter".into(),
+            model: "stand-in/model".into(),
+            state: CellState::Done,
+            output: text(result),
+            error: None,
+        })
+    }
+
+    /// No host: a notebook keeps every run as a version, made from the prompt
+    /// that ran; back and forward switch versions; undo and redo never add or
+    /// remove a run; a deleted cell comes back with its runs; cut and paste,
+    /// Markdown, saving with the active cell, and reopening all hold.
     #[test]
-    fn a_book_is_kept_with_no_host() {
+    fn a_notebook_is_kept_with_no_host() {
         let dir = std::env::temp_dir().join(format!("inpainter-book-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -901,99 +1236,175 @@ mod tests {
         let mut session = Session::launch();
         let greeting = session.greeting();
         assert!(greeting.iter().any(|message| matches!(message, AppMessage::Contents { kind: ContentsKind::Cells, .. })));
-        assert!(greeting.iter().any(|message| matches!(message, AppMessage::End)));
+        assert!(greeting.iter().any(|message| matches!(
+            message,
+            AppMessage::Tabs(tabs) if tabs.tabs[0].label == UNTITLED
+        )));
 
-        let added = session.handle(HostMessage::Command {
-            id: "add_cell".into(),
-            tab: Some("1".into()),
-            arg: None,
-            node: None,
-            viewport: [800.0, 600.0],
-        });
-        let cell = cells_of(added.iter().find(|message| cells_of(message).is_some()).unwrap())
-            .unwrap()[0]
-            .clone();
-        assert_eq!(cell.kind, "text");
-        assert_eq!(cell.state, CellState::Idle);
-        assert!(cell.prompt().is_empty());
-
-        let edited = session.handle(HostMessage::EditCell {
+        // A new notebook has one empty LLM cell, active.
+        let (cells, selected) = last_cells(&session.handle(HostMessage::EditCell {
             tab: "1".into(),
-            cell: cell.id.clone(),
-            input: vec![CellPart::Text {
-                text: "A lighthouse keeper.".into(),
-            }],
-        });
-        let edited_cell = cells_of(edited.iter().find(|message| cells_of(message).is_some()).unwrap()).unwrap()[0].clone();
-        assert_eq!(edited_cell.prompt(), "A lighthouse keeper.");
+            cell: session.books[0].cells[0].id.clone(),
+            input: text("A lighthouse keeper."),
+        }));
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].kind, TEXT_KIND);
+        let first = cells[0].id.clone();
+        assert_eq!(selected.as_deref(), Some(first.as_str()));
 
-        let finished = session.handle(HostMessage::CellResult {
+        // Three runs, three versions, the last current.
+        run(&mut session, &first, "A lighthouse keeper.", "One.");
+        run(&mut session, &first, "A lighthouse keeper.", "Two.");
+        let (cells, _) = last_cells(&run(&mut session, &first, "A lighthouse keeper.", "Three."));
+        assert_eq!(cells[0].versions.len(), 3);
+        assert_eq!(cells[0].current, Some(2));
+        assert_eq!(cells[0].result_text(), "Three.");
+
+        // Back to version 2; an edit; a run from there adds a 4th at the end,
+        // holding the prompt that ran, not a later edit.
+        let (cells, _) = last_cells(&session.handle(HostMessage::SetVersion { tab: "1".into(), cell: first.clone(), index: 1 }));
+        assert_eq!((cells[0].current, cells[0].result_text().as_str()), (Some(1), "Two."));
+        session.handle(HostMessage::EditCell { tab: "1".into(), cell: first.clone(), input: text("A darker keeper.") });
+        let (cells, _) = last_cells(&run(&mut session, &first, "A darker keeper.", "Four."));
+        assert_eq!(cells[0].versions.len(), 4);
+        assert_eq!(cells[0].current, Some(3));
+        assert_eq!(cells[0].versions[3].input, text("A darker keeper."));
+        let ids: std::collections::HashSet<_> = cells[0].versions.iter().map(|version| version.id.clone()).collect();
+        assert_eq!(ids.len(), 4, "versions share an id");
+
+        // Undo and redo, every step back to the start and forward again,
+        // never change the number of runs.
+        // The three steps: the first edit, the switch to version 2, and the
+        // second edit.
+        for _ in 0..3 {
+            let (cells, _) = last_cells(&command(&mut session, "undo"));
+            assert_eq!(cells[0].versions.len(), 4, "undo removed a run");
+        }
+        assert!(command(&mut session, "undo").is_empty(), "a run was an undo step");
+        for _ in 0..3 {
+            let (cells, _) = last_cells(&command(&mut session, "redo"));
+            assert_eq!(cells[0].versions.len(), 4, "redo changed the runs");
+        }
+
+        // Add a Markdown cell below; running it shows it rendered, makes no
+        // version, and showing its source again is not a version either.
+        command(&mut session, "kind_markdown");
+        let (cells, selected) = last_cells(&command(&mut session, "add_cell"));
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[1].kind, MARKDOWN_KIND);
+        let notes = cells[1].id.clone();
+        assert_eq!(selected.as_deref(), Some(notes.as_str()));
+        session.handle(HostMessage::EditCell { tab: "1".into(), cell: notes.clone(), input: text("# The Last Signal") });
+        let (cells, _) = last_cells(&session.handle(HostMessage::CellResult {
             tab: "1".into(),
-            cell: cell.id.clone(),
-            endpoint: "openrouter".into(),
-            model: "stand-in/model".into(),
+            cell: notes.clone(),
+            input: Vec::new(),
+            endpoint: String::new(),
+            model: String::new(),
             state: CellState::Done,
-            output: vec![CellPart::Text {
-                text: "He kept the light.".into(),
-            }],
+            output: Vec::new(),
             error: None,
-        });
-        let done = cells_of(finished.iter().find(|message| cells_of(message).is_some()).unwrap()).unwrap()[0].clone();
-        assert_eq!(done.result_text(), "He kept the light.");
-        assert_eq!(done.state, CellState::Done);
+        }));
+        assert_eq!((cells[1].state, cells[1].versions.len()), (CellState::Done, 0));
+        let (cells, _) = last_cells(&session.handle(HostMessage::ShowSource { tab: "1".into(), cell: notes.clone() }));
+        assert_eq!(cells[1].state, CellState::Idle);
 
-        let undone = session.handle(HostMessage::Command {
-            id: "undo".into(),
-            tab: Some("1".into()),
-            arg: None,
-            node: None,
-            viewport: [800.0, 600.0],
-        });
-        let back = cells_of(undone.iter().find(|message| cells_of(message).is_some()).unwrap()).unwrap()[0].clone();
-        assert_eq!(back.state, CellState::Idle);
-        assert!(back.output.is_empty());
-        assert_eq!(back.prompt(), "A lighthouse keeper.");
+        // Move the LLM cell below the Markdown cell, then delete it and undo:
+        // it comes back with all four runs.
+        let (cells, _) = last_cells(&session.handle(HostMessage::MoveCell { tab: "1".into(), cell: first.clone(), to: 1 }));
+        assert_eq!(cells[1].id, first);
+        let (cells, _) = last_cells(&session.handle(HostMessage::DeleteCell { tab: "1".into(), cell: first.clone() }));
+        assert_eq!(cells.len(), 1);
+        let (cells, _) = last_cells(&command(&mut session, "undo"));
+        let back = cells.iter().find(|cell| cell.id == first).expect("the deleted cell did not come back");
+        assert_eq!(back.versions.len(), 4);
 
-        let redone = session.handle(HostMessage::Command {
-            id: "redo".into(),
-            tab: Some("1".into()),
-            arg: None,
-            node: None,
-            viewport: [800.0, 600.0],
-        });
-        let again = cells_of(redone.iter().find(|message| cells_of(message).is_some()).unwrap()).unwrap()[0].clone();
-        assert_eq!(again.result_text(), "He kept the light.");
+        // Copy and paste: a new id, `from` the source, runs under new ids.
+        session.handle(HostMessage::SelectCell { tab: "1".into(), cell: first.clone() });
+        command(&mut session, "copy");
+        let (cells, selected) = last_cells(&command(&mut session, "paste"));
+        let pasted = cells.iter().find(|cell| Some(&cell.id) == selected.as_ref()).unwrap();
+        assert_ne!(pasted.id, first);
+        assert_eq!(pasted.from.as_deref(), Some(first.as_str()));
+        assert_eq!(pasted.versions.len(), 4);
+        assert!(pasted.versions.iter().all(|version| !ids.contains(&version.id)));
 
-        let saved = session.handle(HostMessage::Command {
-            id: "save".into(),
-            tab: Some("1".into()),
-            arg: None,
-            node: None,
-            viewport: [800.0, 600.0],
-        });
-        let AppMessage::File { id, kind: FileKind::Save, folder: None, .. } = &saved[0] else {
+        // Save with the active cell, and reopen as it was.
+        let saved = command(&mut session, "save");
+        let AppMessage::File { id, kind: FileKind::Save, .. } = &saved[0] else {
             panic!("save asked for a file, got {}", lines_of(&saved).join(""));
         };
-        let wrote = session.handle(HostMessage::FileResult {
-            id: id.clone(),
-            path: Some(path.display().to_string()),
-        });
-        assert!(wrote.iter().any(|message| matches!(
-            message,
-            AppMessage::Tabs(tabs) if tabs.tabs[0].path.as_deref() == Some(path.display().to_string().as_str())
-        )));
-        let file = read_book(&path).unwrap();
-        assert_eq!(file[0].result_text(), "He kept the light.");
-        assert!(!path.with_extension("smx.partial").exists());
-
+        session.handle(HostMessage::FileResult { id: id.clone(), path: Some(path.display().to_string()) });
+        let read = read_book(&path).unwrap();
+        assert_eq!(read.selected, selected);
         let mut again = Session::restored();
-        let opened = again.handle(HostMessage::Open {
-            path: Some(path.display().to_string()),
-        });
-        let reopened = cells_of(opened.iter().find(|message| cells_of(message).is_some()).unwrap()).unwrap();
-        assert_eq!(reopened[0].id, file[0].id);
-        assert_eq!(reopened[0].prompt(), "A lighthouse keeper.");
-        assert_eq!(reopened[0].result_text(), "He kept the light.");
+        let (cells, reselected) = last_cells(&again.handle(HostMessage::Open { path: Some(path.display().to_string()) }));
+        assert_eq!(reselected, selected);
+        let reopened = cells.iter().find(|cell| cell.id == first).unwrap();
+        assert_eq!((reopened.versions.len(), reopened.current), (4, Some(3)));
+        assert_eq!(reopened.prompt(), "A darker keeper.");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Undo after a run keeps that run's result showing, and a run that ends
+    /// after its cell was deleted comes back with the cell.
+    #[test]
+    fn undo_never_hides_or_loses_a_run() {
+        let mut session = Session::launch();
+        let id = session.books[0].cells[0].id.clone();
+        session.handle(HostMessage::EditCell { tab: "1".into(), cell: id.clone(), input: text("p1") });
+        run(&mut session, &id, "p1", "R1");
+        session.handle(HostMessage::EditCell { tab: "1".into(), cell: id.clone(), input: text("p2") });
+        run(&mut session, &id, "p2", "R2");
+        let (cells, _) = last_cells(&command(&mut session, "undo"));
+        assert_eq!(cells[0].result_text(), "R2", "undo showed an older run");
+        assert_eq!(cells[0].current, Some(1));
+
+        command(&mut session, "add_cell");
+        let doomed = session.books[0].cells[1].id.clone();
+        session.handle(HostMessage::DeleteCell { tab: "1".into(), cell: doomed.clone() });
+        run(&mut session, &doomed, "late", "Arrived after the delete.");
+        let (cells, _) = last_cells(&command(&mut session, "undo"));
+        let back = cells.iter().find(|cell| cell.id == doomed).expect("the cell did not come back");
+        assert_eq!(back.versions.len(), 1, "the run that ended after the delete was lost");
+    }
+
+    /// A notebook made with + reports its one cell.
+    #[test]
+    fn a_new_notebook_reports_its_cell() {
+        let mut session = Session::launch();
+        let (cells, selected) = last_cells(&command(&mut session, "new_book"));
+        assert_eq!(cells.len(), 1);
+        assert_eq!(selected.as_deref(), Some(cells[0].id.as_str()));
+        let (cells, _) = last_cells(&session.handle(HostMessage::Open { path: None }));
+        assert_eq!(cells.len(), 1);
+    }
+
+    /// Deleting the last cell leaves one empty cell, active.
+    #[test]
+    fn the_last_cell_deleted_leaves_an_empty_one() {
+        let mut session = Session::launch();
+        let only = session.books[0].cells[0].id.clone();
+        let (cells, selected) = last_cells(&session.handle(HostMessage::DeleteCell { tab: "1".into(), cell: only.clone() }));
+        assert_eq!(cells.len(), 1);
+        assert_ne!(cells[0].id, only);
+        assert_eq!(selected.as_deref(), Some(cells[0].id.as_str()));
+    }
+
+    /// A mission book saved by 0.5 opens, each result as one version.
+    #[test]
+    fn a_version_one_book_opens() {
+        let dir = std::env::temp_dir().join(format!("inpainter-book-v1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.smx");
+        let mut cell = Cell::text("old-1", "A keeper.");
+        cell.output = text("He kept it.");
+        cell.state = CellState::Done;
+        std::fs::write(&path, serde_json::json!({"version": 1, "cells": [cell]}).to_string()).unwrap();
+        let read = read_book(&path).unwrap();
+        assert_eq!(read.cells[0].versions.len(), 1);
+        assert_eq!(read.cells[0].current, Some(0));
+        assert_eq!(read.cells[0].result_text(), "He kept it.");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

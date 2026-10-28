@@ -143,7 +143,7 @@ impl Flows {
     pub(crate) fn question_lines(&self) -> Vec<String> {
         match &self.question {
             Some(Question::Remove) => vec![
-                "The conversation is deleted. The folders and files stay.".to_string(),
+                "The conversation and the project's files are deleted.".to_string(),
             ],
             None => Vec::new(),
         }
@@ -175,6 +175,8 @@ fn note(text: String) -> Entry {
         attachments: Vec::new(),
         tool: None,
         ok: None,
+        cell: None,
+        aside: true,
     }
 }
 
@@ -694,7 +696,7 @@ impl HostWindow {
             Some(Question::Remove) => Ask {
                 id: "project-remove".to_string(),
                 title: "Remove this project?".to_string(),
-                lines: vec!["The conversation is deleted. The folders and files stay.".to_string()],
+                lines: vec!["The conversation and the project's files are deleted.".to_string()],
                 buttons: vec![button("remove", "Remove"), button("cancel", "Cancel")],
                 dismiss: Some("cancel".to_string()),
             },

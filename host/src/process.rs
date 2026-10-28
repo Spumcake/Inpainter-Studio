@@ -73,6 +73,14 @@ pub struct Declared {
     pub results: VecDeque<ToolResult>,
     /// Answers to `keep`: the tab, and its file or none when cancelled.
     pub kept: VecDeque<(String, Option<String>)>,
+    /// The cells a tab reported, and which one is selected.
+    pub cells: HashMap<String, (Vec<protocol::Cell>, Option<String>)>,
+    /// Cells the toolbar asked the host to run.
+    pub run_cells: VecDeque<(String, String)>,
+    /// Cells the toolbar asked the host to stop.
+    pub stop_cells: VecDeque<(String, String)>,
+    /// Answers to `claim`.
+    pub claimed: VecDeque<(String, bool)>,
     /// Every tab report, each as its tabs' ids and files, while the host
     /// follows a quit. None when it is not following one.
     pub tab_log: Option<Vec<Vec<(String, Option<String>, String)>>>,
@@ -481,6 +489,12 @@ impl Running {
             }
             AppMessage::ToolResult(result) => declared.results.push_back(result),
             AppMessage::Kept { tab, path } => declared.kept.push_back((tab, path)),
+            AppMessage::Cells { tab, cells, selected } => {
+                declared.cells.insert(tab, (cells, selected));
+            }
+            AppMessage::RunCell { tab, cell } => declared.run_cells.push_back((tab, cell)),
+            AppMessage::StopCell { tab, cell } => declared.stop_cells.push_back((tab, cell)),
+            AppMessage::Claimed { id, yours } => declared.claimed.push_back((id, yours)),
         }
     }
 

@@ -1,0 +1,6 @@
+{
+  "id": "mission-control",
+  "name": "Mission Control",
+  "executable": "mission-control",
+  "protocol": 1
+}

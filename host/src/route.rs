@@ -31,9 +31,47 @@ pub(crate) struct Routing {
     offered: Option<Vec<Target>>,
 }
 
-/// Every running sub-application, as a request offers it.
+/// The host's own id, for the tool it offers. The assistant is not told to
+/// treat this id differently from any other.
+pub(crate) const HOST_ID: &str = "inpainter";
+
+/// The host's tool: a prompt that runs as a cell. Learned the same way as
+/// any application's skill.
+pub(crate) fn host_skill() -> protocol::Skill {
+    protocol::Skill {
+        id: "prompt".into(),
+        name: "Prompt".into(),
+        description: "Write a prompt and run it as a cell in the conversation.".into(),
+        instructions: "When the person asks for a piece of writing, or to write or run a prompt, call run_text_prompt with the prompt. Do not write the piece in the reply. After the tool returns, reply briefly.".into(),
+        tools: vec![protocol::Tool {
+            name: "run_text_prompt".into(),
+            description: "Show a text prompt as a cell and run it.".into(),
+            input: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "The prompt to run."}
+                },
+                "required": ["prompt"],
+                "additionalProperties": false
+            }),
+        }],
+    }
+}
+
+fn host_target() -> Target {
+    Target {
+        app: HOST_ID.into(),
+        name: "Inpainter".into(),
+        tabs: Vec::new(),
+        skills: vec![host_skill()],
+        tabless: true,
+    }
+}
+
+/// Every running sub-application, and the host's own tools, as a request offers them.
 pub(crate) fn targets(apps: &[Started]) -> Vec<Target> {
-    apps.iter()
+    let mut offered: Vec<Target> = apps
+        .iter()
         .filter(|started| !started.running.exited() && !started.running.pending())
         .map(|started| Target {
             app: started.id.clone(),
@@ -49,8 +87,11 @@ pub(crate) fn targets(apps: &[Started]) -> Vec<Target> {
                 })
                 .collect(),
             skills: started.running.declared.skills.clone(),
+            tabless: false,
         })
-        .collect()
+        .collect();
+    offered.push(host_target());
+    offered
 }
 
 fn failed(call: String, reason: &str) -> ToolResult {

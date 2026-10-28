@@ -17,11 +17,21 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 mod agent;
 mod openrouter;
 mod prompt;
+pub use openrouter::stream_prompt;
 #[cfg(test)]
 mod tests;
 
 /// The most tool calls one request may make before it stops itself.
 pub const MAX_CALLS: usize = 40;
+
+/// Shown when a run is asked for and no key was in the environment at start.
+/// The note a stopped request ends with.
+pub const STOPPED: &str = "Stopped.";
+
+pub const NO_KEY: &str = "No OpenRouter key is set. Inpainter reads it from OPENROUTER_API_KEY, set in the environment or in a .env file in Inpainter's data folder, when it starts.";
+
+/// Shown when a run is asked for and the picker has no model.
+pub const NO_MODEL: &str = "No model is chosen.";
 
 /// Where the assistant reaches its models, and how it wakes the window.
 pub struct Config {
@@ -60,6 +70,9 @@ pub struct Target {
     pub name: String,
     pub tabs: Vec<TabInfo>,
     pub skills: Vec<protocol::Skill>,
+    /// Its tools take no `tab`, such as the host's own. A target that does
+    /// not say so offers nothing while it has no open tab.
+    pub tabless: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -145,6 +158,9 @@ pub enum Event {
         /// The request's id. One request is one undo step.
         group: String,
     },
+    /// A piece of the assistant's reply, as the model writes it. The host
+    /// shows the pieces until the reply's entry arrives.
+    Partial(String),
     /// A request started (true) or ended (false). While true, the host locks
     /// the sub-applications' controls and send becomes stop.
     Working(bool),
@@ -170,6 +186,13 @@ pub struct Entry {
     pub tool: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ok: Option<bool>,
+    /// A cell this entry shows. Set while a prompt runs, and kept with its result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell: Option<protocol::Cell>,
+    /// A notice that is not the end of a request, such as one the host makes
+    /// about a file. It never marks a reply as failed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub aside: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

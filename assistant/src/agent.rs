@@ -14,9 +14,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-const NO_KEY: &str = "No OpenRouter key is set. Inpainter reads it from OPENROUTER_API_KEY when it starts.";
-const NO_MODEL: &str = "No model is chosen.";
-const STOPPED: &str = "Stopped.";
+use crate::{NO_KEY, NO_MODEL};
+use crate::STOPPED;
 const NOT_RUN_STOPPED: &str = "Not run: the person stopped the request.";
 const NO_REPLY: &str = "The model ended without a reply.";
 
@@ -28,6 +27,8 @@ enum Input {
     Command(Command),
     /// A model turn's answer: the turn's number, and the reply's message.
     Reply(u64, Result<Value, String>),
+    /// A piece of a model turn's text, as it arrives.
+    Partial(u64, String),
     /// The host dropped its handle.
     Closed,
 }
@@ -36,6 +37,7 @@ enum Input {
 enum Woke {
     Stop,
     Reply(u64, Result<Value, String>),
+    Partial(u64, String),
     Result(protocol::ToolResult),
 }
 
@@ -106,6 +108,15 @@ impl Agent {
     }
 
     fn entry(&self, role: Role, text: impl Into<String>) {
+        self.emit_entry(role, text, false);
+    }
+
+    /// A notice the host asked for: an aside, never the end of a request.
+    fn aside(&self, text: impl Into<String>) {
+        self.emit_entry(Role::Note, text, true);
+    }
+
+    fn emit_entry(&self, role: Role, text: impl Into<String>, aside: bool) {
         self.emit(Event::Entry(Entry {
             role,
             text: text.into(),
@@ -113,6 +124,8 @@ impl Agent {
             attachments: Vec::new(),
             tool: None,
             ok: None,
+            cell: None,
+            aside,
         }));
     }
 
@@ -123,7 +136,7 @@ impl Agent {
                 Some(command) => command,
                 None => match self.inbox.recv() {
                     Ok(Input::Command(command)) => command,
-                    Ok(Input::Reply(..)) => continue,
+                    Ok(Input::Reply(..)) | Ok(Input::Partial(..)) => continue,
                     Ok(Input::Closed) | Err(_) => return,
                 },
             };
@@ -135,7 +148,7 @@ impl Agent {
                     self.history.clear();
                     self.emit(Event::Cleared);
                 }
-                Command::Note(text) => self.entry(Role::Note, text),
+                Command::Note(text) => self.aside(text),
                 Command::Result(_) | Command::Targets(_) | Command::Stop => {}
             }
         }
@@ -220,6 +233,8 @@ impl Agent {
                 .collect(),
             tool: None,
             ok: None,
+            cell: None,
+            aside: false,
         }));
         compact(&mut self.history);
         let parts = request.attachments.iter().map(attachment_part).collect();
@@ -323,7 +338,10 @@ impl Agent {
         let started = std::thread::Builder::new()
             .name(String::from("assistant-turn"))
             .spawn(move || {
-                let reply = crate::openrouter::chat(&base_url, &key, &body);
+                let pieces = outbox.clone();
+                let reply = crate::openrouter::chat_streamed(&base_url, &key, &body, |text| {
+                    let _ = pieces.send(Input::Partial(turn, text.to_string()));
+                });
                 let _ = outbox.send(Input::Reply(turn, reply));
             });
         if started.is_err() {
@@ -336,7 +354,8 @@ impl Agent {
                 Some(Woke::Reply(number, reply)) if number == turn => {
                     return reply.map_err(Some);
                 }
-                Some(Woke::Reply(..)) | Some(Woke::Result(_)) => {}
+                Some(Woke::Partial(number, text)) if number == turn => self.emit(Event::Partial(text)),
+                Some(Woke::Reply(..)) | Some(Woke::Partial(..)) | Some(Woke::Result(_)) => {}
             }
         }
     }
@@ -349,11 +368,13 @@ impl Agent {
         let (app, tab, input) = match routed {
             Ok(routed) => routed,
             Err(error) => {
-                self.tool_entry(name, false);
+                self.tool_entry(name, Some(false));
                 return Some((tool_error(&error), Vec::new()));
             }
         };
         let call = format!("{}.{}", busy.group, busy.calls);
+        // The host can show the call, as a cell, before it finishes.
+        self.tool_entry(name, None);
         self.emit(Event::Call {
             call: call.clone(),
             app,
@@ -366,10 +387,10 @@ impl Agent {
             match self.next(busy)? {
                 Woke::Result(result) if result.call == call => break result,
                 // A stop waits for the call in progress.
-                Woke::Stop | Woke::Reply(..) | Woke::Result(_) => {}
+                Woke::Stop | Woke::Reply(..) | Woke::Partial(..) | Woke::Result(_) => {}
             }
         };
-        self.tool_entry(name, result.ok);
+        self.tool_entry(name, Some(result.ok));
         let mut content = json!({"ok": result.ok, "output": result.output});
         if !result.images.is_empty() {
             content["pictures"] = json!(format!(
@@ -380,14 +401,16 @@ impl Agent {
         Some((content.to_string(), result.images))
     }
 
-    fn tool_entry(&self, tool: &str, ok: bool) {
+    fn tool_entry(&self, tool: &str, ok: Option<bool>) {
         self.emit(Event::Entry(Entry {
             role: Role::Tool,
             text: String::new(),
             time: now(),
             attachments: Vec::new(),
             tool: Some(tool.to_string()),
-            ok: Some(ok),
+            ok,
+            cell: None,
+            aside: false,
         }));
     }
 
@@ -405,12 +428,13 @@ impl Agent {
                     Command::Targets(targets) => busy.targets = targets,
                     Command::Send(_) => {}
                     Command::ListModels => self.list_models(),
-                    Command::Note(text) => self.entry(Role::Note, text),
+                    Command::Note(text) => self.aside(text),
                     command @ (Command::Restore(_) | Command::Clear) => {
                         self.deferred.push_back(command)
                     }
                 },
                 Ok(Input::Reply(turn, reply)) => return Some(Woke::Reply(turn, reply)),
+                Ok(Input::Partial(turn, text)) => return Some(Woke::Partial(turn, text)),
                 Ok(Input::Closed) | Err(_) => {
                     self.closed = true;
                     return None;
@@ -420,16 +444,16 @@ impl Agent {
     }
 }
 
-/// Checks a call against the targets: the key names an offered tool, the
-/// arguments are an object, and `tab` is one of that application's tabs.
-/// Returns the application, the tab, and the input without `tab`.
+/// Checks a call against the targets: the key names an offered tool and the
+/// arguments are an object. A tool of an application with tabs takes `tab`.
+/// A tool of an application with none does not. Returns the application, the
+/// tab (empty when the application has none), and the input without `tab`.
 fn route(targets: &[Target], key: &str, arguments: &str) -> Result<(String, String, Value), String> {
     let unknown = || format!("No tool is named `{key}`. Use only the tools offered.");
     let (app, skill, tool) = protocol::split_tool_key(key).ok_or_else(unknown)?;
     let target = targets
         .iter()
         .find(|target| target.app == app)
-        .filter(|target| !target.tabs.is_empty())
         .ok_or_else(unknown)?;
     let offered = target
         .skills
@@ -446,6 +470,10 @@ fn route(targets: &[Target], key: &str, arguments: &str) -> Result<(String, Stri
             _ => return Err(String::from("The arguments were not a JSON object.")),
         }
     };
+    if target.tabless {
+        input.remove("tab");
+        return Ok((app.to_string(), String::new(), Value::Object(input)));
+    }
     let tabs = || {
         target
             .tabs

@@ -6,8 +6,10 @@
 
 use serde::{Deserialize, Serialize};
 
+mod cell;
 mod declare;
 mod skills;
+pub use cell::*;
 pub use declare::*;
 pub use skills::*;
 
@@ -82,6 +84,19 @@ pub enum AppMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
     },
+    /// The whole cell list of a tab that keeps cells, after any change.
+    Cells {
+        tab: String,
+        cells: Vec<Cell>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected: Option<String>,
+    },
+    /// Asks the host to run that cell, as the toolbar's Run does.
+    RunCell { tab: String, cell: String },
+    /// Asks the host to stop that cell. The host keeps what had arrived.
+    StopCell { tab: String, cell: String },
+    /// Whether this application can open `path` as its own work.
+    Claimed { id: String, yours: bool },
 }
 
 /// What the host writes to a sub-application, on its standard input.
@@ -156,6 +171,34 @@ pub enum HostMessage {
     Keep { tab: String },
     /// The window is closing. Exit.
     Shutdown,
+    /// The person's edit of a cell's prompt, when it loses focus and before
+    /// a run. Never per keystroke. One undo step for the cell's owner.
+    EditCell {
+        tab: String,
+        cell: String,
+        input: Vec<CellPart>,
+    },
+    /// A run finished, failed, or was stopped. One undo step.
+    CellResult {
+        tab: String,
+        cell: String,
+        endpoint: String,
+        model: String,
+        state: CellState,
+        output: Vec<CellPart>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// A dragged cell, already given a new id and `from` by the host.
+    InsertCell {
+        tab: String,
+        index: usize,
+        cell: Cell,
+    },
+    /// The cell the person selected.
+    SelectCell { tab: String, cell: String },
+    /// Asks whether `path` is this application's own work.
+    Claim { id: String, path: String },
 }
 
 /// What a selection message does, as the drawing surface's select tool does it.
@@ -199,6 +242,8 @@ pub enum ContentsKind {
     Grid,
     /// The drawing surface: the grid, the document, and its tools.
     Canvas,
+    /// A list of cells. The host draws them; the sub-application keeps them.
+    Cells,
 }
 
 /// Where the properties panel sits. Only the right side has a reference.
@@ -317,7 +362,11 @@ impl Declaration {
             | AppMessage::Pong
             | AppMessage::Skills { .. }
             | AppMessage::ToolResult(_)
-            | AppMessage::Kept { .. } => Accept::More,
+            | AppMessage::Kept { .. }
+            | AppMessage::Cells { .. }
+            | AppMessage::RunCell { .. }
+            | AppMessage::StopCell { .. }
+            | AppMessage::Claimed { .. } => Accept::More,
             AppMessage::End => Accept::Ready,
         }
     }
@@ -329,9 +378,17 @@ fn strip(line: &str) -> &str {
 
 pub fn parse_app_message(line: &str) -> Result<AppMessage, ParseError> {
     let line = strip(line);
-    serde_json::from_str(line).map_err(|_| ParseError {
+    let refused = || ParseError {
         line: line.to_string(),
-    })
+    };
+    let message: AppMessage = serde_json::from_str(line).map_err(|_| refused())?;
+    // A running cell is the host's to draw, never a sub-application's to say.
+    if let AppMessage::Cells { cells, .. } = &message
+        && cells.iter().any(|cell| cell.state == CellState::Running)
+    {
+        return Err(refused());
+    }
+    Ok(message)
 }
 
 pub fn parse_host_message(line: &str) -> Result<HostMessage, ParseError> {
@@ -545,5 +602,117 @@ mod tests {
             parse_host_message(r#"{"type":"open"}"#).unwrap(),
             HostMessage::Open { path: None }
         );
+    }
+
+    fn round_trip_app(message: AppMessage) {
+        let line = encode_app_message(&message);
+        assert_eq!(parse_app_message(&line).unwrap(), message);
+    }
+
+    fn round_trip_host(message: HostMessage) {
+        let line = encode_host_message(&message);
+        assert_eq!(parse_host_message(&line).unwrap(), message);
+    }
+
+    /// A cell whose prompt and result hold a file, and one of a kind this
+    /// build does not run, both survive a round trip. Dropping either would
+    /// lose a later kind.
+    /// Catches a cells message from a later version refused whole: a part
+    /// and a state this build does not know are kept, and the rest reads.
+    #[test]
+    fn a_later_part_and_state_still_read() {
+        let line = r#"{"type":"cells","tab":"book","cells":[{"id":"x","kind":"text","input":[{"text":"north"},{"image_ref":3}],"state":"queued"}]}"#;
+        let AppMessage::Cells { cells, .. } = parse_app_message(line).expect("a later cell was refused") else {
+            panic!("not a cells message");
+        };
+        assert_eq!(cells[0].state, CellState::Other);
+        assert_eq!(cells[0].input.len(), 2);
+        assert!(matches!(cells[0].input[1], CellPart::Other(_)));
+        assert_eq!(cells[0].prompt(), "north");
+    }
+
+    #[test]
+    fn a_cell_with_a_path_and_an_unknown_kind_round_trip() {
+        let path = Cell {
+            id: "11111111-1111-4111-8111-111111111111".into(),
+            from: Some("00000000-0000-4000-8000-000000000000".into()),
+            kind: "text".into(),
+            input: vec![
+                CellPart::Text { text: "Describe this.".into() },
+                CellPart::Path {
+                    path: "/tmp/still.png".into(),
+                    media_type: "image/png".into(),
+                },
+            ],
+            endpoint: Some("openrouter".into()),
+            model: Some("stand-in/model".into()),
+            output: vec![CellPart::Path {
+                path: "/tmp/out.png".into(),
+                media_type: "image/png".into(),
+            }],
+            state: CellState::Done,
+            error: None,
+        };
+        let unknown = Cell {
+            id: "22222222-2222-4222-8222-222222222222".into(),
+            from: None,
+            kind: "plot".into(),
+            input: vec![CellPart::Text { text: "a rising line".into() }],
+            endpoint: None,
+            model: None,
+            output: Vec::new(),
+            state: CellState::Idle,
+            error: None,
+        };
+        round_trip_app(AppMessage::Cells {
+            tab: "book".into(),
+            cells: vec![path.clone(), unknown.clone()],
+            selected: Some(unknown.id.clone()),
+        });
+        round_trip_host(HostMessage::InsertCell {
+            tab: "book".into(),
+            index: 1,
+            cell: unknown,
+        });
+        round_trip_host(HostMessage::CellResult {
+            tab: "book".into(),
+            cell: path.id.clone(),
+            endpoint: "openrouter".into(),
+            model: "stand-in/model".into(),
+            state: CellState::Failed,
+            output: path.output.clone(),
+            error: Some("The model failed.".into()),
+        });
+        assert!(parse_app_message(r#"{"type":"cells","tab":"book","cells":[{"id":"x","kind":"plot","state":"running"}]}"#).is_err());
+    }
+
+    /// Every cell message round-trips, so a field cannot be dropped quietly.
+    #[test]
+    fn cell_messages_round_trip() {
+        round_trip_app(AppMessage::RunCell {
+            tab: "book".into(),
+            cell: "c1".into(),
+        });
+        round_trip_app(AppMessage::StopCell {
+            tab: "book".into(),
+            cell: "c1".into(),
+        });
+        round_trip_app(AppMessage::Claimed {
+            id: "claim-1".into(),
+            yours: true,
+        });
+        round_trip_host(HostMessage::EditCell {
+            tab: "book".into(),
+            cell: "c1".into(),
+            input: vec![CellPart::Text { text: "A lighthouse.".into() }],
+        });
+        round_trip_host(HostMessage::SelectCell {
+            tab: "book".into(),
+            cell: "c1".into(),
+        });
+        round_trip_host(HostMessage::Claim {
+            id: "claim-1".into(),
+            path: "/tmp/book.smx".into(),
+        });
     }
 }

@@ -269,6 +269,14 @@ impl Server {
                 camera = self.file_result(&id, path);
             }
             HostMessage::Quit => self.chrome.note_quit(&mut self.session),
+            HostMessage::Claim { id, path } => replies.push(AppMessage::Claimed {
+                id,
+                yours: crate::store::readable_smx(std::path::Path::new(&path)),
+            }),
+            HostMessage::EditCell { .. }
+            | HostMessage::CellResult { .. }
+            | HostMessage::InsertCell { .. }
+            | HostMessage::SelectCell { .. } => {}
         }
         self.session.poll_recovery(Instant::now());
         self.session.publish_emergency();

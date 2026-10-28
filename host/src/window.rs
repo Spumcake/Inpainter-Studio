@@ -55,6 +55,22 @@ pub(crate) struct AppSpec {
     pub executable: Option<PathBuf>,
 }
 
+/// An open file being offered to sub-applications, one at a time.
+struct ClaimJob {
+    id: String,
+    path: String,
+    request_id: String,
+    requester: usize,
+    /// The requesting application first, then the others.
+    order: Vec<usize>,
+    cursor: usize,
+    waiting_since: Option<Instant>,
+}
+
+/// How long a sub-application may stay silent about a file before it counts
+/// as not claiming it, so Open still finishes.
+const CLAIM_WAIT: std::time::Duration = std::time::Duration::from_millis(400);
+
 /// The project open in this window. The host owns it; no sub-application sees it.
 struct Project {
     id: String,
@@ -120,6 +136,17 @@ struct HostWindow {
     assistant: Assistant,
     chat: Chat,
     routing: Routing,
+    /// Cells being typed or run. The host draws every cell from here and
+    /// from what a sub-application reported.
+    board: crate::cells::Board,
+    openrouter_url: String,
+    openrouter_key: Option<String>,
+    /// A conversation cell the person is dragging.
+    dragging: Option<protocol::Cell>,
+    /// The pointer was released on this cells tab.
+    drop_target: Option<(usize, String)>,
+    claim: Option<ClaimJob>,
+    claim_seq: u64,
     settings: Settings,
     /// Where projects are kept. None in frame tests, which never write one.
     data: Option<PathBuf>,
@@ -179,6 +206,11 @@ impl HostWindow {
         let wake_ctx = ctx.clone();
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || wake_ctx.request_repaint());
         let assistant = Assistant::spawn(assistant::Config::from_env(wake));
+        let openrouter_url = std::env::var("INPAINTER_OPENROUTER_URL")
+            .unwrap_or_else(|_| String::from("https://openrouter.ai/api/v1"));
+        let openrouter_key = std::env::var("OPENROUTER_API_KEY")
+            .ok()
+            .filter(|key| !key.trim().is_empty());
         Self {
             apps,
             selected: 0,
@@ -198,6 +230,13 @@ impl HostWindow {
             assistant,
             chat: Chat::default(),
             routing: Routing::default(),
+            board: crate::cells::Board::default(),
+            openrouter_url,
+            openrouter_key,
+            dragging: None,
+            drop_target: None,
+            claim: None,
+            claim_seq: 0,
             settings: Settings::load(None),
             data: None,
             project: None,
@@ -369,25 +408,21 @@ impl HostWindow {
         }
         for app in 0..self.apps.len() {
             while let Some(request) = self.apps[app].running.declared.files.pop_front() {
-                let folder = request.folder.as_deref().map(std::path::Path::new);
+                let folder = self.dialog_folder(request.folder.as_deref());
                 let path = match request.kind {
-                    FileKind::Open => {
-                        crate::dialogs::pick_open(frame, folder, request.filter.as_ref())
-                    }
+                    FileKind::Open => crate::dialogs::pick_open(
+                        frame,
+                        folder.as_deref(),
+                        request.filter.as_ref(),
+                    ),
                     FileKind::Save => crate::dialogs::pick_save(
                         frame,
-                        folder,
+                        folder.as_deref(),
                         request.name.as_deref().unwrap_or_default(),
                         request.filter.as_ref(),
                     ),
                 };
-                self.send(
-                    app,
-                    HostMessage::FileResult {
-                        id: request.id,
-                        path: path.map(|path| path.display().to_string()),
-                    },
-                );
+                self.deliver_file(app, request, path);
             }
         }
     }
@@ -520,6 +555,20 @@ impl eframe::App for HostWindow {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // A card names its model as the picker does, without the provider.
+        let mut names: Vec<(String, String)> = match &self.chat.models {
+            Some(Ok(models)) => models.iter().map(|model| (model.id.clone(), model.name.clone())).collect(),
+            _ => Vec::new(),
+        };
+        if let Some(chosen) = &self.chat.model {
+            names.push((chosen.id.clone(), chosen.name.clone()));
+        }
+        for (_, name) in &mut names {
+            if let Some((_, short)) = name.split_once(": ") {
+                *name = short.to_string();
+            }
+        }
+        crate::cells::set_model_names(&ctx, &names);
         let mut pending = false;
         for started in &mut self.apps {
             started.running.poll();
@@ -532,6 +581,9 @@ impl eframe::App for HostWindow {
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
         self.note_kinds();
         self.pump_assistant();
+        self.take_cell_requests();
+        self.tick_cells();
+        self.poll_claim();
         self.project_frame(&ctx, frame);
         self.resolve_dialogs(frame);
 
@@ -583,7 +635,17 @@ impl eframe::App for HostWindow {
                 let chat_rect =
                     Rect::from_min_max(full.min, egui::pos2(full.left() + left, full.bottom()));
                 let shell = Rect::from_min_max(egui::pos2(chat_rect.right(), full.top()), full.max);
-                talk = chat::show(ui, chat_rect, &mut self.chat, &mut menu, !workspace_open);
+                let mut cell_actions = Vec::new();
+                talk = chat::show(
+                    ui,
+                    chat_rect,
+                    &mut self.chat,
+                    &mut menu,
+                    !workspace_open,
+                    &mut self.board,
+                    &mut cell_actions,
+                );
+                self.note_cell_actions(cell_actions);
                 if workspace_open {
                     ui.scope_builder(egui::UiBuilder::new().max_rect(shell), |ui| {
                         self.shell(ui, &ctx, app, tab.clone(), dismissing, &mut chosen, &mut sent);
@@ -630,6 +692,646 @@ impl eframe::App for HostWindow {
             self.chat_event(event, &ctx, frame);
         }
         self.show_asks(&ctx, frame);
+        self.finish_drag(&ctx);
+    }
+}
+
+impl HostWindow {
+    /// The folder a file dialog starts in when the request names none.
+    fn project_files_dir(&self) -> Option<PathBuf> {
+        let data = self.data.as_ref()?;
+        let id = self.project.as_ref()?.id.clone();
+        let folder = workspace::project_files(data, &id);
+        // A project made before projects had folders gets its folder here.
+        let _ = std::fs::create_dir_all(&folder);
+        Some(folder)
+    }
+
+    /// The folder a file dialog opens in: the one the request names, or the
+    /// project's own folder.
+    pub(crate) fn dialog_folder(&self, requested: Option<&str>) -> Option<PathBuf> {
+        let files = self.project_files_dir();
+        workspace::dialog_directory(requested.map(std::path::Path::new), files.as_deref())
+    }
+
+    /// A file dialog's answer. An open is offered to the sub-applications
+    /// before anyone receives the path. A save goes straight back.
+    fn deliver_file(
+        &mut self,
+        app: usize,
+        request: crate::process::FileRequest,
+        path: Option<PathBuf>,
+    ) {
+        let Some(path) = path else {
+            self.send(
+                app,
+                HostMessage::FileResult {
+                    id: request.id,
+                    path: None,
+                },
+            );
+            return;
+        };
+        if request.kind == FileKind::Open {
+            self.begin_claim(app, request.id, path.display().to_string());
+            return;
+        }
+        self.send(
+            app,
+            HostMessage::FileResult {
+                id: request.id,
+                path: Some(path.display().to_string()),
+            },
+        );
+    }
+
+    fn begin_claim(&mut self, requester: usize, request_id: String, path: String) {
+        self.claim_seq += 1;
+        let mut order = vec![requester];
+        order.extend((0..self.apps.len()).filter(|index| *index != requester));
+        self.claim = Some(ClaimJob {
+            id: format!("claim-{}", self.claim_seq),
+            path,
+            request_id,
+            requester,
+            order,
+            cursor: 0,
+            waiting_since: None,
+        });
+        self.poll_claim();
+    }
+
+    /// One step of asking who owns an opened file.
+    fn poll_claim(&mut self) {
+        let Some(job) = self.claim.as_ref() else {
+            return;
+        };
+        if job.cursor >= job.order.len() {
+            self.claim_unclaimed();
+            return;
+        }
+        if job.waiting_since.is_some() {
+            let app = job.order[job.cursor];
+            let id = job.id.clone();
+            let waited = job.waiting_since.unwrap_or_else(Instant::now);
+            let reply = self.apps.get_mut(app).and_then(|started| {
+                let queued = &mut started.running.declared.claimed;
+                queued
+                    .iter()
+                    .position(|(claim, _)| claim == &id)
+                    .and_then(|position| queued.remove(position))
+                    .map(|(_, yours)| yours)
+            });
+            if let Some(yours) = reply {
+                self.claim_answered(yours);
+                return;
+            }
+            if waited.elapsed() >= CLAIM_WAIT {
+                self.claim_answered(false);
+            }
+            return;
+        }
+        let app = job.order[job.cursor];
+        let id = job.id.clone();
+        let path = job.path.clone();
+        self.send(app, HostMessage::Claim { id, path });
+        if let Some(job) = self.claim.as_mut() {
+            job.waiting_since = Some(Instant::now());
+        }
+    }
+
+    fn claim_answered(&mut self, yours: bool) {
+        let Some(job) = self.claim.as_ref() else {
+            return;
+        };
+        let app = job.order[job.cursor];
+        let requester = job.requester;
+        if yours {
+            let path = job.path.clone();
+            let request_id = job.request_id.clone();
+            self.claim = None;
+            if app == requester {
+                self.send(
+                    requester,
+                    HostMessage::FileResult {
+                        id: request_id,
+                        path: Some(path),
+                    },
+                );
+            } else {
+                self.send(
+                    app,
+                    HostMessage::Open {
+                        path: Some(path),
+                    },
+                );
+                self.send(
+                    requester,
+                    HostMessage::FileResult {
+                        id: request_id,
+                        path: None,
+                    },
+                );
+            }
+            return;
+        }
+        if let Some(job) = self.claim.as_mut() {
+            job.cursor += 1;
+            job.waiting_since = None;
+        }
+        self.poll_claim();
+    }
+
+    fn claim_unclaimed(&mut self) {
+        let Some(job) = self.claim.take() else {
+            return;
+        };
+        self.send(
+            job.requester,
+            HostMessage::FileResult {
+                id: job.request_id,
+                path: Some(job.path),
+            },
+        );
+    }
+
+    /// Sends one message, with the files chosen for it, to the assistant.
+    fn send_message(&mut self, text: String, chips: Vec<PathBuf>) {
+        let mut unread = Vec::new();
+        let attachments = chips
+            .iter()
+            .filter_map(|path| {
+                let loaded = chat::load_attachment(path);
+                if loaded.is_none() {
+                    unread.push(path.display().to_string());
+                }
+                loaded
+            })
+            .collect();
+        let selected = self.apps.get(self.selected).and_then(|started| {
+            Some((started.id.clone(), started.running.tabs().1?))
+        });
+        let request = assistant::Request {
+            text,
+            attachments,
+            model: self
+                .chat
+                .model
+                .as_ref()
+                .map(|model| model.id.clone())
+                .unwrap_or_default(),
+            selected,
+            targets: route::targets(&self.apps),
+        };
+        self.assistant.send(Command::Send(request));
+        for path in unread {
+            self.assistant
+                .send(Command::Note(format!("{path} could not be read, so it was not sent.")));
+        }
+    }
+
+    /// Text that arrived but never became an entry, as when a request is
+    /// stopped or fails midway, stays in the conversation as it was.
+    fn keep_live(&mut self) {
+        let text = std::mem::take(&mut self.chat.live);
+        if !text.trim().is_empty() {
+            self.chat.conversation.push(assistant::Entry {
+                role: assistant::Role::Assistant,
+                text: text.trim().to_string(),
+                time: crate::workspace::now_seconds(),
+                attachments: Vec::new(),
+                tool: None,
+                ok: None,
+                cell: None,
+                aside: false,
+            });
+        }
+    }
+
+    fn note_entry(&mut self, entry: assistant::Entry) {
+        match entry.role {
+            // The reply's entry replaces the pieces shown while it arrived.
+            assistant::Role::Assistant => self.chat.live.clear(),
+            assistant::Role::Note => self.keep_live(),
+            _ => {}
+        }
+        if entry.role == assistant::Role::Tool
+            && entry.ok.is_some()
+            && let Some(pending) = self.chat.conversation.iter_mut().rev().find(|existing| {
+                existing.role == assistant::Role::Tool && existing.ok.is_none() && existing.tool == entry.tool
+            })
+        {
+            pending.ok = entry.ok;
+            return;
+        }
+        self.chat.conversation.push(entry);
+    }
+
+    fn begin_host_cell(&mut self, call: String, input: serde_json::Value) {
+        let prompt = input.get("prompt").and_then(|value| value.as_str()).unwrap_or("").to_string();
+        let model = self.chat.model.as_ref().map(|model| model.id.clone()).unwrap_or_default();
+        let mut cell = protocol::Cell::text(protocol::cell_id(), &prompt);
+        cell.endpoint = Some(String::from("openrouter"));
+        cell.model = Some(model.clone());
+        if let Some(entry) = self.chat.conversation.iter_mut().rev().find(|entry| {
+            entry.role == assistant::Role::Tool && entry.ok.is_none()
+        }) {
+            entry.cell = Some(cell.clone());
+        }
+        self.board.drafts.insert(cell.id.clone(), prompt.clone());
+        self.launch_run(crate::cells::Place::Conversation, cell.id, Some(call), model, prompt);
+    }
+
+    fn note_cell_actions(&mut self, actions: Vec<crate::cells::CardAction>) {
+        for action in actions {
+            match action {
+                crate::cells::CardAction::Drag(cell) => self.dragging = Some(cell),
+                crate::cells::CardAction::Edit(id, input) => self.edit_prompt(&id, input),
+                crate::cells::CardAction::Run(id) => self.run_from_card(&id),
+                crate::cells::CardAction::Stop(id) => self.stop_one(&id),
+                crate::cells::CardAction::Select(id) => self.select_one(&id),
+            }
+        }
+    }
+
+    fn edit_prompt(&mut self, id: &str, input: Vec<protocol::CellPart>) {
+        if let Some(entry) = self.chat.conversation.iter_mut().find(|entry| {
+            entry.cell.as_ref().is_some_and(|cell| cell.id == id)
+        }) {
+            if let Some(cell) = entry.cell.as_mut() {
+                cell.input = input;
+            }
+            return;
+        }
+        let Some((app, tab)) = self.cell_home(id) else {
+            return;
+        };
+        self.send(
+            app,
+            HostMessage::EditCell {
+                tab,
+                cell: id.to_string(),
+                input,
+            },
+        );
+    }
+
+    fn run_from_card(&mut self, id: &str) {
+        let prompt = self.board.drafts.get(id).cloned().unwrap_or_default();
+        if self.chat.conversation.iter().any(|entry| entry.cell.as_ref().is_some_and(|cell| cell.id == id)) {
+            self.edit_prompt(id, vec![protocol::CellPart::Text { text: prompt.clone() }]);
+            let model = self.model_id();
+            self.launch_run(crate::cells::Place::Conversation, id.to_string(), None, model, prompt);
+            return;
+        }
+        let Some((app, tab)) = self.cell_home(id) else {
+            return;
+        };
+        self.start_book_run(app, &tab, id);
+    }
+
+    fn select_one(&mut self, id: &str) {
+        let Some((app, tab)) = self.cell_home(id) else {
+            return;
+        };
+        self.send(
+            app,
+            HostMessage::SelectCell {
+                tab,
+                cell: id.to_string(),
+            },
+        );
+    }
+
+    fn cell_home(&self, id: &str) -> Option<(usize, String)> {
+        for (app, started) in self.apps.iter().enumerate() {
+            for (tab, (cells, _)) in &started.running.declared.cells {
+                if cells.iter().any(|cell| cell.id == id) {
+                    return Some((app, tab.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    fn model_id(&self) -> String {
+        self.chat.model.as_ref().map(|model| model.id.clone()).unwrap_or_default()
+    }
+
+    fn launch_run(
+        &mut self,
+        place: crate::cells::Place,
+        id: String,
+        call: Option<String>,
+        model: String,
+        prompt: String,
+    ) {
+        self.board.runs.retain(|run| run.id != id);
+        let rx = crate::cells::start_run(&self.openrouter_url, self.openrouter_key.as_deref(), &model, &prompt);
+        self.board.runs.push(crate::cells::Run {
+            place,
+            id,
+            call,
+            model,
+            text: String::new(),
+            rx,
+            settled: false,
+        });
+    }
+
+    fn take_cell_requests(&mut self) {
+        let mut runs = Vec::new();
+        let mut stops = Vec::new();
+        for (app, started) in self.apps.iter_mut().enumerate() {
+            runs.extend(
+                started
+                    .running
+                    .declared
+                    .run_cells
+                    .drain(..)
+                    .map(|(tab, cell)| (app, tab, cell)),
+            );
+            stops.extend(
+                started
+                    .running
+                    .declared
+                    .stop_cells
+                    .drain(..)
+                    .map(|(tab, cell)| (app, tab, cell)),
+            );
+        }
+        for (app, tab, cell) in runs {
+            self.start_book_run(app, &tab, &cell);
+        }
+        for (app, tab, cell) in stops {
+            self.stop_one(&cell);
+            let _ = (app, tab);
+        }
+    }
+
+    fn start_book_run(&mut self, app: usize, tab: &str, id: &str) {
+        let Some(cell) = self.apps.get(app).and_then(|started| {
+            started.running.declared.cells.get(tab).and_then(|(cells, _)| {
+                cells.iter().find(|cell| cell.id == id).cloned()
+            })
+        }) else {
+            return;
+        };
+        if cell.kind != "text" {
+            return;
+        }
+        let prompt = self.board.drafts.get(id).cloned().unwrap_or_else(|| cell.prompt());
+        if prompt.trim().is_empty() {
+            return;
+        }
+        if prompt != cell.prompt() {
+            self.send(
+                app,
+                HostMessage::EditCell {
+                    tab: tab.to_string(),
+                    cell: id.to_string(),
+                    input: vec![protocol::CellPart::Text { text: prompt.clone() }],
+                },
+            );
+        }
+        self.launch_run(
+            crate::cells::Place::Book {
+                app,
+                tab: tab.to_string(),
+            },
+            id.to_string(),
+            None,
+            self.model_id(),
+            prompt,
+        );
+    }
+
+    fn stop_one(&mut self, id: &str) {
+        let Some(index) = self.board.runs.iter().position(|run| run.id == id && !run.settled) else {
+            return;
+        };
+        self.finish_run(index, protocol::CellState::Stopped, None);
+    }
+
+    fn stop_conversation_cells(&mut self) {
+        let ids: Vec<usize> = self
+            .board
+            .runs
+            .iter()
+            .enumerate()
+            .filter(|(_, run)| matches!(run.place, crate::cells::Place::Conversation) && !run.settled)
+            .map(|(index, _)| index)
+            .rev()
+            .collect();
+        for index in ids {
+            self.finish_run(index, protocol::CellState::Stopped, None);
+        }
+    }
+
+    fn tick_cells(&mut self) {
+        let Some((index, piece)) = self.board.poll() else {
+            return;
+        };
+        match piece {
+            crate::cells::Piece::Text(_) => self.mirror_live(index),
+            crate::cells::Piece::End => self.finish_run(index, protocol::CellState::Done, None),
+            crate::cells::Piece::Failed(reason) => {
+                self.finish_run(index, protocol::CellState::Failed, Some(reason))
+            }
+        }
+    }
+
+    fn mirror_live(&mut self, index: usize) {
+        let Some(run) = self.board.runs.get(index) else {
+            return;
+        };
+        if !matches!(run.place, crate::cells::Place::Conversation) {
+            return;
+        }
+        let id = run.id.clone();
+        let text = run.text.clone();
+        if let Some(cell) = self.chat.conversation.iter_mut().find_map(|entry| {
+            entry.cell.as_mut().filter(|cell| cell.id == id)
+        }) {
+            cell.output = vec![protocol::CellPart::Text { text }];
+        }
+    }
+
+    fn finish_run(&mut self, index: usize, state: protocol::CellState, error: Option<String>) {
+        let Some(run) = self.board.runs.get(index) else {
+            return;
+        };
+        if run.settled {
+            return;
+        }
+        let id = run.id.clone();
+        let text = run.text.clone();
+        let model = run.model.clone();
+        let call = run.call.clone();
+        let place = match &run.place {
+            crate::cells::Place::Conversation => None,
+            crate::cells::Place::Book { app, tab } => Some((*app, tab.clone())),
+        };
+        self.board.runs.remove(index);
+        let output = vec![protocol::CellPart::Text { text: text.clone() }];
+        match place {
+            None => {
+                if let Some(cell) = self.chat.conversation.iter_mut().find_map(|entry| {
+                    entry.cell.as_mut().filter(|cell| cell.id == id)
+                }) {
+                    cell.output = output.clone();
+                    cell.state = state;
+                    cell.error = error.clone();
+                    cell.endpoint = Some(String::from("openrouter"));
+                    cell.model = Some(model.clone());
+                }
+                if let Some(call) = call {
+                    let ok = state != protocol::CellState::Failed;
+                    let output = if let Some(reason) = &error {
+                        serde_json::json!({ "error": reason })
+                    } else {
+                        serde_json::json!(text)
+                    };
+                    self.assistant.send(Command::Result(protocol::ToolResult {
+                        call,
+                        ok,
+                        output,
+                        images: Vec::new(),
+                    }));
+                }
+            }
+            Some((app, tab)) => {
+                if !self.tab_open(app, &tab) {
+                    return;
+                }
+                self.send(
+                    app,
+                    HostMessage::CellResult {
+                        tab,
+                        cell: id,
+                        endpoint: String::from("openrouter"),
+                        model,
+                        state,
+                        output,
+                        error,
+                    },
+                );
+            }
+        }
+    }
+
+    fn tab_open(&self, app: usize, tab: &str) -> bool {
+        self.apps.get(app).is_some_and(|started| {
+            started.running.tabs().0.iter().any(|known| known.id == tab)
+        })
+    }
+
+    /// The cells a tab keeps, drawn with the same card as the conversation.
+    fn show_cells(&mut self, ui: &mut egui::Ui, app: usize, tab: &str, rect: Rect) {
+        let label = self
+            .apps
+            .get(app)
+            .and_then(|started| {
+                started
+                    .running
+                    .tabs()
+                    .0
+                    .into_iter()
+                    .find(|known| known.id == tab)
+                    .map(|known| known.label)
+            })
+            .unwrap_or_default();
+        let listed = self
+            .apps
+            .get(app)
+            .and_then(|started| started.running.declared.cells.get(tab).cloned())
+            .map(|(cells, _)| cells)
+            .unwrap_or_default();
+        ui.painter().with_clip_rect(rect).rect_filled(rect, 0.0, Color32::WHITE);
+        ui.painter().text(
+            egui::pos2(rect.left() + 16.0, rect.top() + 12.0),
+            egui::Align2::LEFT_TOP,
+            label,
+            egui::FontId::proportional(16.0),
+            crate::widgets::TEXT,
+        );
+        let body = Rect::from_min_max(egui::pos2(rect.left(), rect.top() + 36.0), rect.max);
+        self.board.drop_rect = Some(body);
+        if ui.input(|input| input.pointer.any_released())
+            && ui.input(|input| input.pointer.interact_pos()).is_some_and(|pos| body.contains(pos))
+        {
+            self.drop_target = Some((app, tab.to_string()));
+        }
+        let mut actions = Vec::new();
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(body));
+        egui::ScrollArea::vertical().id_salt(("cells", tab)).show(&mut child, |ui| {
+            for (index, cell) in listed.iter().enumerate() {
+                let focused = ui.memory(|memory| memory.has_focus(egui::Id::new(("cell-prompt", &cell.id))));
+                let prompt = cell.prompt();
+                let committed = self
+                    .board
+                    .committed
+                    .entry(cell.id.clone())
+                    .or_insert_with(|| prompt.clone())
+                    .clone();
+                let mut draft = self.board.drafts.get(&cell.id).cloned().unwrap_or_else(|| prompt.clone());
+                if !focused && prompt != committed {
+                    draft = prompt.clone();
+                    self.board.committed.insert(cell.id.clone(), prompt);
+                }
+                let live = self.board.running(&cell.id).map(|run| run.text.clone());
+                let width = ui.available_width();
+                let height = crate::cells::card_height(
+                    ui,
+                    cell,
+                    &draft,
+                    live.as_deref(),
+                    live.is_some(),
+                    width,
+                    true,
+                );
+                let (row, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+                crate::cells::paint_card(
+                    ui,
+                    row,
+                    cell,
+                    &mut draft,
+                    live.as_deref(),
+                    live.is_some(),
+                    Some(index + 1),
+                    &mut actions,
+                );
+                self.board.drafts.insert(cell.id.clone(), draft);
+            }
+        });
+        self.note_cell_actions(actions);
+    }
+
+    fn finish_drag(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|input| input.pointer.any_released()) {
+            return;
+        }
+        let Some(source) = self.dragging.take() else {
+            self.drop_target = None;
+            return;
+        };
+        let Some((app, tab)) = self.drop_target.take() else {
+            return;
+        };
+        let mut cell = source;
+        let from = cell.id.clone();
+        cell.id = protocol::cell_id();
+        cell.from = Some(from);
+        let index = self
+            .apps
+            .get(app)
+            .and_then(|started| started.running.declared.cells.get(&tab))
+            .map(|(cells, _)| cells.len())
+            .unwrap_or(0);
+        self.send(
+            app,
+            HostMessage::InsertCell { tab, index, cell },
+        );
     }
 }
 
@@ -815,6 +1517,7 @@ impl HostWindow {
 
         match self.contents(app, &tab) {
             Some(ContentsKind::Canvas) => self.show_canvas(ui, app, &tab, rect, dismissing),
+            Some(ContentsKind::Cells) => self.show_cells(ui, app, &tab, rect),
             Some(ContentsKind::Grid) => {
                 let painter = ui.painter().with_clip_rect(rect);
                 painter.rect_filled(rect, 0.0, CANVAS);
@@ -873,12 +1576,21 @@ impl HostWindow {
         }
         while let Some(event) = self.assistant.try_recv() {
             match event {
-                assistant::Event::Entry(entry) => self.chat.conversation.push(entry),
+                assistant::Event::Entry(entry) => self.note_entry(entry),
+                assistant::Event::Partial(text) => self.chat.live.push_str(&text),
                 assistant::Event::Cleared => self.chat.conversation.clear(),
                 assistant::Event::Working(working) => {
                     self.chat.working = working;
-                    if !working {
+                    if working {
+                        self.chat.started = Some(crate::workspace::now_seconds());
+                    } else {
+                        self.keep_live();
                         self.routing.end();
+                        // A message sent while this one ran goes next.
+                        if !self.chat.queued.is_empty() {
+                            let (text, chips) = self.chat.queued.remove(0);
+                            self.send_message(text, chips);
+                        }
                     }
                 }
                 assistant::Event::Models(models) => {
@@ -909,6 +1621,10 @@ impl HostWindow {
                     input,
                     group,
                 } => {
+                    if app == route::HOST_ID {
+                        self.begin_host_cell(call, input);
+                        continue;
+                    }
                     let message = HostMessage::Invoke {
                         call: call.clone(),
                         tab,
@@ -934,43 +1650,27 @@ impl HostWindow {
     fn chat_event(&mut self, event: ChatEvent, ctx: &egui::Context, frame: &mut eframe::Frame) {
         match event {
             ChatEvent::Send => {
+                let text = std::mem::take(&mut self.chat.input).trim().to_string();
+                let chips = std::mem::take(&mut self.chat.chips);
                 if self.chat.working {
+                    // It waits for the running request, shown as queued.
+                    self.chat.queued.push((text, chips));
                     return;
                 }
-                let text = std::mem::take(&mut self.chat.input).trim().to_string();
-                let mut unread = Vec::new();
-                let attachments = std::mem::take(&mut self.chat.chips)
-                    .iter()
-                    .filter_map(|path| {
-                        let loaded = chat::load_attachment(path);
-                        if loaded.is_none() {
-                            unread.push(path.display().to_string());
-                        }
-                        loaded
-                    })
-                    .collect();
-                let selected = self.apps.get(self.selected).and_then(|started| {
-                    Some((started.id.clone(), started.running.tabs().1?))
-                });
-                let request = assistant::Request {
-                    text,
-                    attachments,
-                    model: self
-                        .chat
-                        .model
-                        .as_ref()
-                        .map(|model| model.id.clone())
-                        .unwrap_or_default(),
-                    selected,
-                    targets: route::targets(&self.apps),
-                };
-                self.assistant.send(Command::Send(request));
-                for path in unread {
-                    self.assistant
-                        .send(Command::Note(format!("{path} could not be read, so it was not sent.")));
+                self.send_message(text, chips);
+            }
+            ChatEvent::Retry(text) => {
+                if self.chat.working {
+                    self.chat.queued.push((text, Vec::new()));
+                } else {
+                    self.send_message(text, Vec::new());
                 }
             }
-            ChatEvent::Stop => self.assistant.send(Command::Stop),
+            ChatEvent::Stop => {
+                self.chat.queued.clear();
+                self.stop_conversation_cells();
+                self.assistant.send(Command::Stop);
+            }
             ChatEvent::Attach => {
                 let filter = protocol::FileFilter {
                     name: "Pictures and text files".to_string(),
@@ -1505,6 +2205,8 @@ mod tests {
             attachments: Vec::new(),
             tool: None,
             ok: None,
+            cell: None,
+            aside: false,
         }
     }
 
@@ -1754,8 +2456,9 @@ mod tests {
         assert!(routing.poll(&mut apps).is_empty());
 
         let targets = crate::route::targets(&apps);
-        assert_eq!(targets.len(), 1, "an exited process is not offered");
-        assert_eq!(targets[0].app, "here");
-        assert_eq!(targets[0].tabs[0].label, "Template");
+        assert!(targets.iter().all(|target| target.app != "gone"), "an exited process is offered");
+        let here = targets.iter().find(|target| target.app == "here").expect("the living process was dropped");
+        assert_eq!(here.tabs[0].label, "Template");
+        assert!(targets.iter().any(|target| target.app == crate::route::HOST_ID));
     }
 }

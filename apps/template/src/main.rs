@@ -37,6 +37,9 @@ fn main() {
             Ok(HostMessage::Shutdown) => break,
             Ok(HostMessage::Ping) => vec![AppMessage::Pong],
             Ok(HostMessage::Quit) => vec![AppMessage::QuitReady],
+            Ok(HostMessage::Claim { id, .. }) => {
+                vec![AppMessage::Claimed { id, yours: false }]
+            }
             // The one tab, declared as the greeting declares it, then listed.
             Ok(HostMessage::Open { .. }) if !open => {
                 open = true;

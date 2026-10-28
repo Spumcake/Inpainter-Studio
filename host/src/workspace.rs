@@ -119,6 +119,14 @@ pub(crate) fn version_line(version: u32) -> String {
     )
 }
 
+/// Seconds since the Unix epoch, as conversation entries keep time.
+pub(crate) fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
 /// `<Inpainter data folder>`. On this computer that is `~/.local/share/inpainter`.
 pub(crate) fn data_folder() -> Option<PathBuf> {
     let dirs = directories::ProjectDirs::from("io.github", "spumcake", "Inpainter")?;
@@ -135,6 +143,20 @@ pub(crate) fn project_dir(data: &Path, id: &str) -> PathBuf {
 
 pub(crate) fn project_path(data: &Path, id: &str) -> PathBuf {
     project_dir(data, id).join(FILE_NAME)
+}
+
+/// The folder a project's own files are saved in. Created with the project
+/// and removed with it, because it lives inside the project folder.
+pub(crate) fn project_files(data: &Path, id: &str) -> PathBuf {
+    project_dir(data, id).join("files")
+}
+
+/// The directory a file dialog opens in. A request that names a folder uses
+/// that. Otherwise the project's own files folder, when there is one.
+pub(crate) fn dialog_directory(requested: Option<&Path>, files: Option<&Path>) -> Option<PathBuf> {
+    requested
+        .map(Path::to_path_buf)
+        .or_else(|| files.map(Path::to_path_buf))
 }
 
 /// The lock file. The system releases it when the process ends, even in a crash.
@@ -283,6 +305,7 @@ pub(crate) fn create_project(data: &Path) -> Result<(String, ProjectFile), Strin
         conversation: Vec::new(),
     };
     let id = fresh_id(data);
+    std::fs::create_dir_all(project_files(data, &id)).map_err(|error| error.to_string())?;
     file.write(&project_path(data, &id))?;
     Ok((id, file))
 }
@@ -443,6 +466,8 @@ mod tests {
             attachments: Vec::new(),
             tool: None,
             ok: None,
+            cell: None,
+            aside: false,
         }
     }
 
@@ -563,6 +588,23 @@ mod tests {
         let listed = list_projects(&folder);
         assert_eq!(listed[0].id, "newer");
         assert_eq!(listed[1].id, "older");
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    #[test]
+    fn a_project_is_created_with_its_files_folder_and_a_dialog_starts_there() {
+        let folder = scratch("files");
+        let (id, _) = create_project(&folder).unwrap();
+        let files = project_files(&folder, &id);
+        assert!(files.is_dir(), "the project's folder was not created");
+        assert_eq!(dialog_directory(None, Some(&files)).as_deref(), Some(files.as_path()));
+        let elsewhere = folder.join("elsewhere");
+        assert_eq!(
+            dialog_directory(Some(&elsewhere), Some(&files)).as_deref(),
+            Some(elsewhere.as_path())
+        );
+        delete_project(&folder, &id).unwrap();
+        assert!(!project_dir(&folder, &id).exists(), "removing the project left its folder");
         std::fs::remove_dir_all(&folder).unwrap();
     }
 

@@ -1,11 +1,14 @@
 mod apps;
 mod ask;
 mod canvas;
+mod cells;
 mod chat;
 mod dialogs;
+mod env_file;
 mod doc;
 mod grid;
 mod icons;
+mod markdown;
 mod outliner;
 mod panel;
 mod process;
@@ -13,11 +16,13 @@ mod route;
 mod tablet;
 mod tabs;
 mod toolbar;
+mod typescale;
 mod widgets;
 mod window;
 mod workspace;
 
 fn main() -> eframe::Result<()> {
+    env_file::load(&env_file::files(workspace::data_folder()));
     // The lock is taken here, outside the window, so the window's own checks
     // never take it. The system releases it when this process ends.
     let _lock = match workspace::acquire_lock() {

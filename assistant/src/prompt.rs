@@ -10,7 +10,8 @@ pub const SYSTEM: &str = "\
 You are the assistant in Inpainter, a desktop program for creative work. \
 The person's work is open in tabs, and each tab belongs to one of the applications listed below. \
 You work on that work only through the tools offered to you. \
-Every tool takes a `tab`: use the selected tab unless the request says otherwise.
+A tool takes a `tab` when its application has open tabs: use the selected tab unless the request says otherwise. \
+An application with no open tabs offers its tools without a tab.
 
 - Read or look at the work before you change it, so you work from what is there now.
 - Keep what the person made. Change only what the request asks for.
@@ -33,7 +34,9 @@ pub fn system(targets: &[Target], selected: Option<&(String, String)>) -> String
     text.push_str("\n\n# Applications running now");
     for target in targets {
         text.push_str(&format!("\n\n## {} (id `{}`)\n", target.name, target.app));
-        if target.tabs.is_empty() {
+        if target.tabless {
+            text.push_str("Its tools take no `tab`.\n");
+        } else if target.tabs.is_empty() {
             text.push_str("Open tabs: none, so its tools are not offered.\n");
         } else {
             text.push_str("Open tabs:\n");
@@ -72,20 +75,28 @@ pub fn system(targets: &[Target], selected: Option<&(String, String)>) -> String
     text.trim_end().to_string()
 }
 
-/// Every tool of every target that has a tab, as OpenAI-style functions,
-/// each with a required `tab` chosen from that target's tabs.
+/// Every tool of every target, as OpenAI-style functions. A target with tabs
+/// gets a required `tab` chosen from those tabs. A target with none does not.
 pub fn tools(targets: &[Target]) -> Vec<Value> {
     let mut offered = Vec::new();
-    for target in targets.iter().filter(|target| !target.tabs.is_empty()) {
+    for target in targets {
+        if target.skills.is_empty() || (!target.tabless && target.tabs.is_empty()) {
+            continue;
+        }
         let tabs: Vec<Value> = target.tabs.iter().map(|tab| json!(tab.id)).collect();
         for skill in &target.skills {
             for tool in &skill.tools {
+                let parameters = if target.tabless {
+                    tool.input.clone()
+                } else {
+                    with_tab(&tool.input, &tabs)
+                };
                 offered.push(json!({
                     "type": "function",
                     "function": {
                         "name": protocol::tool_key(&target.app, &skill.id, &tool.name),
                         "description": tool.description,
-                        "parameters": with_tab(&tool.input, &tabs),
+                        "parameters": parameters,
                     }
                 }));
             }

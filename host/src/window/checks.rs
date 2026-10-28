@@ -103,6 +103,8 @@ fn quill_program(dir: &Path) -> PathBuf {
     path
 }
 
+mod cells_checks;
+
 /// A folder of the check's own, which it removes when done.
 fn scratch(name: &str) -> PathBuf {
     let base = std::env::var_os("TMPDIR").map_or_else(std::env::temp_dir, PathBuf::from);
@@ -117,6 +119,14 @@ struct StandIn {
     url: String,
     requests: Arc<Mutex<Vec<Value>>>,
     replies: Arc<Mutex<std::collections::VecDeque<Value>>>,
+    /// While held, a streamed text reply sends its first part, flushes, and
+    /// waits for `release` before it sends the rest, as a slow model does.
+    gate: Arc<(Mutex<Gate>, std::sync::Condvar)>,
+}
+
+#[derive(Default)]
+struct Gate {
+    held: bool,
 }
 
 impl StandIn {
@@ -127,6 +137,8 @@ impl StandIn {
         let seen = requests.clone();
         let replies = Arc::new(Mutex::new(replies.into_iter().collect::<std::collections::VecDeque<_>>()));
         let script = replies.clone();
+        let gate = Arc::new((Mutex::new(Gate::default()), std::sync::Condvar::new()));
+        let held = gate.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { return };
@@ -160,19 +172,47 @@ impl StandIn {
                         .pop_front()
                         .unwrap_or_else(|| text_reply("Nothing more."))
                 };
-                let body = reply.to_string();
+                let (body, content_type) = if request_line.starts_with("GET") {
+                    (reply.to_string(), "application/json")
+                } else {
+                    streamed(&reply)
+                };
+                // No length: the body ends when the connection closes, so
+                // each part reaches the reader as it is written.
                 let _ = write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
+                    "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\nconnection: close\r\n\r\n"
                 );
+                let parts: Vec<&str> = body.split_inclusive("\n\n").collect();
+                for (index, part) in parts.iter().enumerate() {
+                    let _ = stream.write_all(part.as_bytes());
+                    let _ = stream.flush();
+                    if index == 0 && parts.len() > 2 && content_type == "text/event-stream" {
+                        let (lock, wake) = &*held;
+                        let mut state = lock.lock().unwrap();
+                        while state.held {
+                            state = wake.wait(state).unwrap();
+                        }
+                    }
+                }
             }
         });
         Self {
             url,
             requests,
             replies,
+            gate,
         }
+    }
+
+    /// Streamed replies pause after their first part until `release`.
+    fn hold(&self) {
+        self.gate.0.lock().unwrap().held = true;
+    }
+
+    fn release(&self) {
+        self.gate.0.lock().unwrap().held = false;
+        self.gate.1.notify_all();
     }
 
     /// Replaces the replies still to come.
@@ -183,6 +223,35 @@ impl StandIn {
     fn requests(&self) -> Vec<Value> {
         self.requests.lock().unwrap().clone()
     }
+}
+
+/// A chat reply as server-sent events. Text is two parts, so a cell shows
+/// it arriving. A tool call is one event carrying the whole message.
+fn streamed(reply: &Value) -> (String, &'static str) {
+    let Some(message) = reply.pointer("/choices/0/message") else {
+        return (reply.to_string(), "application/json");
+    };
+    if message.get("tool_calls").is_some() {
+        let body = format!(
+            "data: {}\n\ndata: [DONE]\n",
+            json!({ "choices": [{ "message": message }] })
+        );
+        return (body, "text/event-stream");
+    }
+    let Some(text) = message.get("content").and_then(Value::as_str) else {
+        return (reply.to_string(), "application/json");
+    };
+    let count = text.chars().count();
+    let Some(mid) = text.char_indices().nth(count / 2).map(|(index, _)| index).filter(|_| count >= 2) else {
+        return (reply.to_string(), "application/json");
+    };
+    let (first, second) = text.split_at(mid);
+    let body = format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n",
+        json!({ "choices": [{ "delta": { "role": "assistant", "content": first } }] }),
+        json!({ "choices": [{ "delta": { "content": second } }] }),
+    );
+    (body, "text/event-stream")
 }
 
 fn text_reply(text: &str) -> Value {
@@ -203,6 +272,10 @@ struct Window {
     frame: eframe::Frame,
     /// The logo's Quit asked the window to close; the next frame honors it.
     close_next: bool,
+    /// Pointer and text events for the next frame, as a person would send them.
+    events: Vec<egui::Event>,
+    /// The texts the last frame painted, with where each was drawn.
+    texts: Vec<(String, Rect)>,
 }
 
 impl Window {
@@ -215,6 +288,8 @@ impl Window {
             api_key: Some(String::from("stand-in")),
             wake: Arc::new(move || wake_ctx.request_repaint()),
         });
+        app.openrouter_url = stand_in.url.clone();
+        app.openrouter_key = Some(String::from("stand-in"));
         app.chat.model = Some(ModelChoice {
             id: String::from("stand-in/model"),
             name: String::from("Stand-in"),
@@ -224,6 +299,8 @@ impl Window {
             app,
             frame: eframe::Frame::_new_kittest(),
             close_next: false,
+        texts: Vec::new(),
+            events: Vec::new(),
         };
         // Every application here declares skills just after its greeting.
         window.until(|app| {
@@ -248,9 +325,18 @@ impl Window {
                 .events
                 .push(egui::ViewportEvent::Close);
         }
+        input.events.append(&mut self.events);
         let Self { ctx, app, frame, .. } = self;
         let mut output = ctx.run_ui(input, |ui| app.ui(ui, frame));
         output.textures_delta.clear();
+        self.texts = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some((text.galley.text().to_string(), text.visual_bounding_rect())),
+                _ => None,
+            })
+            .collect();
         for viewport in output.viewport_output.values() {
             if viewport
                 .commands
@@ -290,11 +376,27 @@ impl Window {
                 )
             })
             .collect();
+        let entries: Vec<String> = self
+            .app
+            .chat
+            .conversation
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{:?} ok={:?} tool={:?} cell={} text={:?}",
+                    entry.role,
+                    entry.ok,
+                    entry.tool,
+                    entry.cell.is_some(),
+                    entry.text.chars().take(40).collect::<String>()
+                )
+            })
+            .collect();
         panic!(
-            "the window never got there: project {:?}, question {:?}, {} entries, {state:#?}",
+            "the window never got there: project {:?}, question {:?}, working {}, {entries:?}, {state:#?}",
             self.app.project.as_ref().map(|project| &project.id),
             self.app.flows.question_shown(),
-            self.app.chat.conversation.len()
+            self.app.chat.working,
         );
     }
 
@@ -363,6 +465,11 @@ fn declared(app: &HostWindow) -> Vec<String> {
             })
         })
         .collect();
+    names.push(protocol::tool_key(
+        crate::route::HOST_ID,
+        "prompt",
+        "run_text_prompt",
+    ));
     names.sort();
     names
 }
@@ -413,7 +520,13 @@ fn a_stand_in_under_a_known_id_offers_only_its_own_skill() {
     let mut window = Window::new(vec![start("simple-sketch", "Simple Sketch", &quill)], &stand_in);
     window.ask("What can you do?");
     let requests = stand_in.requests();
-    assert_eq!(offered(&requests[0]), vec!["simple-sketch__quill__stamp_glyph".to_string()]);
+    assert_eq!(
+        offered(&requests[0]),
+        vec![
+            "inpainter__prompt__run_text_prompt".to_string(),
+            "simple-sketch__quill__stamp_glyph".to_string(),
+        ]
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -474,13 +587,7 @@ impl Window {
     fn answer_saves(&mut self, path: &Path) {
         for app in 0..self.app.apps.len() {
             while let Some(request) = self.app.apps[app].running.declared.files.pop_front() {
-                self.app.send(
-                    app,
-                    protocol::HostMessage::FileResult {
-                        id: request.id,
-                        path: Some(path.display().to_string()),
-                    },
-                );
+                self.app.deliver_file(app, request, Some(path.to_path_buf()));
             }
         }
     }
@@ -512,6 +619,8 @@ fn project_window(specs: Vec<super::AppSpec>, stand_in: &StandIn, data: &Path) -
         api_key: Some(String::from("stand-in")),
         wake: Arc::new(move || wake_ctx.request_repaint()),
     });
+    app.openrouter_url = stand_in.url.clone();
+    app.openrouter_key = Some(String::from("stand-in"));
     app.chat.model = Some(ModelChoice {
         id: String::from("stand-in/model"),
         name: String::from("Stand-in"),
@@ -524,6 +633,8 @@ fn project_window(specs: Vec<super::AppSpec>, stand_in: &StandIn, data: &Path) -
         app,
         frame: eframe::Frame::_new_kittest(),
         close_next: false,
+        texts: Vec::new(),
+        events: Vec::new(),
     };
     window.until(|app| {
         app.project.is_some()
@@ -987,6 +1098,25 @@ fn cancelling_the_save_dialog_while_quitting_stops_the_switch() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Catches a project from before projects had folders: its save dialog
+/// starts in a folder that exists.
+#[test]
+fn a_project_without_a_files_folder_gets_one() {
+    let dir = scratch("no-files");
+    let stand_in = StandIn::start(Vec::new());
+    let window = project_window(both(), &stand_in, &dir);
+    let id = window.app.project.as_ref().unwrap().id.clone();
+    drop(window);
+    let files = crate::workspace::project_files(&dir, &id);
+    std::fs::remove_dir_all(&files).unwrap();
+    let window = project_window(both(), &stand_in, &dir);
+    assert_eq!(window.app.project.as_ref().unwrap().id, id);
+    let start = window.app.dialog_folder(None).expect("no folder for the dialog");
+    assert_eq!(start, files);
+    assert!(files.is_dir(), "the project's folder was not made");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Catches a host that knows one sub-application's questions: an untitled
 /// document a sub-application nothing was written for saves through the file
 /// dialog during New Project stays in the project, and switching back
@@ -1254,8 +1384,7 @@ fn removing_a_project_leaves_its_folders_and_files() {
     let id = window.app.project.as_ref().unwrap().id.clone();
     window.menu(crate::chat::ProjectChoice::Remove);
     assert_eq!(window.app.flows.question_shown().as_deref(), Some("Remove this project?"));
-    assert!(window.app.flows.question_lines().join(" ").contains("conversation is deleted"));
-    assert!(window.app.flows.question_lines().join(" ").contains("folders and files stay"));
+    assert!(window.app.flows.question_lines().join(" ").contains("project's files are deleted"));
     window.app.answer_question("cancel");
     assert!(crate::workspace::project_dir(&dir, &id).is_dir());
 

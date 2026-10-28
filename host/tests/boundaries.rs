@@ -94,7 +94,9 @@ fn product_code(src: &Path) -> Vec<(String, String)> {
                 continue;
             }
             let name = path.file_name().unwrap().to_string_lossy().to_string();
-            if !name.ends_with(".rs") || name == "tests.rs" || name == "checks.rs" {
+            // Window checks name the programs they drive. They are not the host.
+            let in_checks = path.components().any(|component| component.as_os_str() == "checks");
+            if !name.ends_with(".rs") || name == "tests.rs" || name == "checks.rs" || in_checks {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();
@@ -118,6 +120,7 @@ fn no_declared_skill_or_tool_is_named_in_the_host_or_the_assistant() {
     for (program, skill) in declared_skills("simple-sketch")
         .into_iter()
         .chain(declared_skills("template"))
+        // Mission Control declares no skills yet; its own words are searched for below.
     {
         words.push(format!("\"{}\"", skill.id));
         for tool in &skill.tools {
@@ -128,6 +131,10 @@ fn no_declared_skill_or_tool_is_named_in_the_host_or_the_assistant() {
     // `tab` is the protocol's own word: the host gives every tool a `tab`.
     // A skill that happens to share it names nothing the host was written for.
     words.retain(|word| word != "\"tab\"");
+    // The application's own name. `cells` and `cell` are the protocol's words.
+    words.push(String::from("mission-control"));
+    words.push(String::from("mission control"));
+    words.push(String::from("Mission Control"));
     let mut found = Vec::new();
     for crate_src in [root.join("src"), root.join("../assistant/src")] {
         for (file, text) in product_code(&crate_src) {

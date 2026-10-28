@@ -161,6 +161,7 @@ fn targets() -> Vec<Target> {
                 TabInfo { id: String::from("n1"), label: String::from("Notes One") },
                 TabInfo { id: String::from("n2"), label: String::from("Notes Two") },
             ],
+            tabless: false,
             skills: vec![
                 Skill {
                     id: String::from("reading"),
@@ -182,6 +183,7 @@ fn targets() -> Vec<Target> {
             app: String::from("fixture-labels"),
             name: String::from("Fixture Labels"),
             tabs: vec![TabInfo { id: String::from("l1"), label: String::from("Labels") }],
+            tabless: false,
             skills: vec![Skill {
                 id: String::from("naming"),
                 name: String::from("Naming"),
@@ -402,17 +404,21 @@ fn calls_are_routed_with_the_group_and_results_reach_the_model() {
     assert_eq!(assistant_turn["tool_calls"].as_array().map(Vec::len), Some(2));
 
     let entries = entries(&events);
-    let roles: Vec<Role> = entries.iter().map(|entry| entry.role).collect();
-    assert_eq!(roles, [Role::Person, Role::Tool, Role::Tool, Role::Assistant]);
+    let finished: Vec<&Entry> = entries
+        .iter()
+        .filter(|entry| entry.role == Role::Tool && entry.ok.is_some())
+        .collect();
+    assert_eq!(finished.len(), 2);
     assert_eq!(entries.iter().filter(|e| e.role == Role::Person).count(), 1);
-    // A tool entry holds the key and whether it worked, never input or output.
+    // A finished tool entry holds the key and whether it worked, never input or output.
+    // A call also records a pending entry first, so the host can show it while it runs.
     for entry in entries.iter().filter(|entry| entry.role == Role::Tool) {
         assert!(entry.text.is_empty());
-        assert_eq!(entry.ok, Some(true));
         let saved = serde_json::to_string(entry).expect("json");
         assert!(!saved.contains("secret words") && !saved.contains("id-for") && !saved.contains("New"), "{saved}");
     }
-    assert_eq!(entries[1].tool.as_deref(), Some("fixture-notes__writing__add"));
+    assert_eq!(finished[0].ok, Some(true));
+    assert_eq!(finished[0].tool.as_deref(), Some("fixture-notes__writing__add"));
 
     // A second request has a different group.
     assistant.send(Command::Send(request("more", targets())));
@@ -668,6 +674,8 @@ fn restore_rebuilds_the_conversation_and_clear_empties_it() {
             attachments: vec![attached.display().to_string(), missing.display().to_string()],
             tool: None,
             ok: None,
+            cell: None,
+            aside: false,
         },
         Entry {
             role: Role::Tool,
@@ -676,6 +684,8 @@ fn restore_rebuilds_the_conversation_and_clear_empties_it() {
             attachments: Vec::new(),
             tool: Some(String::from("fixture-notes__writing__add")),
             ok: Some(true),
+            cell: None,
+            aside: false,
         },
         Entry {
             role: Role::Assistant,
@@ -684,6 +694,8 @@ fn restore_rebuilds_the_conversation_and_clear_empties_it() {
             attachments: Vec::new(),
             tool: None,
             ok: None,
+            cell: None,
+            aside: false,
         },
         Entry {
             role: Role::Note,
@@ -692,6 +704,8 @@ fn restore_rebuilds_the_conversation_and_clear_empties_it() {
             attachments: Vec::new(),
             tool: None,
             ok: None,
+            cell: None,
+            aside: false,
         },
     ];
     assistant.send(Command::Restore(saved.clone()));
@@ -825,4 +839,49 @@ fn the_source_names_no_application_or_work() {
         checked += 1;
     }
     assert!(checked >= 4);
+}
+
+/// Catches every application with no open tab offered as if its tools took
+/// none: only a target that says its tools take no `tab` is offered that
+/// way, and one with no tab otherwise offers nothing.
+#[test]
+fn only_a_tabless_target_offers_tools_without_a_tab() {
+    let make = |app: &str, tabless: bool| Target {
+        app: String::from(app),
+        name: String::from(app),
+        tabs: Vec::new(),
+        tabless,
+        skills: vec![Skill {
+            id: String::from("making"),
+            name: String::from("Making"),
+            description: String::from("Makes."),
+            instructions: String::new(),
+            tools: vec![tool("make")],
+        }],
+    };
+    let offered = crate::prompt::tools(&[make("fixture-closed", false), make("fixture-own", true)]);
+    let names: Vec<&str> = offered
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["fixture-own__making__make"]);
+    assert!(offered[0]["function"]["parameters"]["properties"].get("tab").is_none());
+}
+
+/// Catches a tool call read from one streamed event only: OpenRouter sends
+/// the name and the arguments in fragments, and they arrive whole.
+#[test]
+fn a_tool_call_in_fragments_arrives_whole() {
+    let events = [
+        json!({"choices": [{"delta": {"role": "assistant", "tool_calls": [{"index": 0, "id": "c1", "type": "function", "function": {"name": "fixture-notes__writing__add", "arguments": ""}}]}}]}),
+        json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{\"tab\":\"n1\","}}]}}]}),
+        json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "\"text\":\"North\"}"}}]}}]}),
+    ];
+    let body: String = events.iter().map(|event| format!("data: {event}\n\n")).collect::<String>() + "data: [DONE]\n";
+    let message = crate::openrouter::assemble(&body).expect("the stream was not read");
+    let call = &message["tool_calls"][0];
+    assert_eq!(call["id"], "c1");
+    assert_eq!(call["function"]["name"], "fixture-notes__writing__add");
+    let arguments: Value = serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(arguments, json!({"tab": "n1", "text": "North"}));
 }

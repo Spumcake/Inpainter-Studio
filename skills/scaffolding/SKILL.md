@@ -57,9 +57,16 @@ The host sends these; a sub-application that declares no skills never receives `
 - `invoke {call, tab, tool, input, group}` — run one tool on that tab. `tool` is `<application id>__<skill id>__<tool name>`, made by `protocol::tool_key`. Carry it out through the same path the person's hand action takes, so undo, saving, and what the host shows are the same as for hand work. Send any `document`, `tabs`, or other message the call caused first, then `result {call, ok, output, images?}`: `output` is JSON for the model to read, such as what was made and its ids; with `ok: false` nothing changed and `output` says why; `images` holds PNG pictures in standard base64. Every change made under one `group`, the assistant's request, is one undo step, until another group or a change by hand. Undo and redo stay with the person, so they are never tools.
 - `open {path?}` — open that file in a new tab or, with no path, the tab the sub-application opens of its own at start. A tab opened this way is declared as the greeting declares tabs: send its `contents` and, when it uses the panel, its `panel`, before the `tabs` that lists it.
 - `claim {id, path}` — say whether this file is the application's own work. Answer `claimed {id, yours}`. The host asks the application that opened the dialog first, then the others. The first that claims it receives `open`. A file nobody claims goes to the application that asked, which reports its own error. The host never reads the file to decide.
-- `keep {tab}` — make sure that tab has a file, through the sub-application's own Save, with its own `file` request for a document that has none. Answer `kept {tab, path?}` once that Save is done, with no path when the person cancelled.
+- `keep {tab}` — make sure that tab's file is written. Answer `kept {tab, path?, error?}`: `path` with no `error` when written, no `path` and no `error` when clean or untouched, and `error` when writing failed.
 - Each `tabs` entry carries `path`, the file the tab shows once it has one, and `saves`, whether the tab is a document that can be saved to a file. The template's tab does not save.
 - Started with `--restore` (`protocol::RESTORE_FLAG`), a sub-application opens no document of its own: its greeting has no `tab`, `contents`, or `panel`, and it waits for `open`. The host uses this to reopen a workspace.
+- `project {folder}` — the current project's folder as an absolute path, sent before any `open`. Inside a project a sub-application that saves documents:
+  - writes each document into that folder by itself, about a second after it changes, with no Save, Save As, or save question; Simple Sketch and Mission Control show how, with a loop that also wakes with no message;
+  - names a new document's file after its tab, adding " 2", " 3", and on when a file of that name exists in the folder, and never replaces another file;
+  - writes everything before a tab closes, before `kept`, and before `quit_ready`, so closing and quitting ask nothing;
+  - refuses every path outside the folder, from `open`, `file_result`, `claim`, and its own recent files, and opens nothing in its place.
+
+  The host asks before a file from outside comes in, and sends only the imported copy's path.
 
 The host starts each sub-application with `--data-dir <folder>`, its own folder inside Inpainter's data folder, for its preferences and recovery files.
 

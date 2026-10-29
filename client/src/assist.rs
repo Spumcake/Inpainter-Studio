@@ -493,7 +493,7 @@ pub(crate) fn workspace(dir: &Path, saved: &Path) -> Result<(), String> {
 
     // A tab that has a file is kept as it is.
     let replies = pair.exchange(HostMessage::Keep { tab: opened.id.clone() })?;
-    if !matches!(replies.last(), Some(AppMessage::Kept { tab, path: Some(kept) }) if *tab == opened.id && *kept == path) {
+    if !matches!(replies.last(), Some(AppMessage::Kept { tab, path: Some(kept), .. }) if *tab == opened.id && *kept == path) {
         return Err("keep of a saved tab did not answer with its file".into());
     }
     // A cancelled Save keeps no file.
@@ -502,7 +502,7 @@ pub(crate) fn workspace(dir: &Path, saved: &Path) -> Result<(), String> {
         return Err("keep of an untitled sketch did not run its Save".into());
     };
     let replies = answer_file(&mut pair, dir, "keep", id, None)?;
-    if !matches!(replies.last(), Some(AppMessage::Kept { tab, path: None }) if *tab == untitled) {
+    if !matches!(replies.last(), Some(AppMessage::Kept { tab, path: None, .. }) if *tab == untitled) {
         return Err("a cancelled keep did not answer with no file".into());
     }
     // A chosen file is saved and named in `kept`, after the tabs that show it.
@@ -514,7 +514,7 @@ pub(crate) fn workspace(dir: &Path, saved: &Path) -> Result<(), String> {
     let oracle = dir.join("keep").join("oracle").join(&name);
     let replies = answer_file(&mut pair, dir, "keep", id, Some((&process, &oracle)))?;
     let wanted = process.display().to_string();
-    if !matches!(replies.last(), Some(AppMessage::Kept { tab, path: Some(kept) }) if *tab == untitled && *kept == wanted) {
+    if !matches!(replies.last(), Some(AppMessage::Kept { tab, path: Some(kept), .. }) if *tab == untitled && *kept == wanted) {
         return Err("keep did not answer with the file it saved".into());
     }
     let tabs = tabs_of(&replies).ok_or("keep sent no tabs with the new file")?;

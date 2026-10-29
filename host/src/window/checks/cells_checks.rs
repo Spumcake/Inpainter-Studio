@@ -467,8 +467,7 @@ fn a_book_and_a_conversation_cell_come_back_with_the_project() {
         text_reply(PIECE),
     ]);
     let mut window = project_window(apps(), &stand_in, &dir);
-    let id = window.app.project.as_ref().unwrap().id.clone();
-    let files = crate::workspace::project_files(&dir, &id);
+    let (id, files, session) = window.here();
     assert!(files.is_dir());
     window.app.chat.input = "Remember a cell.".into();
     let ctx = window.ctx.clone();
@@ -484,35 +483,32 @@ fn a_book_and_a_conversation_cell_come_back_with_the_project() {
     window.until(|app| book_cells(app).iter().any(|cell| cell.prompt() == "Saved from the book."));
     command(&mut window, "mission-control", "run");
     window.until(|app| book_cells(app).iter().any(|cell| cell.result_text() == PIECE));
-    command(&mut window, "mission-control", "save");
-    window.until(|app| {
-        app.apps.iter().any(|started| started.id == "mission-control" && !started.running.declared.files.is_empty())
-    });
-    let book = files.join("keeper.smx");
-    window.answer_saves(&book);
+    // The notebook writes itself into the project, with no dialog.
+    let book = files.join("Untitled Notebook.smx");
     window.until(|app| {
         app.apps.iter().any(|started| {
             started.id == "mission-control"
                 && started.running.tabs().0.iter().any(|tab| tab.path.as_deref() == Some(book.to_str().unwrap()))
         })
     });
+    window.until(|_| std::fs::read_to_string(&book).is_ok_and(|saved| saved.contains(PIECE)));
     let saved = std::fs::read_to_string(&book).unwrap();
     assert!(saved.contains("Saved from the book."));
     assert!(saved.contains(PIECE));
     keep_ticking(&mut window);
-    let project = crate::workspace::ProjectFile::read(&crate::workspace::project_path(&dir, &id)).unwrap();
+    let project = crate::workspace::SessionFile::read(&files, &session).unwrap();
     assert!(project.conversation.iter().any(|entry| {
         entry.cell.as_ref().is_some_and(|cell| cell.prompt() == "Remember this." && cell.result_text() == PIECE)
     }));
     window.until(|app| !app.chat.working);
-    window.menu(crate::chat::ProjectChoice::New);
+    window.menu(crate::sessions::SessionChoice::NewSession { project: id.clone() });
     assert!(
         window.app.flows.closing_started(),
-        "new did not start closing"
+        "a new session did not start closing"
     );
     window.until(|app| {
         let asked = app.apps.iter().any(|started| started.running.declared.ask.is_some());
-        let ready = app.project.as_ref().is_some_and(|project| project.id != id)
+        let ready = app.project.as_ref().is_some_and(|project| project.session != session)
             && app.apps.iter().all(|started| !started.running.pending() && started.running.tabs().1.is_some())
             && !app.chat.working;
         asked || ready
@@ -523,10 +519,10 @@ fn a_book_and_a_conversation_cell_come_back_with_the_project() {
         .iter()
         .filter_map(|started| started.running.declared.ask.as_ref().map(|ask| ask.title.clone()))
         .collect();
-    assert!(asked.is_empty(), "leaving a saved project asked {asked:?}");
-    window.menu(crate::chat::ProjectChoice::Switch(id.clone()));
+    assert!(asked.is_empty(), "leaving a session asked {asked:?}");
+    window.menu(crate::sessions::SessionChoice::Open { project: id.clone(), session: session.clone() });
     window.until(|app| {
-        app.project.as_ref().is_some_and(|project| project.id == id)
+        app.project.as_ref().is_some_and(|project| project.session == session)
             && app.chat.conversation.iter().any(|entry| {
                 entry.cell.as_ref().is_some_and(|cell| cell.prompt() == "Remember this." && cell.result_text() == PIECE)
             })
@@ -561,25 +557,32 @@ fn a_book_and_a_conversation_cell_come_back_with_the_project() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// C-5. Closing a book with changes asks first.
+/// S-4. Closing a changed notebook in a project writes it there and asks
+/// nothing.
 #[test]
-fn closing_a_changed_book_asks_first() {
+fn closing_a_changed_book_writes_it_and_asks_nothing() {
     let dir = scratch("close-book");
     let stand_in = StandIn::start(Vec::new());
     let mut window = project_window(apps(), &stand_in, &dir);
+    let folder = window.here().1;
     window.select("mission-control");
     show_workspace(&mut window);
     command(&mut window, "mission-control", "add_cell");
     window.until(|app| book_cells(app).len() == 2);
     command(&mut window, "mission-control", "close_tab");
-    window.until(|app| {
-        app.apps.iter().any(|started| {
-            started.running.declared.ask.as_ref().is_some_and(|ask| ask.title == "Keep this notebook?")
-        })
-    });
-    answer(&mut window, "cancel");
-    window.until(|app| book_cells(app).len() == 2 && app.apps.iter().all(|started| started.running.declared.ask.is_none()));
+    let book = folder.join("Untitled Notebook.smx");
+    window.until(|_| book.is_file());
+    keep_ticking(&mut window);
+    assert!(window.app.apps.iter().all(|started| started.running.declared.ask.is_none()), "closing asked");
+    let read = mission_control_cells(&book);
+    assert_eq!(read, 2, "the closed notebook lost its cells");
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The cells a notebook file holds.
+fn mission_control_cells(path: &std::path::Path) -> usize {
+    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    value["cells"].as_array().map_or(0, Vec::len)
 }
 
 /// C-8. The stand-in's own commands get drawing, Run, and a dropped cell.
@@ -694,10 +697,8 @@ fn the_application_that_claims_a_file_opens_it() {
         &stand_in,
         &dir,
     );
-    let id = window.app.project.as_ref().unwrap().id.clone();
-    let files = crate::workspace::project_files(&dir, &id);
-    let sketch = files.join("view.smx");
-    super::save_tab(&mut window, 0, &sketch);
+    let files = window.here().1;
+    let sketch = super::save_tab(&mut window, 0);
     let book = files.join("story.smx");
     std::fs::write(
         &book,

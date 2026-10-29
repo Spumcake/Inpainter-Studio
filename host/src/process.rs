@@ -72,7 +72,7 @@ pub struct Declared {
     /// Answers to `invoke` not yet passed to the assistant.
     pub results: VecDeque<ToolResult>,
     /// Answers to `keep`: the tab, and its file or none when cancelled.
-    pub kept: VecDeque<(String, Option<String>)>,
+    pub kept: VecDeque<(String, Option<String>, Option<String>)>,
     /// The cells a tab reported, and which one is selected.
     pub cells: HashMap<String, (Vec<protocol::Cell>, Option<String>)>,
     /// Cells the toolbar asked the host to run.
@@ -287,6 +287,12 @@ impl Running {
         self.exited
     }
 
+    /// A program is running and can answer: not a stand-in a test made, and
+    /// not one that has stopped.
+    pub fn answers(&self) -> bool {
+        self.child.is_some() && !self.exited
+    }
+
     /// No `pong` for three seconds.
     pub fn not_responding(&self) -> bool {
         !self.exited && self.child.is_some() && self.last_pong.elapsed() >= NO_ANSWER
@@ -488,7 +494,7 @@ impl Running {
                 declared.skills_version += 1;
             }
             AppMessage::ToolResult(result) => declared.results.push_back(result),
-            AppMessage::Kept { tab, path } => declared.kept.push_back((tab, path)),
+            AppMessage::Kept { tab, path, error } => declared.kept.push_back((tab, path, error)),
             AppMessage::Cells { tab, cells, selected } => {
                 declared.cells.insert(tab, (cells, selected));
             }

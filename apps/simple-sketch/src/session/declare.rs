@@ -30,6 +30,12 @@ pub(crate) fn command_key(id: CommandId) -> String {
     snake(&format!("{id:?}"))
 }
 
+/// The commands that save by hand. In a project every change is written by
+/// itself, so they are not offered.
+fn saves(id: CommandId) -> bool {
+    matches!(id, CommandId::Save | CommandId::SaveAs | CommandId::SaveCopy)
+}
+
 pub(crate) fn tool_key(tool: Tool) -> String {
     snake(&format!("{tool:?}"))
 }
@@ -177,8 +183,10 @@ impl Session {
     pub(crate) fn declare_menu(&mut self) -> Vec<MenuEntry> {
         let recent = self.recent_menu();
         let clear_enabled = self.command_enabled(CommandId::ClearRecent);
+        let in_project = self.project().is_some();
         registry::sketch_menu()
             .iter()
+            .filter(|row| !(in_project && matches!(row, registry::SketchMenuRow::Command(id) if saves(*id))))
             .map(|row| match row {
                 registry::SketchMenuRow::Command(id) => command_row(self, *id, false),
                 registry::SketchMenuRow::Recent => MenuEntry {
@@ -257,6 +265,9 @@ impl Session {
             items.push(ToolItem::Separator);
         }
         for id in registry::file_commands() {
+            if self.project().is_some() && saves(*id) {
+                continue;
+            }
             items.push(self.command_button(*id));
         }
         items.push(ToolItem::Separator);

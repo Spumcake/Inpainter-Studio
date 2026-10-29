@@ -12,6 +12,8 @@ const SEARCHED: &[&str] = &[
     "src/route.rs",
     "src/workspace.rs",
     "src/window/flows.rs",
+    "src/sessions.rs",
+    "src/dialogs.rs",
 ];
 
 /// Words that would mean one of these parts was written for a particular

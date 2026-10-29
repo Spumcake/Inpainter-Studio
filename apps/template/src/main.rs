@@ -37,6 +37,12 @@ fn main() {
             Ok(HostMessage::Shutdown) => break,
             Ok(HostMessage::Ping) => vec![AppMessage::Pong],
             Ok(HostMessage::Quit) => vec![AppMessage::QuitReady],
+            Ok(HostMessage::Keep { tab }) => vec![AppMessage::Kept {
+                tab,
+                path: None,
+                error: None,
+            }],
+            Ok(HostMessage::Project { .. }) => Vec::new(),
             Ok(HostMessage::Claim { id, .. }) => {
                 vec![AppMessage::Claimed { id, yours: false }]
             }

@@ -12,6 +12,7 @@ mod markdown;
 mod outliner;
 mod panel;
 mod process;
+mod sessions;
 mod route;
 mod tablet;
 mod tabs;

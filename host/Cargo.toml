@@ -18,3 +18,4 @@ protocol = { path = "../protocol" }
 rfd = "=0.15.4"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.152"
+trash = "=5.2.9"

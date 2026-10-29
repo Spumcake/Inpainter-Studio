@@ -1,4 +1,4 @@
-//! Mission Control: mission books. The host draws and runs the cells.
+//! Mission Control: notebooks. The host draws and runs the cells.
 
 mod book;
 
@@ -10,10 +10,27 @@ fn main() {
     let mut session = if restore { Session::restored() } else { Session::launch() };
     let greeting = session.greeting();
     send(&greeting);
-    let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else {
-            break;
+    // Lines arrive on their own thread, so the loop also wakes with no
+    // message and writes a project's changes that are due.
+    let (lines, incoming) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    loop {
+        let line = match incoming.recv_timeout(std::time::Duration::from_millis(250)) {
+            Ok(line) => line,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                send(&session.tick());
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
         if line.contains("\"type\":\"shutdown\"") {
             break;
@@ -24,6 +41,8 @@ fn main() {
             let _ = out.flush();
         }
     }
+    // The host is gone: whatever a project has not written yet is written.
+    session.write_all();
 }
 
 fn send(messages: &[protocol::AppMessage]) {

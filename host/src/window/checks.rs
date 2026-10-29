@@ -39,12 +39,11 @@ while IFS= read -r line; do
 done
 "#;
 
-/// A sub-application nothing was written for, whose one untitled ledger can
-/// be saved. Its quit question, buttons, and file request use words of its
-/// own. Like Simple Sketch, it writes and closes the ledger in one step, so
-/// no tab report ever shows the ledger with its file.
+/// A sub-application nothing was written for, with ids of its own. It is
+/// told the project's folder, and writes its one ledger there by itself
+/// after any change, reporting the file, as every activity must.
 const LEDGER: &str = r#"#!/bin/sh
-dirty=0
+folder=""
 echo '{"type":"hello","protocol":1}'
 echo '{"type":"tab","id":"l1","label":"Untitled Ledger"}'
 echo '{"type":"contents","tab":"l1","kind":"grid"}'
@@ -54,21 +53,11 @@ while IFS= read -r line; do
   case "$line" in
     *'"type":"ping"'*) echo '{"type":"pong"}' ;;
     *'"type":"shutdown"'*) exit 0 ;;
-    *'"type":"command"'*) dirty=1 ;;
-    *'"type":"quit"'*)
-      if [ "$dirty" = 1 ]; then
-        echo '{"type":"ask","id":"ledger-unwritten","title":"Write the ledger?","buttons":[{"id":"write","label":"Write"},{"id":"toss","label":"Toss"},{"id":"stay","label":"Stay"}],"dismiss":"stay"}'
-      else
-        echo '{"type":"quit_ready"}'
-      fi ;;
-    *'"type":"answer"'*'"button":"write"'*) echo '{"type":"file","id":"ledger-file","kind":"save"}' ;;
-    *'"type":"answer"'*'"button":"toss"'*|*'"type":"file_result"'*'"path"'*)
-      dirty=0
-      echo '{"type":"tabs","tabs":[{"id":"l2","label":"Untitled Ledger","saves":true}],"active":"l2"}'
-      echo '{"type":"quit_ready"}' ;;
-    *'"type":"open"'*'"path"'*)
-      path=$(printf '%s' "$line" | sed 's/.*"path":"\([^"]*\)".*/\1/')
-      echo "{\"type\":\"tabs\",\"tabs\":[{\"id\":\"l1\",\"label\":\"Untitled Ledger\",\"saves\":true},{\"id\":\"l3\",\"label\":\"Ledger\",\"path\":\"$path\",\"saves\":true}],\"active\":\"l3\"}" ;;
+    *'"type":"project"'*) folder=$(printf '%s' "$line" | sed 's/.*"folder":"\([^"]*\)".*/\1/') ;;
+    *'"type":"command"'*)
+      printf 'ledger' > "$folder/Ledger.ledger"
+      echo "{\"type\":\"tabs\",\"tabs\":[{\"id\":\"l1\",\"label\":\"Ledger\",\"path\":\"$folder/Ledger.ledger\",\"saves\":true}],\"active\":\"l1\"}" ;;
+    *'"type":"quit"'*) echo '{"type":"quit_ready"}' ;;
   esac
 done
 "#;
@@ -599,10 +588,34 @@ impl Window {
         self.step();
     }
 
-    fn menu(&mut self, choice: crate::chat::ProjectChoice) {
+    fn menu(&mut self, choice: crate::sessions::SessionChoice) {
         let Self { app, frame, .. } = self;
-        app.project_menu(choice, frame);
+        app.session_choice(choice, frame);
         self.step();
+    }
+
+    /// The open project's id and folder, and the open session's id.
+    fn here(&self) -> (String, PathBuf, String) {
+        let project = self.app.project.as_ref().expect("a project is open");
+        (project.id.clone(), project.folder.clone(), project.session.clone())
+    }
+
+    /// Steps until the open session is `session`, and every sub-application
+    /// has reported its tabs. Fails if anything asks a question meanwhile.
+    fn settle_on(&mut self, session: &str) {
+        let session = session.to_string();
+        self.until(move |app| {
+            let asked: Vec<String> = app
+                .apps
+                .iter()
+                .filter_map(|started| started.running.declared.ask.as_ref().map(|ask| ask.title.clone()))
+                .collect();
+            assert!(asked.is_empty(), "switching asked {asked:?}");
+            app.project.as_ref().is_some_and(|project| project.session == session)
+                && app.flows.idle()
+                && app.apps.iter().all(|started| !started.running.pending() && started.running.tabs().1.is_some())
+        });
+        keep_ticking(self);
     }
 }
 
@@ -755,40 +768,42 @@ fn change_on_its_own(sketch: &Path) {
     child.wait().unwrap();
 }
 
-/// Saves the open tab through its own Save, answering the file dialog with `path`.
-fn save_tab(window: &mut Window, app: usize, path: &Path) {
+/// Changes the open tab and saves it through its own Save. In a project
+/// that writes into the project's folder with no dialog; returns the file.
+fn save_tab(window: &mut Window, app: usize) -> PathBuf {
     let tab = window.app.apps[app].running.tabs().1.clone().unwrap();
-    window.app.send(
-        app,
-        protocol::HostMessage::Command {
-            id: String::from("save"),
-            tab: Some(tab),
-            arg: None,
-            node: None,
-            viewport: window.app.viewport,
-        },
-    );
+    for id in ["new_canvas", "save"] {
+        window.app.send(
+            app,
+            protocol::HostMessage::Command {
+                id: String::from(id),
+                tab: Some(tab.clone()),
+                arg: None,
+                node: None,
+                viewport: window.app.viewport,
+            },
+        );
+    }
     let start = Instant::now();
-    let wanted = path.display().to_string();
     while start.elapsed() < Duration::from_secs(20) {
-        window.answer_saves(path);
         for started in &mut window.app.apps {
             started.running.poll();
         }
         window.step();
-        let has = window.app.apps[app]
+        let written = window.app.apps[app]
             .running
             .tabs()
             .0
-            .iter()
-            .any(|tab| tab.path.as_deref() == Some(wanted.as_str()));
-        if has {
+            .into_iter()
+            .find(|entry| entry.id == tab)
+            .and_then(|entry| entry.path);
+        if let Some(path) = written {
             keep_ticking(window);
-            return;
+            return PathBuf::from(path);
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    panic!("the tab was never kept as {}", path.display());
+    panic!("the tab was never written");
 }
 
 fn answer(window: &mut Window, button: &str) {
@@ -856,18 +871,136 @@ fn the_bar_shows_and_hides_the_workspace() {
     window.app.toggle_workspace();
     window.step();
     assert!(window.app.project.as_ref().unwrap().workspace_open);
+    // Open, the bar sits inside the workspace panel, right of the edge.
+    let edge = crate::chat::width(1280.0, None);
+    assert!(window.app.bar_rect.left() > edge, "the bar is inside the conversation: {:?}", window.app.bar_rect);
     let shown = window.app.viewport;
     assert!(
         (shown[0] - hidden[0]).abs() < 2.0 && (shown[1] - hidden[1]).abs() < 2.0,
         "hidden {hidden:?} and shown {shown:?} are different sizes"
     );
-    let id = window.app.project.as_ref().unwrap().id.clone();
-    let text = std::fs::read_to_string(crate::workspace::project_path(&dir, &id)).unwrap();
+    let (_, folder, session) = window.here();
+    let text = std::fs::read_to_string(crate::workspace::session_path(&folder, &session)).unwrap();
     assert!(text.contains("\"workspace_open\": true"), "{text}");
     window.app.toggle_workspace();
     window.step();
     assert!(!window.app.project.as_ref().unwrap().workspace_open);
     assert!(window.app.bar_rect.center().x > 1200.0);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Catches a bar that a tool underneath also takes: with Simple Sketch's
+/// brush, a real press on the bar over the canvas, moving a little as a pen
+/// does, closes the workspace and draws nothing.
+#[test]
+fn clicking_the_bar_over_the_canvas_draws_nothing() {
+    let dir = scratch("bar-click");
+    let stand_in = StandIn::start(Vec::new());
+    let mut window = project_window(both(), &stand_in, &dir);
+    window.select("simple-sketch");
+    window.app.toggle_workspace();
+    keep_ticking(&mut window);
+    let tab = window.app.apps[0].running.tabs().1.clone().unwrap();
+    window.app.send(
+        0,
+        protocol::HostMessage::Command { id: "select_tool".into(), tab: Some(tab.clone()), arg: Some(json!("brush")), node: None, viewport: [800.0, 600.0] },
+    );
+    keep_ticking(&mut window);
+    window.until(|app| app.apps[0].running.declared.documents.contains_key(&tab));
+    // A press that moves a little, as a pen's does.
+    let press = |window: &mut Window, at: Pos2| {
+        window.events.push(egui::Event::PointerMoved(at));
+        window.step();
+        window.events.push(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+        window.step();
+        for step in 1..=4 {
+            window.events.push(egui::Event::PointerMoved(at + egui::vec2(0.0, step as f32 * 2.0)));
+            window.step();
+        }
+        let end = at + egui::vec2(0.0, 8.0);
+        window.events.push(egui::Event::PointerButton { pos: end, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+        window.step();
+        keep_ticking(window);
+    };
+    // The same press on the open canvas draws, so the check below can tell.
+    let bar = window.app.bar_rect.center();
+    let before = marks(&window.app, &tab);
+    press(&mut window, bar + egui::vec2(200.0, 0.0));
+    window.until(|app| marks(app, &tab) > before);
+    let before = marks(&window.app, &tab);
+    press(&mut window, bar);
+    assert!(!window.app.project.as_ref().unwrap().workspace_open, "the click did not reach the bar");
+    assert_eq!(marks(&window.app, &tab), before, "the press on the bar drew");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Catches a press that closes the session menu and also reaches the
+/// drawing beneath: with the menu open over Simple Sketch's brush, a press
+/// on the canvas outside the menu closes it and draws nothing.
+#[test]
+fn a_press_that_closes_the_session_menu_draws_nothing() {
+    let dir = scratch("menu-away");
+    let stand_in = StandIn::start(Vec::new());
+    let mut window = project_window(both(), &stand_in, &dir);
+    window.select("simple-sketch");
+    window.app.toggle_workspace();
+    keep_ticking(&mut window);
+    let tab = window.app.apps[0].running.tabs().1.clone().unwrap();
+    window.app.send(
+        0,
+        protocol::HostMessage::Command { id: "select_tool".into(), tab: Some(tab.clone()), arg: Some(json!("brush")), node: None, viewport: [800.0, 600.0] },
+    );
+    keep_ticking(&mut window);
+    window.until(|app| app.apps[0].running.declared.documents.contains_key(&tab));
+    let before = marks(&window.app, &tab);
+    window.app.sessions.open = true;
+    window.app.sessions.raise = true;
+    keep_ticking(&mut window);
+    let at = Pos2::new(1100.0, 500.0);
+    window.events.push(egui::Event::PointerMoved(at));
+    window.step();
+    window.events.push(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    window.step();
+    for step in 1..=4 {
+        window.events.push(egui::Event::PointerMoved(at + egui::vec2(0.0, step as f32 * 3.0)));
+        window.step();
+    }
+    window.events.push(egui::Event::PointerButton { pos: at + egui::vec2(0.0, 12.0), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    window.step();
+    keep_ticking(&mut window);
+    assert!(!window.app.sessions.open, "the press outside did not close the menu");
+    assert_eq!(marks(&window.app, &tab), before, "the press that closed the menu drew");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Catches the overlay left over the panel: after a press outside closes
+/// the session menu, reopening it puts the panel back on top, so the
+/// panel, not the overlay, is what a pointer inside it reaches.
+#[test]
+fn the_reopened_session_menu_is_above_its_overlay() {
+    let dir = scratch("menu-reopen");
+    let stand_in = StandIn::start(Vec::new());
+    let mut window = project_window(both(), &stand_in, &dir);
+    let press = |window: &mut Window, at: Pos2| {
+        window.events.push(egui::Event::PointerMoved(at));
+        window.step();
+        for pressed in [true, false] {
+            window.events.push(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+            window.step();
+        }
+    };
+    let open = |window: &mut Window| {
+        window.app.sessions.open = true;
+        window.app.sessions.raise = true;
+        window.step();
+        window.step();
+    };
+    open(&mut window);
+    press(&mut window, Pos2::new(100.0, 700.0));
+    assert!(!window.app.sessions.open, "the press outside did not close the menu");
+    open(&mut window);
+    let panel = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("session-panel"));
+    assert_eq!(window.ctx.layer_id_at(Pos2::new(900.0, 500.0)), Some(panel), "the overlay is over the reopened panel");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -939,194 +1072,403 @@ fn reach(show: bool) -> Reach {
     }
 }
 
-/// Rename keeps the id and everything else, and the name at the top changes.
+/// The intent guide's project test: two sessions of one project, each with a
+/// Simple Sketch tab and the template's, switched back and forth and after a
+/// restart, each bring back their own conversation, tabs, order, and
+/// selection, with nothing asked and nothing saved by hand. Every activity
+/// is a file in the project's folder, and the session holds only its path
+/// relative to that folder.
 #[test]
-fn renaming_changes_only_the_name() {
-    let dir = scratch("rename");
+fn each_session_keeps_its_own_conversation_and_tabs() {
+    use crate::sessions::SessionChoice;
+    let dir = scratch("sessions");
+    let stand_in = StandIn::start(vec![text_reply("First, noted."), text_reply("Second, noted.")]);
+    let mut window = project_window(both(), &stand_in, &dir);
+    let (project, folder, first) = window.here();
+    window.ask("Remember the first.");
+    let sketch = save_tab(&mut window, 0);
+    assert!(sketch.starts_with(&folder), "the sketch was written outside the project: {}", sketch.display());
+    window.select("template");
+    keep_ticking(&mut window);
+    let first_tabs = open_tabs(&window.app);
+    let first_conversation = window.app.chat.conversation.clone();
+
+    window.menu(SessionChoice::NewSession { project: project.clone() });
+    window.until(|app| app.project.as_ref().is_some_and(|open| open.session != first));
+    let second = window.here().2;
+    window.settle_on(&second);
+    assert_eq!(window.app.project.as_ref().unwrap().session_name, "Untitled Session 2");
+    assert!(window.app.chat.conversation.iter().all(|entry| entry.role != Role::Person), "the new session is not empty");
+    window.ask("Remember the second.");
+    keep_ticking(&mut window);
+    let second_conversation = window.app.chat.conversation.clone();
+
+    window.menu(SessionChoice::Open { project: project.clone(), session: first.clone() });
+    window.settle_on(&first);
+    window.until(|app| app.chat.conversation.len() >= first_conversation.len());
+    assert_eq!(window.app.chat.conversation, first_conversation);
+    assert_eq!(window.app.apps[window.app.selected].id, "template");
+    let paths = |tabs: &[(String, Option<String>, String, Option<([f64; 2], f64)>)]| {
+        tabs.iter().map(|tab| (tab.0.clone(), tab.1.clone())).collect::<Vec<_>>()
+    };
+    window.until(|app| app.apps[0].running.tabs().0.iter().any(|tab| tab.path.is_some()));
+    assert_eq!(paths(&open_tabs(&window.app)), paths(&first_tabs), "the first session's tabs did not come back");
+
+    let text = std::fs::read_to_string(crate::workspace::session_path(&folder, &first)).unwrap();
+    let file = crate::workspace::SessionFile::parse(&text).unwrap();
+    let relative = sketch.strip_prefix(&folder).unwrap().display().to_string();
+    assert!(file.tabs.iter().any(|tab| tab.path.as_deref() == Some(relative.as_str())), "{text}");
+    assert!(!text.contains(&folder.display().to_string()), "the session holds an absolute path:\n{text}");
+    drop(window);
+
     let stand_in = StandIn::start(Vec::new());
     let mut window = project_window(both(), &stand_in, &dir);
-    let id = window.app.project.as_ref().unwrap().id.clone();
-    let before = crate::workspace::ProjectFile::read(&crate::workspace::project_path(&dir, &id)).unwrap();
-    window.app.commit_rename("Notes".into());
-    window.step();
-    assert_eq!(window.app.project.as_ref().unwrap().name, "Notes");
-    assert_eq!(window.app.project.as_ref().unwrap().id, id);
-    let file = crate::workspace::ProjectFile::read(&crate::workspace::project_path(&dir, &id)).unwrap();
-    assert_eq!(file.name, "Notes");
-    assert_eq!(file.tabs, before.tabs);
-    assert_eq!(file.folders, before.folders);
-    assert_eq!(file.conversation, before.conversation);
+    assert_eq!(window.here().2, first, "a restart did not come back to the last session");
+    window.until(|app| app.chat.conversation.len() >= first_conversation.len());
+    assert_eq!(window.app.chat.conversation, first_conversation);
+    window.menu(SessionChoice::Open { project, session: second.clone() });
+    window.settle_on(&second);
+    window.until(|app| app.chat.conversation.len() >= second_conversation.len());
+    assert_eq!(window.app.chat.conversation, second_conversation);
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A new project starts empty, after unsaved work is resolved. Dismissing
-/// the question cancels it, and the previous project stays as it was.
+/// Catches a project made somewhere other than chosen, or one made over
+/// another folder's files: New Project makes the folder it names, with its
+/// first session, and refuses a folder that holds something.
 #[test]
-fn a_new_project_waits_for_unsaved_work_and_keeps_the_previous_one() {
+fn a_new_project_goes_where_chosen_and_never_over_other_files() {
+    use crate::sessions::SessionChoice;
     let dir = scratch("new-project");
     let stand_in = StandIn::start(Vec::new());
     let mut window = project_window(both(), &stand_in, &dir);
-    let id = window.app.project.as_ref().unwrap().id.clone();
-    let tab = window.app.apps[0].running.tabs().1.clone().unwrap();
-    stand_in.script(vec![
-        call_reply(
-            "simple-sketch__draw__add_shape",
-            json!({"tab": tab, "kind": "ellipse", "from": [0, 0], "to": [40, 40]}),
-        ),
-        text_reply("Drawn."),
-    ]);
-    window.ask("Draw a circle.");
-    window.menu(crate::chat::ProjectChoice::New);
-    window.until(|app| app.apps.iter().any(|started| started.running.declared.ask.is_some()));
-    let title = window
-        .app
-        .apps
-        .iter()
-        .find_map(|started| started.running.declared.ask.as_ref().map(|ask| ask.title.clone()))
-        .unwrap();
-    assert_eq!(title, "Keep this sketch?");
-    answer(&mut window, "cancel");
-    assert!(!window.app.flows.closing_started(), "dismissing the question did not cancel");
-    assert_eq!(window.app.project.as_ref().unwrap().id, id);
-    assert_eq!(crate::workspace::list_projects(&dir).len(), 1);
+    let (first, _, _) = window.here();
+    let full = dir.join("Full");
+    std::fs::create_dir_all(&full).unwrap();
+    std::fs::write(full.join("notes.txt"), "mine").unwrap();
+    window.menu(SessionChoice::CreateProject { name: "Full".into(), location: full.display().to_string() });
+    assert!(window.app.sessions.form_error.is_some(), "a folder with files in it was taken");
+    assert_eq!(window.here().0, first);
+    assert!(!full.join(".inpainter").exists());
 
-    window.menu(crate::chat::ProjectChoice::New);
-    window.until(|app| app.apps.iter().any(|started| started.running.declared.ask.is_some()));
-    answer(&mut window, "discard");
-    window.until(|app| app.project.as_ref().is_some_and(|project| project.id != id));
-    assert!(
-        window
-            .app
-            .chat
-            .conversation
-            .iter()
-            .all(|entry| entry.role != Role::Person),
-        "the new conversation is not empty"
-    );
-    let previous = crate::workspace::ProjectFile::read(&crate::workspace::project_path(&dir, &id)).unwrap();
-    assert!(previous.conversation.iter().any(|entry| entry.text == "Draw a circle."));
+    let lighthouse = dir.join("Studio projects").join("Lighthouse");
+    window.menu(SessionChoice::CreateProject { name: "Lighthouse".into(), location: lighthouse.display().to_string() });
+    window.until(|app| app.project.as_ref().is_some_and(|open| open.id != first));
+    let session = window.here().2;
+    window.settle_on(&session);
+    let open = window.app.project.as_ref().unwrap();
+    assert_eq!(open.name, "Lighthouse");
+    assert_eq!(open.folder, lighthouse);
+    assert_eq!(open.session_name, "Untitled Session");
+    assert!(lighthouse.join(".inpainter").join("project.json").is_file());
+    assert_eq!(std::fs::read_to_string(full.join("notes.txt")).unwrap(), "mine");
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Save on the quit question writes the sketch, and Simple Sketch then closes
-/// it. The project still holds that path, and switching back reopens it.
+/// Catches a pin that does nothing: projects list the most recently used
+/// first, and a pinned one goes above them.
 #[test]
-fn a_sketch_saved_while_quitting_stays_in_the_project() {
-    let dir = scratch("quit-save");
+fn a_pinned_project_is_listed_first() {
+    use crate::sessions::SessionChoice;
+    let dir = scratch("pin");
     let stand_in = StandIn::start(Vec::new());
     let mut window = project_window(both(), &stand_in, &dir);
-    let sketch = dir.join("kept.smx");
-    save_tab(&mut window, 0, &sketch);
-    let tab = window.app.apps[0].running.tabs().1.clone().unwrap();
-    stand_in.script(vec![
-        call_reply(
-            "simple-sketch__draw__add_shape",
-            json!({"tab": tab, "kind": "ellipse", "from": [0, 0], "to": [40, 40]}),
-        ),
-        text_reply("Drawn."),
-    ]);
-    window.ask("Draw a circle.");
-    let id = window.app.project.as_ref().unwrap().id.clone();
-    window.menu(crate::chat::ProjectChoice::New);
-    window.until(|app| app.apps.iter().any(|started| started.running.declared.ask.is_some()));
-    answer(&mut window, "save");
-    window.until(|app| {
-        app.project.as_ref().is_some_and(|project| project.id != id)
-            && app.apps.iter().all(|started| !started.running.pending() && started.running.tabs().1.is_some())
-    });
-    let wanted = sketch.display().to_string();
-    let file = crate::workspace::ProjectFile::read(&crate::workspace::project_path(&dir, &id)).unwrap();
-    assert!(
-        file.tabs.iter().any(|tab| tab.path.as_deref() == Some(wanted.as_str())),
-        "the saved sketch left the project:\n{}",
-        file.to_text()
-    );
-    window.menu(crate::chat::ProjectChoice::Switch(id.clone()));
-    window.until(|app| {
-        app.project.as_ref().is_some_and(|project| project.id == id)
-            && app.apps.iter().any(|started| {
-                started
-                    .running
-                    .tabs()
-                    .0
-                    .iter()
-                    .any(|tab| tab.path.as_deref() == Some(wanted.as_str()))
-            })
-    });
+    let (first, _, _) = window.here();
+    assert!(window.app.sessions.loaded && !window.app.sessions.recent.is_empty(), "the menu's lists were not read ahead");
+    let second = dir.join("Second");
+    window.menu(SessionChoice::CreateProject { name: "Second".into(), location: second.display().to_string() });
+    window.until(|app| app.project.as_ref().is_some_and(|open| open.id != first));
+    let session = window.here().2;
+    window.settle_on(&session);
+    window.app.sessions.loaded = false;
+    window.menu(SessionChoice::Opened);
+    assert!(window.app.sessions.loaded, "opening the menu did not read its lists");
+    assert_ne!(window.app.sessions.projects[0].id, first, "the most recently used project is not first");
+    window.menu(SessionChoice::PinProject { project: first.clone(), pinned: true });
+    assert_eq!(window.app.sessions.projects[0].id, first, "the pinned project is not first");
+    assert!(window.app.sessions.projects[0].pinned);
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Catches a quit that waits for ever: cancelling the save dialog a quit
-/// question opened stops the new project, as dismissing the question does,
-/// and the project menu works again.
+/// Catches a lock that holds nothing: a locked project refuses Rename,
+/// Archive, Delete, and its sessions' Delete, and Unlock frees them again.
 #[test]
-fn cancelling_the_save_dialog_while_quitting_stops_the_switch() {
-    let dir = scratch("quit-cancel");
+fn a_locked_project_holds_its_name_and_its_sessions() {
+    use crate::sessions::SessionChoice;
+    let dir = scratch("lock");
     let stand_in = StandIn::start(Vec::new());
     let mut window = project_window(both(), &stand_in, &dir);
-    let id = window.app.project.as_ref().unwrap().id.clone();
-    let tab = window.app.apps[0].running.tabs().1.clone().unwrap();
-    stand_in.script(vec![
-        call_reply(
-            "simple-sketch__draw__add_shape",
-            json!({"tab": tab, "kind": "ellipse", "from": [0, 0], "to": [40, 40]}),
-        ),
-        text_reply("Drawn."),
-    ]);
-    window.ask("Draw a circle.");
-    window.menu(crate::chat::ProjectChoice::New);
-    window.until(|app| app.apps.iter().any(|started| started.running.declared.ask.is_some()));
-    answer(&mut window, "save");
-    window.until(|app| !app.apps[0].running.declared.files.is_empty());
-    while let Some(request) = window.app.apps[0].running.declared.files.pop_front() {
-        window.app.send(0, protocol::HostMessage::FileResult { id: request.id, path: None });
-    }
+    let (project, folder, session) = window.here();
+    window.menu(SessionChoice::LockProject { project: project.clone(), locked: true });
+    let name = window.app.project.as_ref().unwrap().name.clone();
+    window.menu(SessionChoice::RenameProject { project: project.clone(), name: "Changed".into() });
+    window.menu(SessionChoice::ArchiveProject { project: project.clone(), archived: true });
+    window.menu(SessionChoice::DeleteProject { project: project.clone() });
+    window.menu(SessionChoice::DeleteSession { project: project.clone(), session: session.clone() });
     keep_ticking(&mut window);
-    assert!(!window.app.flows.closing_started(), "the cancelled save left the switch waiting");
-    assert_eq!(window.app.project.as_ref().unwrap().id, id);
-    // Simple Sketch sent its question again behind the dialog and has no
-    // message to take it back, so it may still show. Cancel answers it.
-    if window.app.apps.iter().any(|started| started.running.declared.ask.is_some()) {
-        answer(&mut window, "cancel");
-    }
-    assert!(!window.app.flows.closing_started());
-
-    window.menu(crate::chat::ProjectChoice::New);
-    window.until(|app| app.apps.iter().any(|started| started.running.declared.ask.is_some()));
-    answer(&mut window, "discard");
-    window.until(|app| app.project.as_ref().is_some_and(|project| project.id != id));
+    assert_eq!(window.here().0, project, "a locked project was left");
+    assert_eq!(window.app.project.as_ref().unwrap().name, name, "a locked project was renamed");
+    let row = window.app.sessions.projects.iter().find(|row| row.id == project).unwrap().clone();
+    assert!(row.locked && !row.archived);
+    assert!(crate::workspace::SessionFile::read(&folder, &session).unwrap().trashed_at.is_none());
+    assert!(window.app.chat.conversation.iter().any(|entry| entry.text.contains("locked")), "nothing said why");
+    window.menu(SessionChoice::LockProject { project: project.clone(), locked: false });
+    window.menu(SessionChoice::RenameProject { project: project.clone(), name: "Changed".into() });
+    assert_eq!(window.app.project.as_ref().unwrap().name, "Changed");
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Catches a project from before projects had folders: its save dialog
-/// starts in a folder that exists.
+/// Catches an archive that deletes or still shows: an archived project
+/// leaves the Projects list and Recent but stays in All Projects, the open
+/// one gives way to another, and Unarchive brings it back.
 #[test]
-fn a_project_without_a_files_folder_gets_one() {
-    let dir = scratch("no-files");
+fn an_archived_project_leaves_the_lists_and_comes_back() {
+    use crate::sessions::SessionChoice;
+    let dir = scratch("archive");
+    let stand_in = StandIn::start(Vec::new());
+    let mut window = project_window(both(), &stand_in, &dir);
+    let (project, folder, session) = window.here();
+    window.menu(SessionChoice::ArchiveProject { project: project.clone(), archived: true });
+    window.until(|app| app.project.as_ref().is_some_and(|open| open.id != project));
+    let other = window.here().2;
+    window.settle_on(&other);
+    window.app.refresh_sessions();
+    let row = window.app.sessions.projects.iter().find(|row| row.id == project).expect("an archived project left All Projects");
+    assert!(row.archived);
+    assert!(folder.join(".inpainter").is_dir(), "archiving removed the project");
+    assert!(!window.app.sessions.trash.iter().any(|row| row.name == "Untitled Project" && matches!(&row.item, crate::sessions::Trashed::Project(id) if *id == project)));
+    window.menu(SessionChoice::EmptyTrash);
+    window.app.answer_question("empty");
+    assert!(folder.join(".inpainter").is_dir(), "Empty Trash touched an archived project");
+    window.menu(SessionChoice::ArchiveProject { project: project.clone(), archived: false });
+    assert!(window.app.sessions.projects.iter().any(|row| row.id == project && !row.archived));
+    assert!(window.app.sessions.recent.iter().any(|row| row.id == session));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Catches a delete that loses work: a deleted session and a deleted
+/// project go to Trash and come back as they were, and Empty Trash asks
+/// first, then keeps a deleted session's activities in its project.
+#[test]
+fn deleted_sessions_and_projects_come_back_from_trash() {
+    use crate::sessions::{SessionChoice, Trashed};
+    let dir = scratch("trash");
+    let stand_in = StandIn::start(vec![text_reply("Noted.")]);
+    let mut window = project_window(both(), &stand_in, &dir);
+    let (project, folder, first) = window.here();
+    window.ask("Keep this.");
+    let sketch = save_tab(&mut window, 0);
+    window.menu(SessionChoice::DeleteSession { project: project.clone(), session: first.clone() });
+    window.until(|app| app.project.as_ref().is_some_and(|open| open.session != first));
+    let other = window.here().2;
+    window.settle_on(&other);
+    window.app.refresh_sessions();
+    assert!(window.app.sessions.trash.iter().any(|row| row.item == Trashed::Session { project: project.clone(), id: first.clone() }));
+    assert!(!window.app.sessions.recent.iter().any(|row| row.id == first));
+    window.menu(SessionChoice::Restore(Trashed::Session { project: project.clone(), id: first.clone() }));
+    assert!(window.app.sessions.recent.iter().any(|row| row.id == first));
+    window.menu(SessionChoice::Open { project: project.clone(), session: first.clone() });
+    window.settle_on(&first);
+    assert!(window.app.chat.conversation.iter().any(|entry| entry.text == "Keep this."));
+
+    window.menu(SessionChoice::DeleteProject { project: project.clone() });
+    window.until(|app| app.project.as_ref().is_some_and(|open| open.id != project));
+    let made = window.here().2;
+    window.settle_on(&made);
+    assert!(folder.is_dir(), "deleting the project removed its folder");
+    window.menu(SessionChoice::Restore(Trashed::Project(project.clone())));
+    assert!(window.app.sessions.projects.iter().any(|row| row.id == project));
+
+    window.menu(SessionChoice::DeleteSession { project: project.clone(), session: other.clone() });
+    window.menu(SessionChoice::EmptyTrash);
+    assert_eq!(window.app.flows.question_shown().as_deref(), Some("Empty Trash?"));
+    assert!(window.app.flows.question_lines().join(" ").contains("system's trash"));
+    window.app.answer_question("cancel");
+    assert!(crate::workspace::session_path(&folder, &other).is_file());
+    window.menu(SessionChoice::EmptyTrash);
+    window.app.answer_question("empty");
+    assert!(!crate::workspace::session_path(&folder, &other).exists());
+    assert!(sketch.is_file(), "emptying a session's Trash removed its project's work");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Catches a file from outside the project opened in place: Open's file
+/// from elsewhere is imported as a copy after the person says so, the
+/// sub-application opens the copy, and the original is unchanged.
+#[test]
+fn an_outside_file_is_imported_never_opened_in_place() {
+    let dir = scratch("import");
+    let stand_in = StandIn::start(Vec::new());
+    let mut window = project_window(both(), &stand_in, &dir);
+    let (_, folder, _) = window.here();
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let outside = save_tab(&mut window, 0);
+    std::fs::rename(&outside, elsewhere.join("Shared.smx")).unwrap();
+    let outside = elsewhere.join("Shared.smx");
+    let before = std::fs::read(&outside).unwrap();
+    let tab = window.app.apps[0].running.tabs().1.clone().unwrap();
+    let open = |window: &mut Window| {
+        window.app.send(
+            0,
+            protocol::HostMessage::Command { id: "open".into(), tab: Some(tab.clone()), arg: None, node: None, viewport: [800.0, 600.0] },
+        );
+        window.until(|app| !app.apps[0].running.declared.files.is_empty());
+        let request = window.app.apps[0].running.declared.files.pop_front().unwrap();
+        window.app.deliver_file(0, request, Some(outside.clone()));
+    };
+    open(&mut window);
+    assert_eq!(window.app.flows.question_shown().as_deref(), Some("Import a copy into this project?"));
+    window.app.answer_question("cancel");
+    keep_ticking(&mut window);
+    assert!(!window.app.apps[0].running.tabs().0.iter().any(|entry| entry.path.as_deref() == Some(outside.to_str().unwrap())));
+
+    open(&mut window);
+    window.app.answer_question("import");
+    let copy = folder.join("Shared.smx");
+    window.until(|app| app.apps[0].running.tabs().0.iter().any(|entry| entry.path.as_deref() == Some(copy.to_str().unwrap())));
+    assert!(!window.app.apps.iter().any(|started| started.running.tabs().0.iter().any(|entry| entry.path.as_deref() == Some(outside.to_str().unwrap()))));
+    assert_eq!(std::fs::read(&outside).unwrap(), before, "the original was changed");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Catches an attachment the session points to outside the project: an
+/// attached file is copied into the project's attachments, and the chip
+/// holds the copy.
+#[test]
+fn an_attachment_is_copied_into_the_project() {
+    let dir = scratch("attach");
+    let stand_in = StandIn::start(Vec::new());
+    let mut window = project_window(both(), &stand_in, &dir);
+    let (_, folder, _) = window.here();
+    let note = dir.join("note.txt");
+    std::fs::write(&note, "from outside").unwrap();
+    window.app.scripted_paths.push_back(note.clone());
+    let ctx = window.ctx.clone();
+    let Window { app, frame, .. } = &mut window;
+    app.chat_event(crate::chat::ChatEvent::Attach, &ctx, frame);
+    let chip = window.app.chat.chips.first().cloned().expect("a chip");
+    assert_eq!(chip, folder.join("attachments").join("note.txt"));
+    assert_eq!(std::fs::read_to_string(&chip).unwrap(), "from outside");
+    // What was attached in one session does not follow into another.
+    let (project, _, first) = window.here();
+    window.app.chat.input = "Half a thought".into();
+    window.menu(crate::sessions::SessionChoice::NewSession { project });
+    window.until(|app| app.project.as_ref().is_some_and(|open| open.session != first));
+    assert!(window.app.chat.chips.is_empty(), "an attachment followed into another session");
+    assert!(window.app.chat.input.is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Catches a change that only Save keeps: a sketch changed by hand and
+/// left at once, before it was written, is written by the switch, and the
+/// session it was left in holds its file.
+#[test]
+fn a_change_left_at_once_is_written_by_the_switch() {
+    use crate::sessions::SessionChoice;
+    let dir = scratch("left-at-once");
+    let stand_in = StandIn::start(Vec::new());
+    let mut window = project_window(both(), &stand_in, &dir);
+    let (project, folder, first) = window.here();
+    let tab = window.app.apps[0].running.tabs().1.clone().unwrap();
+    window.app.send(
+        0,
+        protocol::HostMessage::Command { id: "new_canvas".into(), tab: Some(tab), arg: None, node: None, viewport: [800.0, 600.0] },
+    );
+    window.menu(SessionChoice::NewSession { project });
+    window.until(|app| app.project.as_ref().is_some_and(|open| open.session != first));
+    let second = window.here().2;
+    window.settle_on(&second);
+    let file = crate::workspace::SessionFile::read(&folder, &first).unwrap();
+    let written: Vec<String> = file.tabs.iter().filter_map(|tab| tab.path.clone()).collect();
+    assert_eq!(written, vec!["Untitled 1.smx".to_string()], "the change left at once is not in its session");
+    assert!(folder.join("Untitled 1.smx").is_file());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Catches a switch that loses work it could not write: with the project's
+/// folder read-only, a changed sketch stops the switch, says so, and stays
+/// open with its change.
+#[test]
+fn a_change_that_cannot_be_written_stops_the_switch() {
+    use crate::sessions::SessionChoice;
+    let dir = scratch("unwritable");
+    let stand_in = StandIn::start(Vec::new());
+    let mut window = project_window(both(), &stand_in, &dir);
+    let (project, folder, first) = window.here();
+    window.menu(SessionChoice::NewSession { project: project.clone() });
+    window.until(|app| app.project.as_ref().is_some_and(|open| open.session != first));
+    let second = window.here().2;
+    window.settle_on(&second);
+    let tab = window.app.apps[0].running.tabs().1.clone().unwrap();
+    let mut permissions = std::fs::metadata(&folder).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&folder, permissions.clone()).unwrap();
+    window.app.send(
+        0,
+        protocol::HostMessage::Command { id: "new_canvas".into(), tab: Some(tab), arg: None, node: None, viewport: [800.0, 600.0] },
+    );
+    window.menu(SessionChoice::Open { project, session: first });
+    window.until(|app| app.flows.idle() && app.chat.conversation.iter().any(|entry| entry.text.contains("could not be written")));
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&folder, permissions).unwrap();
+    assert_eq!(window.here().2, second, "the switch went on");
+    assert!(window.app.apps[0].running.tabs().0.iter().any(|tab| tab.dirty), "the change was lost");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Catches projects from before 0.7 left behind: at start, an old project
+/// in the data folder moves into a folder of its own, its conversation
+/// becomes its first session, and its sketch saved elsewhere is copied in
+/// and reopens from the copy.
+#[test]
+fn an_old_project_moves_into_a_folder_with_nothing_lost() {
+    let dir = scratch("migrate");
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let stand_in = StandIn::start(Vec::new());
+    let mut window = project_window(both(), &stand_in, &dir);
+    let sketch = save_tab(&mut window, 0);
+    std::fs::rename(&sketch, elsewhere.join("Harbor.smx")).unwrap();
+    drop(window);
+    let _ = std::fs::remove_file(dir.join("projects.json"));
+    let _ = std::fs::remove_dir_all(dir.join("Inpainter"));
+    let old = dir.join("projects").join("old-one");
+    std::fs::create_dir_all(&old).unwrap();
+    let file = serde_json::json!({
+        "version": 1,
+        "name": "Harbor",
+        "tabs": [{"app": "simple-sketch", "path": elsewhere.join("Harbor.smx").display().to_string(), "label": "Harbor"}],
+        "selected": 0,
+        "workspace_open": true,
+        "conversation": [{"role": "person", "text": "The harbor at night.", "time": 1}]
+    });
+    std::fs::write(old.join("project.json"), file.to_string()).unwrap();
+
     let stand_in = StandIn::start(Vec::new());
     let window = project_window(both(), &stand_in, &dir);
-    let id = window.app.project.as_ref().unwrap().id.clone();
-    drop(window);
-    let files = crate::workspace::project_files(&dir, &id);
-    std::fs::remove_dir_all(&files).unwrap();
-    let window = project_window(both(), &stand_in, &dir);
-    assert_eq!(window.app.project.as_ref().unwrap().id, id);
-    let start = window.app.dialog_folder(None).expect("no folder for the dialog");
-    assert_eq!(start, files);
-    assert!(files.is_dir(), "the project's folder was not made");
+    let (_, folder, _) = window.here();
+    assert_eq!(folder, dir.join("Inpainter").join("Harbor"));
+    assert_eq!(window.app.project.as_ref().unwrap().name, "Harbor");
+    assert!(window.app.chat.conversation.iter().any(|entry| entry.text == "The harbor at night."));
+    let copy = folder.join("Harbor.smx");
+    assert!(copy.is_file(), "the sketch was not copied in");
+    assert!(elsewhere.join("Harbor.smx").is_file(), "the original moved");
+    assert!(window.app.apps[0].running.tabs().0.iter().any(|entry| entry.path.as_deref() == Some(copy.to_str().unwrap())));
+    assert!(dir.join("projects-before-0.7").join("old-one").join("project.json").is_file(), "no backup was kept");
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Catches a host that knows one sub-application's questions: an untitled
-/// document a sub-application nothing was written for saves through the file
-/// dialog during New Project stays in the project, and switching back
-/// reopens it.
+/// Catches a host that knows its sub-applications by name: one nothing
+/// was written for, with ids of its own, is told the project's folder, and
+/// its work lands there.
 #[test]
-fn any_applications_document_saved_while_quitting_stays_in_the_project() {
-    let dir = scratch("ledger-save");
+fn any_application_is_told_the_project_and_saves_into_it() {
+    let dir = scratch("ledger");
     let ledger = ledger_program(&dir);
     let stand_in = StandIn::start(Vec::new());
     let mut window = project_window(vec![spec("ledger", "Ledger", &ledger)], &stand_in, &dir);
+    let (_, folder, _) = window.here();
     window.app.send(
         0,
         protocol::HostMessage::Command {
@@ -1137,198 +1479,14 @@ fn any_applications_document_saved_while_quitting_stays_in_the_project() {
             viewport: [800.0, 600.0],
         },
     );
-    let id = window.app.project.as_ref().unwrap().id.clone();
-    window.menu(crate::chat::ProjectChoice::New);
-    window.until(|app| app.apps[0].running.declared.ask.is_some());
-    answer(&mut window, "write");
-    window.until(|app| !app.apps[0].running.declared.files.is_empty());
-    let written = dir.join("written.ledger");
-    window.answer_saves(&written);
-    window.until(|app| {
-        app.project.as_ref().is_some_and(|project| project.id != id)
-            && app.apps.iter().all(|started| !started.running.pending() && started.running.tabs().1.is_some())
-    });
-    let wanted = written.display().to_string();
-    let file = crate::workspace::ProjectFile::read(&crate::workspace::project_path(&dir, &id)).unwrap();
-    assert!(
-        file.tabs.iter().any(|tab| tab.path.as_deref() == Some(wanted.as_str())),
-        "the written ledger left the project:\n{}",
-        file.to_text()
-    );
-    std::fs::write(&written, "ledger").unwrap();
-    window.menu(crate::chat::ProjectChoice::Switch(id.clone()));
-    window.until(|app| {
-        app.project.as_ref().is_some_and(|project| project.id == id)
-            && app.apps[0]
-                .running
-                .tabs()
-                .0
-                .iter()
-                .any(|tab| tab.path.as_deref() == Some(wanted.as_str()))
-    });
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-/// Switching brings the project back, and a project whose tabs name only one
-/// sub-application still runs the others.
-#[test]
-fn switching_brings_a_project_back_and_every_application_runs() {
-    let dir = scratch("switch");
-    let stand_in = StandIn::start(Vec::new());
-    let mut window = project_window(both(), &stand_in, &dir);
-    let first = window.app.project.as_ref().unwrap().id.clone();
-    window.app.commit_rename("First".into());
-    let sketch = dir.join("kept.smx");
-    save_tab(&mut window, 0, &sketch);
-    window.select("template");
-    let papers = dir.join("Papers");
-    std::fs::create_dir_all(&papers).unwrap();
-    window.app.scripted_paths.push_back(papers.clone());
-    window.menu(crate::chat::ProjectChoice::AddFolder);
-    keep_ticking(&mut window);
-    let sketch_tab = window.app.apps[0].running.tabs().1.clone().unwrap();
-    // A pan, as the drawing surface reports it: the host's camera, then the
-    // camera message Simple Sketch keeps with the sketch.
-    {
-        let display = window.app.apps[0]
-            .running
-            .declared
-            .documents
-            .get_mut(&sketch_tab)
-            .expect("the sketch has a document");
-        display.camera.origin = [20.0, 30.0];
-        display.camera.zoom = 1.5;
-    }
-    window.app.send(
-        0,
-        protocol::HostMessage::Camera {
-            tab: sketch_tab.clone(),
-            origin: [20.0, 30.0],
-            zoom: 1.5,
-        },
-    );
-    window.app.flows.moved = true;
-    window.step();
-    let before = open_tabs(&window.app);
-    assert!(before.iter().any(|tab| tab.3 == Some(([20.0, 30.0], 1.5))));
-    let conversation = window.app.chat.conversation.clone();
-    let folders = window.app.project.as_ref().unwrap().folders.clone();
-
-    // The pan changed the sketch, so leaving asks, and Save keeps its view.
-    window.menu(crate::chat::ProjectChoice::New);
-    window.until(|app| app.apps.iter().any(|started| started.running.declared.ask.is_some()));
-    answer(&mut window, "save");
-    window.until(|app| {
-        app.project.as_ref().is_some_and(|project| project.id != first)
-            && app.apps.iter().all(|started| !started.running.pending() && started.running.tabs().1.is_some())
-    });
-    let second = window.app.project.as_ref().unwrap().id.clone();
-    window.app.commit_rename("Second".into());
-
-    window.menu(crate::chat::ProjectChoice::Switch(first.clone()));
-    window.until(|app| {
-        app.project.as_ref().is_some_and(|project| project.id == first)
-            && app.apps.iter().all(|started| started.running.tabs().1.is_some())
-            && app.chat.conversation.len() >= conversation.len()
-    });
-    assert_eq!(window.app.project.as_ref().unwrap().name, "First");
-    assert_eq!(window.app.apps[window.app.selected].id, "template");
-    assert_eq!(window.app.chat.conversation, conversation);
-    window.until(|app| open_tabs(app).iter().any(|tab| tab.3 == Some(([20.0, 30.0], 1.5))));
-    assert_eq!(open_tabs(&window.app), before, "the tabs did not come back as they were");
-    assert_eq!(window.app.project.as_ref().unwrap().folders, folders);
-    assert!(window.app.project.as_ref().unwrap().folders.iter().any(|folder| folder == &papers.display().to_string()));
-    let ids: Vec<&str> = window.app.apps.iter().map(|started| started.id.as_str()).collect();
-    assert_eq!(ids, ["simple-sketch", "template"]);
-
-    // A project file that names only the template still runs Simple Sketch.
-    let only = crate::workspace::ProjectFile {
-        version: crate::workspace::VERSION,
-        name: "Template only".into(),
-        folders: Vec::new(),
-        tabs: vec![crate::workspace::ProjectTab {
-            app: "template".into(),
-            path: None,
-            label: "Template".into(),
-            camera: None,
-        }],
-        selected: Some(0),
-        workspace_open: false,
-        conversation: Vec::new(),
-    };
-    only.write(&crate::workspace::project_path(&dir, "only")).unwrap();
-    // Nothing changed since the project came back, so leaving it asks nothing.
-    window.menu(crate::chat::ProjectChoice::Switch("only".into()));
-    window.until(|app| {
-        assert!(
-            app.apps.iter().all(|started| started.running.declared.ask.is_none()),
-            "a project that came back unchanged asked about its sketch"
-        );
-        app.project.as_ref().is_some_and(|project| project.id == "only")
-            && app.apps.iter().any(|started| started.id == "simple-sketch" && !started.running.declared.skills.is_empty())
-    });
-    let sketch_running = window
-        .app
-        .apps
-        .iter()
-        .find(|started| started.id == "simple-sketch")
-        .unwrap();
-    assert!(sketch_running.running.tabs().1.is_some());
-    let _ = (second, sketch);
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-/// Closing and opening again comes back to the same project, with nothing saved by hand.
-#[test]
-fn reopening_comes_back_to_the_same_project() {
-    let dir = scratch("reopen");
-    let stand_in = StandIn::start(vec![text_reply("Noted.")]);
-    let mut window = project_window(both(), &stand_in, &dir);
-    window.app.commit_rename("Kept".into());
-    let sketch = dir.join("kept.smx");
-    save_tab(&mut window, 0, &sketch);
-    window.ask("Remember this.");
-    window.select("template");
-    window.app.toggle_workspace();
-    keep_ticking(&mut window);
-    let id = window.app.project.as_ref().unwrap().id.clone();
-    let conversation = window.app.chat.conversation.clone();
-    let open = window.app.project.as_ref().unwrap().workspace_open;
-    drop(window);
-
-    let stand_in = StandIn::start(Vec::new());
-    let window = project_window(both(), &stand_in, &dir);
-    assert_eq!(window.app.project.as_ref().unwrap().id, id);
-    assert_eq!(window.app.project.as_ref().unwrap().name, "Kept");
-    assert_eq!(window.app.project.as_ref().unwrap().workspace_open, open);
-    assert_eq!(window.app.apps[window.app.selected].id, "template");
-    assert_eq!(window.app.chat.conversation, conversation);
-    let text = std::fs::read_to_string(crate::workspace::project_path(&dir, &id)).unwrap();
-    assert!(text.contains(&sketch.display().to_string()), "the project does not hold the path:\n{text}");
-    let saved: Value = serde_json::from_str(&std::fs::read_to_string(&sketch).unwrap()).unwrap();
-    // The project file has its own name, view, and conversation. A key of the
-    // sketch that is not one of those is the sketch's own content.
-    let own = ["version", "name", "folders", "tabs", "selected", "workspace_open", "conversation", "app", "path", "label", "camera", "origin", "zoom", "role", "text", "time", "attachments", "tool", "ok"];
-    for key in saved.as_object().unwrap().keys().filter(|key| !own.contains(&key.as_str())) {
-        assert!(!text.contains(&format!("\"{key}\"")), "the project holds {key}");
-    }
-    assert!(!text.contains("\"input\"") && !text.contains("\"output\""));
-    drop(window);
-
-    change_on_its_own(&sketch);
-    let stand_in = StandIn::start(Vec::new());
-    let mut window = project_window(both(), &stand_in, &dir);
-    let reopened = window.app.apps[0].running.tabs().1.clone().unwrap();
-    window.until(|app| app.apps[0].running.declared.documents.contains_key(&reopened));
-    assert!(
-        marks(&window.app, &reopened) >= 1,
-        "the change saved on its own is not in the reopened tab"
-    );
+    let written = folder.join("Ledger.ledger");
+    window.until(|app| app.apps[0].running.tabs().0.iter().any(|tab| tab.path.as_deref() == Some(written.to_str().unwrap())));
+    assert_eq!(std::fs::read_to_string(&written).unwrap(), "ledger");
     let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A change is written on its own. Dropping the window, without closing it,
-/// still finds the change in the project.
+/// still finds the change in the session.
 #[test]
 fn a_change_is_kept_without_closing() {
     let dir = scratch("kept-quietly");
@@ -1336,16 +1494,38 @@ fn a_change_is_kept_without_closing() {
     let mut window = project_window(both(), &stand_in, &dir);
     window.ask("Remember this.");
     keep_ticking(&mut window);
-    let id = window.app.project.as_ref().unwrap().id.clone();
+    let session = window.here().2;
     drop(window);
 
     let stand_in = StandIn::start(Vec::new());
     let window = project_window(both(), &stand_in, &dir);
-    assert_eq!(window.app.project.as_ref().unwrap().id, id);
+    assert_eq!(window.here().2, session);
     assert!(
         window.app.chat.conversation.iter().any(|entry| entry.text == "Remember this."),
-        "the project was not written on its own"
+        "the session was not written on its own"
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A sketch changed by Simple Sketch with no host shows when the session
+/// reopens, and the session holds the sketch's path, never its content.
+#[test]
+fn a_change_made_with_no_host_shows_when_the_session_reopens() {
+    let dir = scratch("reopen");
+    let stand_in = StandIn::start(Vec::new());
+    let mut window = project_window(both(), &stand_in, &dir);
+    let (_, folder, session) = window.here();
+    let sketch = save_tab(&mut window, 0);
+    drop(window);
+    let text = std::fs::read_to_string(crate::workspace::session_path(&folder, &session)).unwrap();
+    assert!(!text.contains("\"nodes\"") && !text.contains("\"strokes\""), "the session holds the sketch:\n{text}");
+
+    change_on_its_own(&sketch);
+    let stand_in = StandIn::start(Vec::new());
+    let mut window = project_window(both(), &stand_in, &dir);
+    let reopened = window.app.apps[0].running.tabs().1.clone().unwrap();
+    window.until(|app| app.apps[0].running.declared.documents.contains_key(&reopened));
+    assert!(marks(&window.app, &reopened) >= 1, "the change saved on its own is not in the reopened tab");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1359,42 +1539,5 @@ fn quit_closes_like_the_window_button() {
     window.step();
     assert!(window.app.flows.closing_started());
     assert!(window.app.flows.question_shown().is_none());
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-/// Removing deletes the project's folder and nothing it refers to, after the
-/// question. A folder's own remove mark only takes it off the project.
-#[test]
-fn removing_a_project_leaves_its_folders_and_files() {
-    let dir = scratch("remove-project");
-    let stand_in = StandIn::start(Vec::new());
-    let mut window = project_window(both(), &stand_in, &dir);
-    let papers = dir.join("Papers");
-    std::fs::create_dir_all(&papers).unwrap();
-    let sketch = dir.join("kept.smx");
-    save_tab(&mut window, 0, &sketch);
-    window.app.scripted_paths.push_back(papers.clone());
-    window.menu(crate::chat::ProjectChoice::AddFolder);
-    assert!(window.app.project.as_ref().unwrap().folders.iter().any(|folder| folder == &papers.display().to_string()));
-    window.menu(crate::chat::ProjectChoice::RemoveFolder(0));
-    assert!(papers.is_dir(), "taking a folder off the project removed it");
-    assert!(window.app.project.as_ref().unwrap().folders.is_empty());
-    window.app.scripted_paths.push_back(papers.clone());
-    window.menu(crate::chat::ProjectChoice::AddFolder);
-    let id = window.app.project.as_ref().unwrap().id.clone();
-    window.menu(crate::chat::ProjectChoice::Remove);
-    assert_eq!(window.app.flows.question_shown().as_deref(), Some("Remove this project?"));
-    assert!(window.app.flows.question_lines().join(" ").contains("project's files are deleted"));
-    window.app.answer_question("cancel");
-    assert!(crate::workspace::project_dir(&dir, &id).is_dir());
-
-    window.menu(crate::chat::ProjectChoice::Remove);
-    window.app.answer_question("remove");
-    // Quit becomes ready and the next frame opens another project, so the
-    // check is the project changing, not the ready flag the frame consumes.
-    window.until(|app| app.project.as_ref().is_some_and(|project| project.id != id));
-    assert!(!crate::workspace::project_dir(&dir, &id).exists());
-    assert!(papers.is_dir());
-    assert!(sketch.is_file());
     let _ = std::fs::remove_dir_all(dir);
 }

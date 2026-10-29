@@ -1,17 +1,20 @@
-//! The project's flows: keeping it, switching, a new one, removing, and quitting.
+//! The project's and session's flows: keeping the session, switching
+//! sessions and projects, new ones, Trash, and quitting.
 //!
-//! The host owns the project file. It holds each tab's sub-application, file,
-//! label, and camera, the selected tab, the folders, whether the workspace is
-//! shown, and the conversation, never a sub-application's work. Switching,
-//! creating, and removing the current project close every tab through the quit
-//! flow, so each sub-application asks about its own unsaved work. The project
-//! is written on its own, at most once a second, and always before switching,
-//! creating, or closing.
+//! The host owns projects and sessions. A session's file, inside its
+//! project's `.inpainter/sessions`, holds each tab's sub-application, file
+//! (relative to the project's folder), label, and camera, the selected tab,
+//! whether the workspace panel is shown, and the conversation, never a
+//! sub-application's work. Switching closes every tab through the quit flow;
+//! each sub-application writes its own work into the project as it goes, so
+//! nothing is asked. The session is written on its own, at most once a
+//! second, and always before switching or closing.
 
 use super::{AppSpec, HostWindow, Project, Started};
-use crate::chat::{LogoChoice, ProjectChoice};
+use crate::chat::LogoChoice;
+use crate::sessions::{Page, ProjectRow, SessionChoice, SessionRow, TrashRow, Trashed};
 use crate::process::Running;
-use crate::workspace::{self, ProjectFile, ProjectTab, ReadError, View};
+use crate::workspace::{self, ProjectFile, ProjectRecord, ProjectTab, SessionFile, View};
 use assistant::{Command, Entry, Role};
 use eframe::egui;
 use protocol::{Ask, AskButton, HostMessage};
@@ -31,18 +34,53 @@ const RESTORE_WAIT: Duration = Duration::from_secs(10);
 pub(super) const WRITE_EVERY: Duration = Duration::from_secs(1);
 /// The host's own question's id, apart from every sub-application's.
 const QUESTION: usize = usize::MAX;
+/// What Open asks about a file from outside the project.
+const IMPORT_TITLE: &str = "Import a copy into this project?";
+
+fn import_line(path: &Path) -> String {
+    format!(
+        "{} is outside the project. A copy is added to the project's folder, and the original stays as it is.",
+        path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
+    )
+}
+
+/// What Empty Trash asks before it acts.
+const EMPTY_TRASH_LINE: &str =
+    "Projects in Trash go to the system's trash with their folders. Sessions in Trash are deleted; their projects keep their files.";
 
 /// The quit flow is closing every tab, and then this happens.
 enum Closing {
     Quit { closed: bool },
-    Open { id: String, file: ProjectFile },
-    Fresh { note: Option<String> },
-    Remove,
+    Open(Opening),
+}
+
+/// Before a switch or quit: every tab was asked to `keep`, and these
+/// answers are still awaited. A failure stops it all.
+struct Keeping {
+    closing: Closing,
+    /// The sub-application and tab of each awaited answer.
+    waiting: Vec<(usize, String)>,
+    started: Instant,
+}
+
+/// How long a sub-application may take to answer `keep`. One that never
+/// answers saves no files, so the switch goes on without it.
+const KEEP_WAIT: Duration = Duration::from_secs(5);
+
+/// A project and one of its sessions, read and ready to open.
+pub(super) struct Opening {
+    id: String,
+    name: String,
+    folder: PathBuf,
+    session: SessionFile,
 }
 
 /// A question the host asks itself, in the existing dialog look.
 enum Question {
-    Remove,
+    EmptyTrash,
+    /// A file from outside the project, picked in an application's Open:
+    /// the application, its request, and the file.
+    Import { app: usize, request: String, path: PathBuf },
 }
 
 struct RestoreTab {
@@ -120,6 +158,7 @@ pub(crate) struct Flows {
     baseline: Baseline,
     settle: Settle,
     question: Option<Question>,
+    keeping: Option<Keeping>,
     closing: Option<Closing>,
     restore: Option<Restore>,
     /// The tabs at the start of a quit, updated with a path a save produces.
@@ -134,7 +173,8 @@ impl Flows {
     #[cfg(test)]
     pub(crate) fn question_shown(&self) -> Option<String> {
         match self.question.as_ref()? {
-            Question::Remove => Some("Remove this project?".to_string()),
+            Question::EmptyTrash => Some("Empty Trash?".to_string()),
+            Question::Import { .. } => Some(IMPORT_TITLE.to_string()),
         }
     }
 
@@ -142,9 +182,8 @@ impl Flows {
     #[cfg(test)]
     pub(crate) fn question_lines(&self) -> Vec<String> {
         match &self.question {
-            Some(Question::Remove) => vec![
-                "The conversation and the project's files are deleted.".to_string(),
-            ],
+            Some(Question::EmptyTrash) => vec![EMPTY_TRASH_LINE.to_string()],
+            Some(Question::Import { path, .. }) => vec![import_line(path)],
             None => Vec::new(),
         }
     }
@@ -152,11 +191,17 @@ impl Flows {
     /// The quit flow is closing every tab.
     #[cfg(test)]
     pub(crate) fn closing_started(&self) -> bool {
-        self.closing.is_some()
+        self.keeping.is_some() || self.closing.is_some()
+    }
+
+    /// No question, quit, or restore is under way.
+    #[cfg(test)]
+    pub(crate) fn idle(&self) -> bool {
+        !self.busy()
     }
 
     fn busy(&self) -> bool {
-        self.question.is_some() || self.closing.is_some() || self.restore.is_some()
+        self.question.is_some() || self.keeping.is_some() || self.closing.is_some() || self.restore.is_some()
     }
 }
 
@@ -244,7 +289,7 @@ impl HostWindow {
         let (name, folders, workspace_open) = match &self.project {
             Some(project) => (
                 project.name.clone(),
-                project.folders.clone(),
+                Vec::<String>::new(),
                 project.workspace_open,
             ),
             None => (String::new(), Vec::new(), true),
@@ -271,7 +316,7 @@ impl HostWindow {
         let (name, folders, workspace_open) = match &self.project {
             Some(project) => (
                 project.name.as_str(),
-                project.folders.as_slice(),
+                &[] as &[String],
                 project.workspace_open,
             ),
             None => ("", &[][..], true),
@@ -319,7 +364,7 @@ impl HostWindow {
         let (name, folders, workspace_open) = match &self.project {
             Some(project) => (
                 project.name.clone(),
-                project.folders.clone(),
+                Vec::<String>::new(),
                 project.workspace_open,
             ),
             None => (workspace::UNTITLED.to_string(), Vec::new(), false),
@@ -342,7 +387,7 @@ impl HostWindow {
         let (name, folders, open) = match &self.project {
             Some(project) => (
                 project.name.clone(),
-                project.folders.clone(),
+                Vec::<String>::new(),
                 project.workspace_open,
             ),
             None => (String::new(), Vec::new(), true),
@@ -389,16 +434,32 @@ impl HostWindow {
         self.write_file(file);
     }
 
+    /// Writes the open session into its project, its paths relative to the
+    /// project's folder.
     fn write_file(&mut self, file: ProjectFile) {
         let Some(project) = self.project.as_ref() else {
             return;
         };
-        let Some(data) = self.data.clone() else {
-            return;
-        };
-        let id = project.id.clone();
         let signature = self.change_signature();
-        match file.write(&workspace::project_path(&data, &id)) {
+        // A session deleted while open keeps its place in Trash when the
+        // switch away from it writes it a last time.
+        let trashed_at = SessionFile::read(&project.folder, &project.session)
+            .ok()
+            .and_then(|file| file.trashed_at);
+        let base = SessionFile {
+            version: workspace::VERSION,
+            id: project.session.clone(),
+            name: project.session_name.clone(),
+            created_at: project.session_created,
+            updated_at: workspace::now_seconds(),
+            trashed_at,
+            tabs: Vec::new(),
+            selected: None,
+            workspace_open: false,
+            conversation: Vec::new(),
+        };
+        let session = workspace::file_as_session(&project.folder, &file, base);
+        match session.write(&project.folder) {
             Ok(()) => {
                 self.rebaseline();
                 self.failed_signature = None;
@@ -407,7 +468,7 @@ impl HostWindow {
             Err(reason) => {
                 self.last_project_write = Some(Instant::now());
                 if self.failed_signature.as_ref() != Some(&signature) {
-                    self.tell(format!("The project could not be kept: {reason}"));
+                    self.tell(format!("The session could not be kept: {reason}"));
                 }
                 self.failed_signature = Some(signature);
             }
@@ -563,78 +624,355 @@ impl HostWindow {
         }
     }
 
-    /// A row of the project menu.
-    pub(super) fn project_menu(&mut self, choice: ProjectChoice, frame: &mut eframe::Frame) {
+    /// Where Studio makes a project by itself and where New Project starts:
+    /// `~/Inpainter`, or beside a frame test's data folder.
+    pub(super) fn projects_root(&self) -> Option<PathBuf> {
+        self.projects_root
+            .clone()
+            .or_else(|| self.data.as_ref().map(|data| data.join("Inpainter")))
+    }
+
+    /// Asks whether to import a file from outside the project that an
+    /// application's Open picked.
+    pub(super) fn ask_import(&mut self, app: usize, request: String, path: PathBuf) {
+        self.flows.question = Some(Question::Import { app, request, path });
+    }
+
+    /// A choice in the session menu.
+    pub(super) fn session_choice(&mut self, choice: SessionChoice, frame: &mut eframe::Frame) {
+        if choice == SessionChoice::Opened {
+            self.refresh_sessions();
+            return;
+        }
         if self.locked() || self.flows.busy() || self.project.is_none() {
             return;
         }
+        let Some(data) = self.data.clone() else {
+            return;
+        };
+        // A locked project holds its name, Trash, and archiving, and its
+        // sessions' Delete, whatever asks.
+        let held = match &choice {
+            SessionChoice::RenameProject { project, .. }
+            | SessionChoice::DeleteProject { project }
+            | SessionChoice::DeleteSession { project, .. }
+            | SessionChoice::ArchiveProject { project, archived: true } => workspace::known_projects(&data)
+                .into_iter()
+                .any(|known| known.entry.id == *project && known.entry.locked),
+            _ => false,
+        };
+        if held {
+            self.tell("That project is locked. Unlock it first.".to_string());
+            return;
+        }
         match choice {
-            ProjectChoice::Rename => {
-                self.rename_draft = self
-                    .project
-                    .as_ref()
-                    .map(|project| project.name.clone())
-                    .unwrap_or_default();
-                self.renaming = true;
+            SessionChoice::Opened => {}
+            SessionChoice::Open { project, session } => {
+                self.sessions.open = false;
+                self.switch_to(&project, Some(&session));
             }
-            ProjectChoice::Switch(id) => self.begin_switch(id),
-            ProjectChoice::New => self.start_closing(Closing::Fresh { note: None }),
-            ProjectChoice::Remove => self.flows.question = Some(Question::Remove),
-            ProjectChoice::AddFolder => {
+            SessionChoice::NewSession { project } => {
+                let Some(known) = workspace::known_projects(&data).into_iter().find(|known| known.entry.id == project) else {
+                    return;
+                };
+                let taken: Vec<String> = workspace::list_sessions(&known.folder)
+                    .into_iter()
+                    .filter(|session| session.trashed_at.is_none())
+                    .map(|session| session.name)
+                    .collect();
+                match workspace::new_session(&known.folder, workspace::untitled_session_name(&taken)) {
+                    Ok(session) => {
+                        self.sessions.open = false;
+                        self.switch_to(&project, Some(&session.id));
+                    }
+                    Err(reason) => self.tell(format!("A session could not be started: {reason}")),
+                }
+            }
+            SessionChoice::ChooseLocation => {
                 let picked = if self.native_dialogs {
                     crate::dialogs::pick_folder(frame)
                 } else {
                     self.scripted_path()
                 };
                 if let Some(path) = picked {
-                    self.attach_folder(path);
+                    self.sessions.chose_root(&path.display().to_string());
                 }
             }
-            ProjectChoice::RemoveFolder(index) => self.detach_folder(index),
+            SessionChoice::CreateProject { name, location } => {
+                let name = name.trim();
+                let name = if name.is_empty() { workspace::UNTITLED } else { name };
+                match workspace::create_project_at(&data, Path::new(&location), name) {
+                    Ok((record, session)) => {
+                        self.sessions.open = false;
+                        self.sessions.page = Page::Recent;
+                        self.start_closing(Closing::Open(Opening {
+                            id: record.id,
+                            name: record.name,
+                            folder: PathBuf::from(location),
+                            session,
+                        }));
+                    }
+                    Err(reason) => self.sessions.form_error = Some(reason),
+                }
+            }
+            SessionChoice::RenameSession { project, session, name } => {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    return;
+                }
+                if self.project.as_ref().is_some_and(|open| open.session == session) {
+                    if let Some(open) = self.project.as_mut() {
+                        open.session_name = name;
+                    }
+                    self.write_project(true);
+                } else if let Some(known) = workspace::known_projects(&data).into_iter().find(|known| known.entry.id == project)
+                    && let Ok(mut file) = SessionFile::read(&known.folder, &session)
+                {
+                    file.name = name;
+                    let _ = file.write(&known.folder);
+                }
+                self.refresh_sessions();
+            }
+            SessionChoice::RenameProject { project, name } => {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    return;
+                }
+                if let Some(known) = workspace::known_projects(&data).into_iter().find(|known| known.entry.id == project) {
+                    let record = ProjectRecord { name: name.clone(), ..known.record };
+                    if let Err(reason) = record.write(&known.folder) {
+                        self.tell(format!("The project could not be renamed: {reason}"));
+                    }
+                }
+                if let Some(open) = self.project.as_mut().filter(|open| open.id == project) {
+                    open.name = name;
+                }
+                self.refresh_sessions();
+            }
+            SessionChoice::DeleteSession { project, session } => {
+                let current = self.project.as_ref().is_some_and(|open| open.session == session);
+                if current {
+                    self.write_project(true);
+                }
+                if let Some(known) = workspace::known_projects(&data).into_iter().find(|known| known.entry.id == project)
+                    && let Ok(mut file) = SessionFile::read(&known.folder, &session)
+                {
+                    file.trashed_at = Some(workspace::now_seconds());
+                    let _ = file.write(&known.folder);
+                }
+                if current {
+                    // The project's newest other session, or a new one.
+                    self.sessions.open = false;
+                    self.switch_to(&project, None);
+                } else {
+                    self.refresh_sessions();
+                }
+            }
+            SessionChoice::DeleteProject { project } => {
+                let _ = workspace::update_known(&data, &project, |entry| {
+                    entry.trashed_at = Some(workspace::now_seconds());
+                });
+                if self.project.as_ref().is_some_and(|open| open.id == project) {
+                    self.sessions.open = false;
+                    self.open_next();
+                } else {
+                    self.refresh_sessions();
+                }
+            }
+            SessionChoice::Restore(item) => {
+                match item {
+                    Trashed::Session { project, id } => {
+                        if let Some(known) = workspace::known_projects(&data).into_iter().find(|known| known.entry.id == project)
+                            && let Ok(mut file) = SessionFile::read(&known.folder, &id)
+                        {
+                            file.trashed_at = None;
+                            let _ = file.write(&known.folder);
+                        }
+                    }
+                    Trashed::Project(project) => {
+                        let _ = workspace::update_known(&data, &project, |entry| entry.trashed_at = None);
+                    }
+                }
+                self.refresh_sessions();
+            }
+            SessionChoice::EmptyTrash => self.flows.question = Some(Question::EmptyTrash),
+            SessionChoice::LockProject { project, locked } => {
+                if let Err(reason) = workspace::update_known(&data, &project, |entry| entry.locked = locked) {
+                    self.tell(format!("The project could not be locked: {reason}"));
+                }
+                self.refresh_sessions();
+            }
+            SessionChoice::ArchiveProject { project, archived } => {
+                let at = archived.then(workspace::now_seconds);
+                if let Err(reason) = workspace::update_known(&data, &project, |entry| entry.archived_at = at) {
+                    self.tell(format!("The project could not be archived: {reason}"));
+                }
+                if archived && self.project.as_ref().is_some_and(|open| open.id == project) {
+                    self.sessions.open = false;
+                    self.open_next();
+                } else {
+                    self.refresh_sessions();
+                }
+            }
+            SessionChoice::PinProject { project, pinned } => {
+                if let Err(reason) = workspace::update_known(&data, &project, |entry| entry.pinned = pinned) {
+                    self.tell(format!("The project could not be pinned: {reason}"));
+                }
+                self.refresh_sessions();
+            }
         }
     }
 
-    /// The name typed for the project. An empty name leaves the old one.
-    pub(super) fn commit_rename(&mut self, name: String) {
-        self.renaming = false;
-        let name = name.trim().to_string();
-        if name.is_empty() {
-            return;
-        }
-        let Some(project) = self.project.as_mut() else {
+    /// Reads the menu's lists again: every session and project, and Trash.
+    pub(super) fn refresh_sessions(&mut self) {
+        let Some(data) = self.data.clone() else {
             return;
         };
-        if project.name == name {
-            return;
+        let now = workspace::now_seconds();
+        let mut recent = Vec::new();
+        let mut projects = Vec::new();
+        let mut trash = Vec::new();
+        for known in workspace::known_projects(&data) {
+            let sessions = workspace::list_session_summaries(&known.folder);
+            let live: Vec<&workspace::SessionSummary> = sessions.iter().filter(|session| session.trashed_at.is_none()).collect();
+            if let Some(deleted) = known.entry.trashed_at {
+                let count = live.len();
+                trash.push((deleted, TrashRow {
+                    item: Trashed::Project(known.entry.id.clone()),
+                    name: known.record.name.clone(),
+                    line: format!(
+                        "Project · {} · Deleted {}",
+                        if count == 1 { "1 session".to_string() } else { format!("{count} sessions") },
+                        crate::sessions::ago(now, deleted).to_lowercase(),
+                    ),
+                }));
+                continue;
+            }
+            for session in &sessions {
+                match session.trashed_at {
+                    Some(deleted) => trash.push((deleted, TrashRow {
+                        item: Trashed::Session { project: known.entry.id.clone(), id: session.id.clone() },
+                        name: session.name.clone(),
+                        line: format!(
+                            "Session · {} · Deleted {}",
+                            known.record.name,
+                            crate::sessions::ago(now, deleted).to_lowercase(),
+                        ),
+                    })),
+                    None => recent.push(SessionRow {
+                        project: known.entry.id.clone(),
+                        project_name: known.record.name.clone(),
+                        id: session.id.clone(),
+                        name: session.name.clone(),
+                        changed: session.updated_at,
+                        folder: known.folder.display().to_string(),
+                    }),
+                }
+            }
+            projects.push(ProjectRow {
+                id: known.entry.id.clone(),
+                name: known.record.name.clone(),
+                sessions: live.len(),
+                used: known.entry.last_used,
+                pinned: known.entry.pinned,
+                locked: known.entry.locked,
+                archived: known.entry.archived_at.is_some(),
+            });
         }
-        project.name = name;
-        self.write_project(true);
+        // Pinned projects first, then the most recently used.
+        projects.sort_by(|a, b| b.pinned.cmp(&a.pinned).then(b.used.cmp(&a.used)));
+        recent.sort_by(|a, b| b.changed.cmp(&a.changed));
+        trash.sort_by(|a, b| b.0.cmp(&a.0));
+        self.sessions.recent = recent;
+        self.sessions.projects = projects;
+        self.sessions.trash = trash.into_iter().map(|(_, row)| row).collect();
+        self.sessions.loaded = true;
+        // The panel was drawn before the lists were read: show them now,
+        // not at the next movement of the pointer.
+        self.ctx.request_repaint();
+        if self.sessions.form_root.is_empty()
+            && let Some(root) = self.projects_root()
+        {
+            self.sessions.form_root = root.display().to_string();
+        }
     }
 
-    fn attach_folder(&mut self, path: PathBuf) {
-        let text = path.display().to_string();
-        let Some(project) = self.project.as_mut() else {
+    /// Opens that project's session, or its newest one, or a new one when it
+    /// has none, closing the open session's tabs first.
+    fn switch_to(&mut self, project: &str, session: Option<&str>) {
+        if self.project.as_ref().is_some_and(|open| Some(open.session.as_str()) == session) {
+            return;
+        }
+        let Some(data) = self.data.clone() else {
             return;
         };
-        if project.folders.iter().any(|known| known == &text) {
-            return;
+        match self.opening(&data, project, session) {
+            Ok(opening) => self.start_closing(Closing::Open(opening)),
+            Err(reason) => self.tell(reason),
         }
-        project.folders.push(text);
-        self.write_project(true);
     }
 
-    fn detach_folder(&mut self, index: usize) {
-        let Some(project) = self.project.as_mut() else {
+    /// A known project read, with the session to open: the one named, if it
+    /// is not in Trash, or the newest, or a new one.
+    fn opening(&self, data: &Path, project: &str, session: Option<&str>) -> Result<Opening, String> {
+        let known = workspace::known_projects(data)
+            .into_iter()
+            .find(|known| known.entry.id == project)
+            .ok_or_else(|| "That project could not be found.".to_string())?;
+        let sessions: Vec<SessionFile> = workspace::list_sessions(&known.folder)
+            .into_iter()
+            .filter(|file| file.trashed_at.is_none())
+            .collect();
+        let chosen = session
+            .and_then(|id| sessions.iter().find(|file| file.id == id).cloned())
+            .or_else(|| sessions.first().cloned());
+        let session = match chosen {
+            Some(session) => session,
+            None => workspace::new_session(&known.folder, workspace::UNTITLED_SESSION.to_string())?,
+        };
+        Ok(Opening {
+            id: known.entry.id,
+            name: known.record.name,
+            folder: known.folder,
+            session,
+        })
+    }
+
+    /// After the open project went to Trash: the newest other project, or a
+    /// new one made by itself.
+    fn open_next(&mut self) {
+        let Some(data) = self.data.clone() else {
             return;
         };
-        if index >= project.folders.len() {
-            return;
+        let next = workspace::known_projects(&data)
+            .into_iter()
+            .find(|known| known.entry.trashed_at.is_none() && known.entry.archived_at.is_none())
+            .map(|known| known.entry.id);
+        match next.and_then(|id| self.opening(&data, &id, None).ok()) {
+            Some(opening) => self.start_closing(Closing::Open(opening)),
+            None => match self.made_by_itself(&data) {
+                Ok(opening) => self.start_closing(Closing::Open(opening)),
+                Err(reason) => self.tell(reason),
+            },
         }
-        project.folders.remove(index);
-        self.write_project(true);
     }
 
-    /// Shows or hides the workspace, and keeps that with the project.
+    /// "Untitled Project" at `~/Inpainter/Untitled Project`, made with no
+    /// question, because a person always has a project.
+    fn made_by_itself(&self, data: &Path) -> Result<Opening, String> {
+        let root = self.projects_root().ok_or_else(|| "There is no folder for projects.".to_string())?;
+        let folder = workspace::default_project_folder(&root);
+        let (record, session) = workspace::create_project_at(data, &folder, workspace::UNTITLED)
+            .map_err(|reason| format!("A project could not be started: {reason}"))?;
+        Ok(Opening {
+            id: record.id,
+            name: record.name,
+            folder,
+            session,
+        })
+    }
+
+    /// Shows or hides the workspace panel, and keeps that with the session.
     pub(super) fn toggle_workspace(&mut self) {
         let Some(project) = self.project.as_mut() else {
             return;
@@ -642,24 +980,6 @@ impl HostWindow {
         project.workspace_open = !project.workspace_open;
         self.sent_viewport = None;
         self.write_project(true);
-    }
-
-    fn begin_switch(&mut self, id: String) {
-        if self.project.as_ref().is_some_and(|project| project.id == id) {
-            return;
-        }
-        let Some(data) = self.data.clone() else {
-            return;
-        };
-        match ProjectFile::read(&workspace::project_path(&data, &id)) {
-            Ok(file) => self.start_closing(Closing::Open { id, file }),
-            Err(ReadError::Version(version)) => {
-                self.start_closing(Closing::Fresh {
-                    note: Some(workspace::version_line(version)),
-                });
-            }
-            Err(ReadError::Other(reason)) => self.tell(reason),
-        }
     }
 
     /// The person answered a sub-application's question. Its dismiss button
@@ -693,11 +1013,18 @@ impl HostWindow {
     pub(super) fn show_question(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) -> bool {
         let ask = match &self.flows.question {
             None => return false,
-            Some(Question::Remove) => Ask {
-                id: "project-remove".to_string(),
-                title: "Remove this project?".to_string(),
-                lines: vec!["The conversation and the project's files are deleted.".to_string()],
-                buttons: vec![button("remove", "Remove"), button("cancel", "Cancel")],
+            Some(Question::Import { path, .. }) => Ask {
+                id: "import".to_string(),
+                title: IMPORT_TITLE.to_string(),
+                lines: vec![import_line(path)],
+                buttons: vec![button("import", "Import"), button("cancel", "Cancel")],
+                dismiss: Some("cancel".to_string()),
+            },
+            Some(Question::EmptyTrash) => Ask {
+                id: "empty-trash".to_string(),
+                title: "Empty Trash?".to_string(),
+                lines: vec![EMPTY_TRASH_LINE.to_string()],
+                buttons: vec![button("empty", "Empty Trash"), button("cancel", "Cancel")],
                 dismiss: Some("cancel".to_string()),
             },
         };
@@ -712,9 +1039,32 @@ impl HostWindow {
         if self.flows.question.is_none() {
             return;
         }
+        if let Some(Question::Import { app, request, path }) = self.flows.question.take() {
+            let folder = self.project.as_ref().map(|project| project.folder.clone());
+            let copy = match (chosen, folder) {
+                ("import", Some(folder)) => match workspace::import_copy(&path, &folder, "") {
+                    Ok(copy) => Some(copy),
+                    Err(reason) => {
+                        self.tell(format!("{} could not be imported: {reason}", path.display()));
+                        None
+                    }
+                },
+                _ => None,
+            };
+            match copy {
+                Some(copy) => self.claim_imported(app, request, copy),
+                None => self.send(app, HostMessage::FileResult { id: request, path: None }),
+            }
+            return;
+        }
         self.flows.question = None;
-        if chosen == "remove" {
-            self.start_closing(Closing::Remove);
+        if chosen == "empty"
+            && let Some(data) = self.data.clone()
+        {
+            for line in workspace::empty_trash(&data) {
+                self.tell(line);
+            }
+            self.refresh_sessions();
         }
     }
 
@@ -723,6 +1073,7 @@ impl HostWindow {
     pub(super) fn project_frame(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.settle_frame();
         self.close_frame(ctx);
+        self.keeping_frame();
         self.closing_frame(ctx);
         self.restore_frame();
         self.write_project(false);
@@ -772,7 +1123,7 @@ impl HostWindow {
             Some(_) => ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose),
             None => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                if self.flows.question.is_none() && self.flows.restore.is_none() {
+                if self.flows.question.is_none() && self.flows.restore.is_none() && self.flows.keeping.is_none() {
                     self.start_closing(Closing::Quit { closed: false });
                 }
             }
@@ -798,15 +1149,10 @@ impl HostWindow {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 self.flows.closing = Some(Closing::Quit { closed: true });
             }
-            Some(Closing::Open { id, file }) => {
+            Some(Closing::Open(opening)) => {
                 self.write_kept();
-                self.open_loaded(id, file);
+                self.open_loaded(opening);
             }
-            Some(Closing::Fresh { note }) => {
-                self.write_kept();
-                self.open_fresh(note);
-            }
-            Some(Closing::Remove) => self.remove_current(),
             None => {}
         }
     }
@@ -814,7 +1160,9 @@ impl HostWindow {
     /// Every installed sub-application is started. One the project names is
     /// restored; one it does not name starts as it does at launch, so it is
     /// there when the workspace is shown.
-    fn open_loaded(&mut self, id: String, file: ProjectFile) {
+    fn open_loaded(&mut self, opening: Opening) {
+        let Opening { id, name, folder, session } = opening;
+        let file = workspace::session_as_file(&folder, &name, &session);
         let installed = crate::apps::discover();
         let mut notes = Vec::new();
         let mut specs: Vec<AppSpec> = Vec::new();
@@ -894,16 +1242,27 @@ impl HostWindow {
                 ids: None,
             });
         }
-        self.restart(specs, &restoring);
-        self.listed_projects = None;
+        self.restart(specs, &restoring, Some(&folder));
+        if let Some(data) = &self.data
+            && let Err(reason) = workspace::note_current(data, &id, &session.id)
+        {
+            notes.push(note(format!("The current session could not be noted: {reason}")));
+        }
         self.project = Some(Project {
             id: id.clone(),
             name: file.name,
-            folders: file.folders,
+            folder,
+            session: session.id,
+            session_name: session.name,
+            session_created: session.created_at,
             workspace_open: file.workspace_open,
         });
-        self.settings.choose_project(&id);
-        self.renaming = false;
+        self.sessions.renaming = None;
+        // The menu's lists are read now, so the panel opens complete.
+        self.refresh_sessions();
+        // What was being written or attached belongs to the session left.
+        self.chat.chips.clear();
+        self.chat.input.clear();
         self.sent_viewport = None;
         self.failed_signature = None;
         self.chat.conversation.clear();
@@ -919,70 +1278,53 @@ impl HostWindow {
         });
     }
 
-    /// The current project, read from the settings, or the newest one, or a
-    /// new "Untitled Project" when there is none.
+    /// At start: projects from before 0.7 move into folders of their own,
+    /// then the current session opens, or the newest project's newest
+    /// session, or a project made by itself when there is none.
     pub(super) fn open_current(&mut self) {
         let Some(data) = self.data.clone() else {
             return;
         };
-        if let Some(id) = self.settings.project.clone() {
-            match ProjectFile::read(&workspace::project_path(&data, &id)) {
-                Ok(file) => {
-                    self.open_loaded(id, file);
-                    return;
-                }
-                Err(ReadError::Version(version)) => {
-                    self.open_fresh(Some(workspace::version_line(version)));
-                    return;
-                }
-                Err(ReadError::Other(_)) => {}
+        let mut lines = Vec::new();
+        if let Some(root) = self.projects_root() {
+            match workspace::migrate_old_projects_to(&data, &root) {
+                Ok(notes) => lines.extend(notes),
+                Err(reason) => lines.push(format!("Older projects could not be moved: {reason}")),
             }
         }
-        if let Some(listed) = workspace::list_projects(&data).into_iter().next() {
-            self.open_loaded(listed.id, listed.file);
-            return;
-        }
-        self.open_fresh(None);
-    }
-
-    fn open_fresh(&mut self, line: Option<String>) {
-        let Some(data) = self.data.clone() else {
-            return;
+        let list = workspace::ProjectsList::load(&data).unwrap_or_default();
+        let known = workspace::known_projects(&data);
+        let live = |id: &str| {
+            known
+                .iter()
+                .any(|known| known.entry.id == id && known.entry.trashed_at.is_none() && known.entry.archived_at.is_none())
         };
-        match workspace::create_project(&data) {
-            Ok((id, mut file)) => {
-                if let Some(line) = line {
-                    file.conversation.push(note(line));
-                    let _ = file.write(&workspace::project_path(&data, &id));
-                }
-                self.open_loaded(id, file);
-            }
-            Err(reason) => self.tell(format!("A project could not be started: {reason}")),
-        }
-    }
-
-    fn remove_current(&mut self) {
-        let Some(data) = self.data.clone() else {
-            return;
+        let wanted = list
+            .current_project
+            .clone()
+            .filter(|id| live(id))
+            .or_else(|| {
+                known
+                    .iter()
+                    .find(|known| known.entry.trashed_at.is_none() && known.entry.archived_at.is_none())
+                    .map(|known| known.entry.id.clone())
+            });
+        let opening = match wanted {
+            Some(id) => self.opening(&data, &id, list.current_session.as_deref()),
+            None => self.made_by_itself(&data),
         };
-        let Some(id) = self.project.as_ref().map(|project| project.id.clone()) else {
-            return;
-        };
-        if let Err(reason) = workspace::delete_project(&data, &id) {
-            self.tell(reason);
-            return;
+        match opening {
+            Ok(opening) => self.open_loaded(opening),
+            Err(reason) => lines.push(reason),
         }
-        self.project = None;
-        if let Some(listed) = workspace::list_projects(&data).into_iter().next() {
-            self.open_loaded(listed.id, listed.file);
-        } else {
-            self.open_fresh(None);
+        for line in lines {
+            self.tell(line);
         }
     }
 
     /// Stops every sub-application and starts these instead. `restoring` says
     /// which ones wait to be given their tabs, instead of opening their own.
-    fn restart(&mut self, specs: Vec<AppSpec>, restoring: &[bool]) {
+    fn restart(&mut self, specs: Vec<AppSpec>, restoring: &[bool], folder: Option<&Path>) {
         for started in std::mem::take(&mut self.apps) {
             started.running.shutdown();
         }
@@ -996,11 +1338,18 @@ impl HostWindow {
                     .as_ref()
                     .map(|data| data.join("apps").join(&spec.id))
                     .or_else(|| crate::apps::data_dir(&spec.id));
-                let running = match &spec.executable {
+                let mut running = match &spec.executable {
                     Some(executable) => Running::start(executable, dir, restore),
                     None => Running::not_started(),
                 };
                 running.attach(&self.ctx);
+                // The project's folder before anything else, so the tabs it
+                // reopens and every new activity are inside it.
+                if let Some(folder) = folder {
+                    running.send(&HostMessage::Project {
+                        folder: folder.display().to_string(),
+                    });
+                }
                 Started {
                     id: spec.id,
                     name: spec.name,
@@ -1019,9 +1368,73 @@ impl HostWindow {
         self.flows.settle = Settle::Waiting;
     }
 
+    /// Every open tab is asked to write its work first. Only when every one
+    /// has, or its application does not answer, do the tabs close; a tab
+    /// that could not be written stops the switch or quit, so nothing is
+    /// lost.
+    fn start_closing(&mut self, closing: Closing) {
+        let mut waiting = Vec::new();
+        for (index, started) in self.apps.iter_mut().enumerate() {
+            if !started.running.answers() {
+                continue;
+            }
+            started.running.declared.kept.clear();
+            // Only a tab that saves to a file has anything to write.
+            for tab in started.running.tabs().0.into_iter().filter(|tab| tab.saves) {
+                started.running.send(&HostMessage::Keep { tab: tab.id.clone() });
+                waiting.push((index, tab.id));
+            }
+        }
+        if waiting.is_empty() {
+            self.close_all(closing);
+            return;
+        }
+        self.flows.keeping = Some(Keeping {
+            closing,
+            waiting,
+            started: Instant::now(),
+        });
+    }
+
+    /// Follows the answers to `keep`, then closes, or stops on a failure.
+    fn keeping_frame(&mut self) {
+        let Some(mut job) = self.flows.keeping.take() else {
+            return;
+        };
+        let mut failed = Vec::new();
+        for (index, started) in self.apps.iter_mut().enumerate() {
+            while let Some((tab, _, error)) = started.running.declared.kept.pop_front() {
+                job.waiting.retain(|(app, id)| !(*app == index && *id == tab));
+                if let Some(error) = error {
+                    let label = started
+                        .running
+                        .tabs()
+                        .0
+                        .into_iter()
+                        .find(|entry| entry.id == tab)
+                        .map(|entry| entry.label)
+                        .unwrap_or(tab);
+                    failed.push(format!("“{label}” could not be written: {error}"));
+                }
+            }
+        }
+        job.waiting.retain(|(app, _)| self.apps.get(*app).is_some_and(|started| !started.running.exited()));
+        if !failed.is_empty() {
+            for line in failed {
+                self.tell(format!("{line} Nothing was closed, so nothing is lost."));
+            }
+            return;
+        }
+        if job.waiting.is_empty() || job.started.elapsed() >= KEEP_WAIT {
+            self.close_all(job.closing);
+            return;
+        }
+        self.flows.keeping = Some(job);
+    }
+
     /// Every installed sub-application resolves its unsaved work, as when the
     /// window closes. Each is asked again, even one that was ready before.
-    fn start_closing(&mut self, closing: Closing) {
+    fn close_all(&mut self, closing: Closing) {
         self.flows.kept = Some(self.snapshot_tabs());
         self.flows.save_paths.clear();
         for started in &mut self.apps {

@@ -308,6 +308,10 @@ pub struct Session {
     data_dir: Option<PathBuf>,
     /// Last 10 sketch paths, most recent first.
     recent: Vec<PathBuf>,
+    /// The project's folder, when a host runs this inside a project. New
+    /// sketches are written there by themselves, and Open Recent and the
+    /// file dialogs stay inside it.
+    project: Option<PathBuf>,
     /// Whether a recent path held a readable sketch, with the modification
     /// time and size it had when it was read.
     recent_checked: HashMap<PathBuf, ((Option<SystemTime>, u64), bool)>,
@@ -360,6 +364,7 @@ impl Session {
             prefs_dirty: false,
             data_dir: None,
             recent: Vec::new(),
+            project: None,
             recent_checked: HashMap::new(),
             dialog_folder: None,
             file_error: None,
@@ -542,7 +547,11 @@ impl Session {
     /// does not parse every recent sketch each frame.
     pub(crate) fn recent_menu(&mut self) -> Vec<PathBuf> {
         let mut shown = Vec::new();
-        for path in &self.recent {
+        let recent = self.recent.clone();
+        for path in &recent {
+            if self.project.is_some() && !self.in_project(path) {
+                continue;
+            }
             let Ok(meta) = std::fs::metadata(path) else {
                 continue;
             };
@@ -585,10 +594,95 @@ impl Session {
             .and_then(|index| self.sketches[index].path().map(Path::to_path_buf))
     }
 
-    /// The folder Save As and Save a Copy start in: the last folder chosen in
-    /// this window, otherwise the home directory.
+    /// The folder Save As and Save a Copy start in: the project's folder in
+    /// a project, otherwise the last folder chosen in this window, otherwise
+    /// the home directory.
     pub(crate) fn dialog_directory(&self) -> Option<PathBuf> {
-        self.dialog_folder.clone().or_else(crate::prefs::home_dir)
+        self.project
+            .clone()
+            .or_else(|| self.dialog_folder.clone())
+            .or_else(crate::prefs::home_dir)
+    }
+
+    /// Works inside this project's folder from now on.
+    pub(crate) fn set_project(&mut self, folder: &Path) {
+        let folder = crate::store::normalize(folder);
+        self.project = Some(folder.canonicalize().unwrap_or(folder));
+    }
+
+    pub(crate) fn project(&self) -> Option<&Path> {
+        self.project.as_deref()
+    }
+
+    /// Whether `path` is inside the project's folder. Always true outside a
+    /// project.
+    pub(crate) fn in_project(&self, path: &Path) -> bool {
+        let Some(project) = &self.project else {
+            return true;
+        };
+        let path = crate::store::normalize(path);
+        let path = path.canonicalize().unwrap_or(path);
+        path.starts_with(project)
+    }
+
+    /// Sketches with work not yet in their file, in tab order. A sketch
+    /// whose words are still being typed waits, unless `drafts` is set.
+    pub(crate) fn unwritten(&self, drafts: bool) -> Vec<SketchId> {
+        self.sketches
+            .iter()
+            .enumerate()
+            .filter(|(index, sketch)| {
+                let typing = *index == self.active && self.text_draft.is_some();
+                if typing && !drafts {
+                    return false;
+                }
+                sketch.needs_keep() || (typing && self.draft_is_unsaved())
+            })
+            .map(|(_, sketch)| sketch.id())
+            .collect()
+    }
+
+    /// Writes the sketch into the project's folder: to its own file, or, for
+    /// a sketch never written, to a new file named after it that replaces
+    /// nothing, such as `Untitled 1.smx`, then `Untitled 2.smx`. Returns the
+    /// file, or none for an untouched sketch that has nothing to write.
+    pub(crate) fn write_into_project(&mut self, id: SketchId) -> Result<Option<PathBuf>, String> {
+        let Some(folder) = self.project.clone() else {
+            return Err("No project folder.".to_string());
+        };
+        let Some(index) = self.index_of(id) else {
+            return Ok(None);
+        };
+        let typing = index == self.active && self.draft_is_unsaved();
+        if !self.sketches[index].needs_keep() && !typing {
+            return Ok(self.file_path(id));
+        }
+        if let Some(path) = self.file_path(id) {
+            return match self.save_path(id, path.clone(), false, true) {
+                SaveResult::Wrote => Ok(Some(path)),
+                _ => Err(self.write_error()),
+            };
+        }
+        let name = self.name_of(id).unwrap_or("Untitled").trim_end_matches(".smx").to_string();
+        for candidate in free_names(&name) {
+            let path = folder.join(format!("{candidate}.smx"));
+            if path.exists() {
+                continue;
+            }
+            match self.save_path(id, path.clone(), false, false) {
+                SaveResult::Wrote => return Ok(Some(path)),
+                SaveResult::NeedsReplace(_) => continue,
+                SaveResult::Failed => return Err(self.write_error()),
+            }
+        }
+        Err("No free file name.".to_string())
+    }
+
+    fn write_error(&mut self) -> String {
+        self.file_error
+            .as_ref()
+            .map(|error| error.reason.clone())
+            .unwrap_or_else(|| "The sketch could not be written.".to_string())
     }
 
     pub(crate) fn note_dialog_folder(&mut self, path: &Path) {
@@ -3893,6 +3987,23 @@ impl Default for Session {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// `name`, then the names after it: "Untitled 1" gives "Untitled 1",
+/// "Untitled 2", and on; "Lighthouse" gives "Lighthouse", "Lighthouse 2".
+fn free_names(name: &str) -> impl Iterator<Item = String> {
+    let (stem, first) = match name.rsplit_once(' ') {
+        Some((stem, number)) if !stem.is_empty() => match number.parse::<u32>() {
+            Ok(number) => (stem.to_string(), Some(number)),
+            Err(_) => (name.to_string(), None),
+        },
+        _ => (name.to_string(), None),
+    };
+    let start = first.unwrap_or(1);
+    (start..start + 10_000).map(move |number| match first {
+        None if number == 1 => stem.clone(),
+        _ => format!("{stem} {number}"),
+    })
 }
 
 #[cfg(test)]

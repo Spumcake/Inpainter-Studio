@@ -33,14 +33,16 @@ fn pick(full: f32, panel: f32) -> f32 {
     if PANEL.with(Cell::get) { panel } else { full }
 }
 
-/// Prose, the person's messages, and a cell's result: Inter 14 on 21, a
+/// Prose, the person's messages, and a cell's result: Inter 14 on 20, a
 /// step down from the research's 15 so the conversation sits with the rest
-/// of Studio, as the owner set on 2026-10-28. In the panel, 13 on 20.
+/// of Studio, as the owner set on 2026-10-28, with the line a point shorter,
+/// as the owner set on 2026-10-29. In the panel, 13 on 19, a
+/// slightly shorter line as the owner set on 2026-10-29.
 pub(crate) fn body_size() -> f32 {
     pick(14.0, 13.0)
 }
 pub(crate) fn body_line() -> f32 {
-    pick(21.0, 20.0)
+    pick(20.0, 19.0)
 }
 /// Tool rows, actions, the turn's time line, captions: Inter 12 on 16; in
 /// the panel, 11.5 on 15.

@@ -78,11 +78,13 @@ pub enum AppMessage {
     #[serde(rename = "result")]
     ToolResult(ToolResult),
     /// The answer to `keep`: the file that tab now has, or none when the
-    /// person cancelled.
+    /// tab is untouched, or `error` when the change could not be written.
     Kept {
         tab: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     /// The whole cell list of a tab that keeps cells, after any change.
     Cells {
@@ -166,9 +168,11 @@ pub enum HostMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
     },
-    /// Make sure that tab has a file, through the sub-application's own Save.
-    /// The answer is `kept`.
+    /// Make sure that tab's file is written. The answer is `kept`.
     Keep { tab: String },
+    /// The project's folder, as an absolute path. New activities are created
+    /// in it, and paths outside it are refused.
+    Project { folder: String },
     /// The window is closing. Exit.
     Shutdown,
     /// The person's edit of a cell's prompt, when it loses focus and before
@@ -748,6 +752,29 @@ mod tests {
         round_trip_host(HostMessage::Claim {
             id: "claim-1".into(),
             path: "/tmp/book.smx".into(),
+        });
+    }
+
+    /// `project` and `kept`, including a failed `keep`, survive a round trip.
+    #[test]
+    fn project_and_kept_round_trip() {
+        round_trip_host(HostMessage::Project {
+            folder: "/home/someone/Inpainter/Lighthouse".into(),
+        });
+        round_trip_app(AppMessage::Kept {
+            tab: "1".into(),
+            path: Some("/home/someone/Inpainter/Lighthouse/Untitled 1.smx".into()),
+            error: None,
+        });
+        round_trip_app(AppMessage::Kept {
+            tab: "1".into(),
+            path: None,
+            error: None,
+        });
+        round_trip_app(AppMessage::Kept {
+            tab: "1".into(),
+            path: Some("/home/someone/Inpainter/Lighthouse/Untitled 1.smx".into()),
+            error: Some("This location is read-only.".into()),
         });
     }
 }

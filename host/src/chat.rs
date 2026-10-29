@@ -11,7 +11,7 @@ use crate::widgets::{self, BORDER, MUTED, SELECTED, TEXT};
 use crate::workspace::ModelChoice;
 use assistant::{Attachment, Entry, Model, Role};
 use eframe::egui::{
-    self, Align, Align2, Color32, Event, FontId, Galley, Key, Layout, Pos2, Rect, Sense,
+    self, Align, Align2, Color32, Event, Galley, Key, Layout, Pos2, Rect, Sense,
     UiBuilder, pos2, vec2,
 };
 use std::path::{Path, PathBuf};
@@ -85,33 +85,6 @@ pub(crate) enum LogoChoice {
     Quit,
 }
 
-/// What the project menu offers, besides the name itself.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ProjectChoice {
-    Rename,
-    Switch(String),
-    New,
-    Remove,
-    /// Hidden from the menu. A project has its own folder; attaching another waits.
-    #[allow(dead_code)]
-    AddFolder,
-    /// Hidden with the folder rows, for the same reason.
-    #[allow(dead_code)]
-    RemoveFolder(usize),
-}
-
-/// The project menu's contents for one frame.
-pub(crate) struct ProjectMenu {
-    pub name: String,
-    /// Kept for the later project system; not listed now.
-    #[allow(dead_code)]
-    pub folders: Vec<String>,
-    /// Other projects: id, then the name the menu shows.
-    pub others: Vec<(String, String)>,
-    pub renaming: bool,
-    pub draft: String,
-}
-
 /// What the person did in the panel.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ChatEvent {
@@ -127,10 +100,8 @@ pub(crate) enum ChatEvent {
     ListModels,
     Model(Model),
     Logo(LogoChoice),
-    Project(ProjectChoice),
-    /// The name was typed.
-    Renamed(String),
-    CancelRename,
+    /// A choice in the session menu.
+    Session(crate::sessions::SessionChoice),
 }
 
 /// The panel's width beside the workspace. It does not follow the window's
@@ -163,7 +134,7 @@ pub(crate) fn show(
     ui: &mut egui::Ui,
     rect: Rect,
     chat: &mut Chat,
-    project: &mut ProjectMenu,
+    sessions: &mut crate::sessions::SessionMenu,
     fills: bool,
     board: &mut crate::cells::Board,
     cell_actions: &mut Vec<crate::cells::CardAction>,
@@ -186,7 +157,9 @@ pub(crate) fn show(
     let centered = fills && empty;
     chat.input_centered = centered;
     chat.centered_column = fills && !empty;
-    project_name(ui, inner, project, &mut events);
+    let mut picks = Vec::new();
+    crate::sessions::pill(ui, pos2(inner.center().x, inner.top() + LOGO_CENTER), sessions, &mut picks);
+    events.extend(picks.into_iter().map(ChatEvent::Session));
 
     // One column for the conversation and the input, with the guide's gutters.
     let column = if fills { talk_column(inner) } else { inner.shrink2(vec2(ts::GUTTER, 0.0)) };
@@ -271,94 +244,6 @@ fn logo_button(ui: &mut egui::Ui, center: Pos2, chat: &mut Chat, events: &mut Ve
             events.push(ChatEvent::Logo(LogoChoice::Quit));
         }
     });
-}
-
-/// The project's name, centred at the top, which opens its menu.
-fn project_name(ui: &mut egui::Ui, rect: Rect, project: &mut ProjectMenu, events: &mut Vec<ChatEvent>) {
-    if project.name.is_empty() && !project.renaming {
-        return;
-    }
-    let center = pos2(rect.center().x, rect.top() + LOGO_CENTER);
-    if project.renaming {
-        let width = 240.0_f32.min(rect.width() - 24.0);
-        let field = Rect::from_center_size(center, vec2(width, 28.0));
-        let mut edit = ui.new_child(UiBuilder::new().max_rect(field));
-        let response = edit.add(
-            egui::TextEdit::singleline(&mut project.draft)
-                .id(egui::Id::new("project-rename"))
-                .hint_text("Project name")
-                .desired_width(width - 12.0)
-                .font(ts::title()),
-        );
-        response.request_focus();
-        let enter = ui.input(|input| input.key_pressed(Key::Enter));
-        let escape = ui.input(|input| input.key_pressed(Key::Escape));
-        if enter {
-            events.push(ChatEvent::Renamed(project.draft.clone()));
-        } else if escape {
-            events.push(ChatEvent::CancelRename);
-        }
-        return;
-    }
-
-    let font = ts::title();
-    let galley = ui.painter().layout_no_wrap(project.name.clone(), font, TEXT);
-    let chevron = pos2(center.x + galley.size().x / 2.0 + 12.0, center.y);
-    let hit = Rect::from_min_max(
-        pos2(center.x - galley.size().x / 2.0 - 8.0, center.y - 16.0),
-        pos2(chevron.x + 10.0, center.y + 16.0),
-    );
-    let response = ui
-        .interact(hit, egui::Id::new("project-menu"), Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
-    if response.hovered() || open {
-        ui.painter().rect_filled(hit, 6.0, SELECTED);
-    }
-    ui.painter().galley(
-        pos2(center.x - galley.size().x / 2.0, center.y - galley.size().y / 2.0),
-        galley,
-        TEXT,
-    );
-    widgets::chevron(ui.painter(), chevron, MUTED, widgets::Scale(1.0));
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, project.name.as_str())
-    });
-
-    egui::Popup::menu(&response).show(|ui| project_menu(ui, project, events));
-}
-
-/// Rows under the name: the folders, then rename, switch, and new, then remove.
-fn project_menu(ui: &mut egui::Ui, project: &ProjectMenu, events: &mut Vec<ChatEvent>) {
-    // Attached folders wait for the Unity-style project system, so even an
-    // old project's folders, kept in its file, are not listed.
-    // "Add folder…" stays in the choice list and the project file. It is
-    // not shown: a project has its own folder until a later project system.
-    let rows = [
-        item("Rename", true, false, true),
-        item("Switch", !project.others.is_empty(), true, false),
-        item("New Project", true, false, false),
-        item("Remove Project", true, false, true),
-    ];
-    // Switch is the row that opens the other projects.
-    let names: Vec<String> = project.others.iter().map(|(_, name)| name.clone()).collect();
-    let picked = widgets::menu_rows_with(ui, &rows, |index, ui| {
-        if index != 1 {
-            return None;
-        }
-        let items: Vec<widgets::MenuItem> = names.iter().map(|name| item(name, true, false, false)).collect();
-        widgets::menu_rows(ui, &items)
-    });
-    let choice = match picked {
-        Some(widgets::MenuPick::Row(0)) => Some(ProjectChoice::Rename),
-        Some(widgets::MenuPick::Row(2)) => Some(ProjectChoice::New),
-        Some(widgets::MenuPick::Row(3)) => Some(ProjectChoice::Remove),
-        Some(widgets::MenuPick::Sub(index)) => project.others.get(index).map(|(id, _)| ProjectChoice::Switch(id.clone())),
-        _ => None,
-    };
-    if let Some(choice) = choice {
-        events.push(ChatEvent::Project(choice));
-    }
 }
 
 fn item(label: &str, enabled: bool, submenu: bool, divider: bool) -> widgets::MenuItem<'_> {

@@ -75,9 +75,13 @@ const CLAIM_WAIT: std::time::Duration = std::time::Duration::from_millis(400);
 struct Project {
     id: String,
     name: String,
-    /// Absolute paths, in the order the person attached them.
-    folders: Vec<String>,
-    /// The workspace is shown beside the conversation.
+    /// The project's folder, which holds its activities and `.inpainter`.
+    folder: PathBuf,
+    /// The open session: its id, name, and when it was made.
+    session: String,
+    session_name: String,
+    session_created: u64,
+    /// The workspace panel is shown beside the conversation.
     workspace_open: bool,
 }
 
@@ -169,9 +173,12 @@ struct HostWindow {
     /// Where projects are kept. None in frame tests, which never write one.
     data: Option<PathBuf>,
     project: Option<Project>,
-    /// The name is being typed.
-    renaming: bool,
-    rename_draft: String,
+    /// Where Studio makes a project by itself, and where the New Project
+    /// form starts: `~/Inpainter`. A frame test leaves it unset, and its
+    /// projects go beside its data folder instead.
+    projects_root: Option<PathBuf>,
+    /// The session menu's state.
+    sessions: crate::sessions::SessionMenu,
     /// When the project file was last written, so a quiet change waits.
     last_project_write: Option<Instant>,
     /// The change a write failed on. It is tried again only after a new one.
@@ -181,8 +188,6 @@ struct HostWindow {
     listed: bool,
     /// The gray bar, last drawn, so a check can press it.
     bar_rect: Rect,
-    /// Other projects for the menu. Read when the list changes, not each frame.
-    listed_projects: Option<Vec<(String, String)>>,
     /// Paths that frame tests give in place of file dialogs.
     #[cfg(test)]
     scripted_paths: std::collections::VecDeque<PathBuf>,
@@ -196,6 +201,7 @@ impl HostWindow {
         window.launch = specs;
         window.native_dialogs = true;
         window.data = workspace::data_folder();
+        window.projects_root = workspace::default_projects_dir();
         window.settings = Settings::load(Settings::default_file());
         window.chat.model = window.settings.model.clone();
         window.open_current();
@@ -265,14 +271,13 @@ impl HostWindow {
             settings: Settings::load(None),
             data: None,
             project: None,
-            renaming: false,
-            rename_draft: String::new(),
+            projects_root: None,
+            sessions: crate::sessions::SessionMenu::default(),
             last_project_write: None,
             failed_signature: None,
             flows: flows::Flows::default(),
             listed: false,
             bar_rect: Rect::NOTHING,
-            listed_projects: None,
             #[cfg(test)]
             scripted_paths: std::collections::VecDeque::new(),
         }
@@ -666,21 +671,11 @@ impl eframe::App for HostWindow {
         let mut sent: Vec<Sent> = Vec::new();
         let mut talk: Vec<ChatEvent> = Vec::new();
         let workspace_open = self.workspace_shown();
-        let mut menu = chat::ProjectMenu {
-            name: self
-                .project
-                .as_ref()
-                .map(|project| project.name.clone())
-                .unwrap_or_default(),
-            folders: self
-                .project
-                .as_ref()
-                .map(|project| project.folders.clone())
-                .unwrap_or_default(),
-            others: self.other_projects(),
-            renaming: self.renaming,
-            draft: self.rename_draft.clone(),
-        };
+        if let Some(project) = &self.project {
+            self.sessions.session = project.session_name.clone();
+            self.sessions.project = project.id.clone();
+        }
+        let mut menu = std::mem::take(&mut self.sessions);
         let mut bar_pressed = false;
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
@@ -716,11 +711,11 @@ impl eframe::App for HostWindow {
                 if workspace_open {
                     self.drag_panel_edge(ui, edge, full);
                 }
-                let (rect, pressed) = workspace_bar(ui, edge, full);
+                let (rect, pressed) = workspace_bar(ui, edge, workspace_open, full);
                 self.bar_rect = rect;
                 bar_pressed = pressed;
             });
-        self.rename_draft = menu.draft;
+        self.sessions = menu;
         if bar_pressed {
             self.toggle_workspace();
         }
@@ -759,14 +754,10 @@ impl eframe::App for HostWindow {
 }
 
 impl HostWindow {
-    /// The folder a file dialog starts in when the request names none.
+    /// The folder a file dialog starts in when the request names none: the
+    /// project's own folder.
     fn project_files_dir(&self) -> Option<PathBuf> {
-        let data = self.data.as_ref()?;
-        let id = self.project.as_ref()?.id.clone();
-        let folder = workspace::project_files(data, &id);
-        // A project made before projects had folders gets its folder here.
-        let _ = std::fs::create_dir_all(&folder);
-        Some(folder)
+        Some(self.project.as_ref()?.folder.clone())
     }
 
     /// The folder a file dialog opens in: the one the request names, or the
@@ -795,6 +786,16 @@ impl HostWindow {
             return;
         };
         if request.kind == FileKind::Open {
+            // A file from outside the project is never opened in place, and
+            // no sub-application sees its path: it is imported first.
+            let outside = self
+                .project
+                .as_ref()
+                .is_some_and(|project| workspace::relative_to_project(&project.folder, &path).is_none());
+            if outside {
+                self.ask_import(app, request.id, path);
+                return;
+            }
             self.begin_claim(app, request.id, path.display().to_string());
             return;
         }
@@ -805,6 +806,11 @@ impl HostWindow {
                 path: Some(path.display().to_string()),
             },
         );
+    }
+
+    /// An imported copy goes on as a picked file inside the project would.
+    pub(super) fn claim_imported(&mut self, requester: usize, request_id: String, copy: PathBuf) {
+        self.begin_claim(requester, request_id, copy.display().to_string());
     }
 
     fn begin_claim(&mut self, requester: usize, request_id: String, path: String) {
@@ -1718,16 +1724,32 @@ impl HostWindow {
     }
 }
 
-/// A short gray bar on `edge_x`, vertically centered. Returns its rect and
-/// whether it was clicked.
-fn workspace_bar(ui: &egui::Ui, edge_x: f32, bounds: Rect) -> (Rect, bool) {
-    let center = egui::pos2(edge_x - 8.0, bounds.center().y);
+/// A short gray bar by `edge_x`, vertically centered. With the workspace
+/// panel open it sits just inside the panel, right of the conversation's
+/// edge, so it is never taken for the conversation's scroll bar, as the
+/// owner set on 2026-10-29; closed, it sits just inside the window's right
+/// edge. Returns its rect and whether it was clicked.
+fn workspace_bar(ui: &egui::Ui, edge_x: f32, inside_workspace: bool, bounds: Rect) -> (Rect, bool) {
+    let x = if inside_workspace { edge_x + 8.0 } else { edge_x - 8.0 };
+    let center = egui::pos2(x, bounds.center().y);
     let bar = Rect::from_center_size(center, egui::vec2(5.0, 56.0));
     let hit = bar.expand2(egui::vec2(8.0, 6.0));
-    ui.painter().rect_filled(bar, 3.0, BAR_GRAY);
-    let clicked = ui
-        .interact(hit, egui::Id::new("workspace-bar"), egui::Sense::click())
-        .clicked();
+    // Its own layer, over the workspace's contents and under menus and the
+    // session panel. It takes presses and drags, so no tool underneath,
+    // such as a brush, ever starts from it, as the owner set on 2026-10-29.
+    let clicked = egui::Area::new(egui::Id::new("workspace-bar"))
+        .order(egui::Order::Middle)
+        .fixed_pos(hit.min)
+        .fade_in(false)
+        .show(ui.ctx(), |ui| {
+            let (rect, response) = ui.allocate_exact_size(hit.size(), egui::Sense::click_and_drag());
+            ui.painter().rect_filled(Rect::from_center_size(rect.center(), bar.size()), 3.0, BAR_GRAY);
+            // The ordinary arrow over it, as the owner set on 2026-10-29. A
+            // press that drifts, as a pen's does, still counts.
+            let response = response.on_hover_cursor(egui::CursorIcon::Default);
+            response.clicked() || response.drag_stopped()
+        })
+        .inner;
     (bar, clicked)
 }
 
@@ -2053,7 +2075,23 @@ impl HostWindow {
                 } else {
                     self.scripted_path().into_iter().collect()
                 };
+                // Each file is copied into the project when it is attached, so
+                // the session never points outside the project.
+                let folder = self.project.as_ref().map(|project| project.folder.clone());
                 for path in picked {
+                    let path = match &folder {
+                        Some(folder) => match workspace::import_copy(&path, folder, "attachments") {
+                            Ok(copy) => copy,
+                            Err(reason) => {
+                                self.assistant.send(Command::Note(format!(
+                                    "{} could not be attached: {reason}",
+                                    path.display()
+                                )));
+                                continue;
+                            }
+                        },
+                        None => path,
+                    };
                     if !self.chat.chips.contains(&path) {
                         self.chat.chips.push(path);
                     }
@@ -2072,9 +2110,7 @@ impl HostWindow {
                 self.settings.choose_model(choice);
             }
             ChatEvent::Logo(choice) => self.logo(choice, ctx, frame),
-            ChatEvent::Project(choice) => self.project_menu(choice, frame),
-            ChatEvent::Renamed(name) => self.commit_rename(name),
-            ChatEvent::CancelRename => self.renaming = false,
+            ChatEvent::Session(choice) => self.session_choice(choice, frame),
         }
     }
 
@@ -2085,30 +2121,6 @@ impl HostWindow {
             .as_ref()
             .map(|project| project.workspace_open)
             .unwrap_or(true)
-    }
-
-    /// Other projects, newest change first, for the menu's switch list.
-    /// The files are read when the list is first needed and after a project
-    /// opens, not on every frame.
-    fn other_projects(&mut self) -> Vec<(String, String)> {
-        if let Some(listed) = &self.listed_projects {
-            return listed.clone();
-        }
-        let listed = self.read_other_projects();
-        self.listed_projects = Some(listed.clone());
-        listed
-    }
-
-    fn read_other_projects(&self) -> Vec<(String, String)> {
-        let Some(data) = &self.data else {
-            return Vec::new();
-        };
-        let current = self.project.as_ref().map(|project| project.id.as_str());
-        workspace::list_projects(data)
-            .into_iter()
-            .filter(|listed| Some(listed.id.as_str()) != current)
-            .map(|listed| (listed.id, listed.file.name))
-            .collect()
     }
 
     /// The properties panel's width when the workspace is shown and it is open.
@@ -2151,14 +2163,17 @@ impl HostWindow {
         let _ = std::fs::create_dir_all(&data);
         self.data = Some(data.clone());
         self.settings = Settings::load(Some(data.join("settings.json")));
-        let (id, file) = workspace::create_project(&data).expect("a project");
+        let folder = workspace::default_project_folder(&data.join("Inpainter"));
+        let (record, session) = workspace::create_project_at(&data, &folder, workspace::UNTITLED).expect("a project");
         self.project = Some(Project {
-            id: id.clone(),
-            name: file.name,
-            folders: file.folders,
+            id: record.id,
+            name: record.name,
+            folder,
+            session: session.id,
+            session_name: session.name,
+            session_created: session.created_at,
             workspace_open: true,
         });
-        self.settings.choose_project(&id);
         self.write_project(true);
     }
 
@@ -2664,16 +2679,14 @@ mod tests {
         let folder = scratch("save");
         harness.app.remember_in(folder.clone());
 
-        let id = harness.app.project.as_ref().unwrap().id.clone();
-        let path = crate::workspace::project_path(&folder, &id);
-        let text = std::fs::read_to_string(&path).expect("the project was written");
-        let file = crate::workspace::ProjectFile::parse(&text).unwrap();
-        assert_eq!(file.tabs.len(), 1);
-        assert_eq!(file.tabs[0].app, "fixture");
-        assert_eq!(file.tabs[0].path.as_deref(), Some("/somewhere/notes.file"));
-        let camera = file.tabs[0].camera.expect("the camera is kept");
-        assert_eq!((camera.origin, camera.zoom), ([-30.0, 12.5], 2.0));
-        assert_eq!(file.selected, Some(0));
+        let project = harness.app.project.as_ref().unwrap();
+        let path = crate::workspace::session_path(&project.folder, &project.session);
+        let text = std::fs::read_to_string(&path).expect("the session was written");
+        let file = crate::workspace::SessionFile::parse(&text).unwrap();
+        // The fixture's file is outside the project, so the session never
+        // points to it.
+        assert!(file.tabs.is_empty(), "a file outside the project was written:\n{text}");
+        assert!(!text.contains("/somewhere"));
         assert_eq!(file.conversation, harness.app.chat.conversation);
         for word in ["Private Words", "nodes", "format_version", "\"41\"", "selection"] {
             assert!(!text.contains(word), "the project holds {word:?}:\n{text}");
@@ -2706,8 +2719,8 @@ mod tests {
         assert!(changed.app.flows.closing_started());
         changed.app.apps[0].running.declared.quit_ready = true;
         changed.step(Vec::new());
-        let id = changed.app.project.as_ref().unwrap().id.clone();
-        let text = std::fs::read_to_string(crate::workspace::project_path(&folder, &id)).unwrap();
+        let project = changed.app.project.as_ref().unwrap();
+        let text = std::fs::read_to_string(crate::workspace::session_path(&project.folder, &project.session)).unwrap();
         assert!(text.contains("hello"), "closing did not keep the conversation");
         std::fs::remove_dir_all(folder).unwrap();
     }
@@ -2720,24 +2733,23 @@ mod tests {
         let mut harness = Harness::new();
         harness.step(Vec::new());
         harness.app.remember_in(folder.clone());
-        let file = crate::workspace::ProjectFile {
-            version: crate::workspace::VERSION,
-            name: "Older".into(),
-            folders: Vec::new(),
-            tabs: vec![crate::workspace::ProjectTab {
-                app: "no-such-app".into(),
-                path: None,
-                label: "Gone".into(),
-                camera: None,
-            }],
-            selected: Some(0),
-            workspace_open: false,
-            conversation: vec![entry(assistant::Role::Person, "hello")],
-        };
-        file.write(&crate::workspace::project_path(&folder, "older")).unwrap();
+        let older = folder.join("Inpainter").join("Older");
+        let (record, mut session) = crate::workspace::create_project_at(&folder, &older, "Older").unwrap();
+        session.tabs = vec![crate::workspace::SessionTab {
+            app: "no-such-app".into(),
+            path: None,
+            label: "Gone".into(),
+            camera: None,
+        }];
+        session.selected = Some(0);
+        session.conversation = vec![entry(assistant::Role::Person, "hello")];
+        session.write(&older).unwrap();
 
         let Harness { app, frame, .. } = &mut harness;
-        app.project_menu(crate::chat::ProjectChoice::Switch("older".into()), frame);
+        app.session_choice(
+            crate::sessions::SessionChoice::Open { project: record.id.clone(), session: session.id.clone() },
+            frame,
+        );
         assert!(harness.app.flows.closing_started());
         // The sub-application has resolved its unsaved work.
         harness.app.apps[0].running.declared.quit_ready = true;
@@ -2746,7 +2758,7 @@ mod tests {
         let left_out = &harness.app.chat.conversation[1];
         assert_eq!(left_out.role, assistant::Role::Note);
         assert!(left_out.text.contains("Gone"), "{}", left_out.text);
-        assert_eq!(harness.app.project.as_ref().map(|project| project.id.as_str()), Some("older"));
+        assert_eq!(harness.app.project.as_ref().map(|project| project.id.as_str()), Some(record.id.as_str()));
         std::fs::remove_dir_all(folder).unwrap();
     }
 

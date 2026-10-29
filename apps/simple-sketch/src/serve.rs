@@ -6,6 +6,11 @@
 //! are sent back. The assistant's `invoke` runs one of the skills in
 //! `skills.rs`; a workspace's `open` and `keep` open a file in a tab and give
 //! a tab a file through Simple Sketch's own Save.
+//!
+//! Inside a project, which the host names with `project`, every sketch is
+//! written into the project's folder by itself, a second after it changes,
+//! and before a tab closes, a `keep` is answered, or the host quits. Save,
+//! Save As, recovery copies, and their questions are not used there.
 
 use crate::ask::Chrome;
 use crate::look::Looker;
@@ -24,7 +29,16 @@ use protocol::{
 use serde_json::Value;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+/// How long a change waits before it is written, so a burst of edits is
+/// written once.
+const WRITE_AFTER: Duration = Duration::from_secs(1);
+/// How long a failed write waits before it is tried again by itself.
+const RETRY_AFTER: Duration = Duration::from_secs(5);
+/// How often the loop wakes with no message, to write what is due.
+const TICK: Duration = Duration::from_millis(250);
 
 /// A file dialog Simple Sketch asked the host for, and is waiting on.
 enum Waiting {
@@ -68,6 +82,12 @@ pub struct Server {
     deferred: Vec<RecoveryOffer>,
     /// A `keep` waiting on Simple Sketch's own Save: the host's tab and the sketch.
     keeping: Option<(String, SketchId)>,
+    /// The current project's folder from the host.
+    project: Option<PathBuf>,
+    /// Sketches with work not yet in their file, since when.
+    unwritten_since: HashMap<SketchId, Instant>,
+    /// Sketches whose last write failed: why, and when.
+    write_failed: HashMap<SketchId, (String, Instant)>,
 }
 
 impl Server {
@@ -106,6 +126,9 @@ impl Server {
             hidden: restore,
             deferred,
             keeping: None,
+            project: None,
+            unwritten_since: HashMap::new(),
+            write_failed: HashMap::new(),
         }
     }
 
@@ -165,6 +188,17 @@ impl Server {
                 input,
                 group,
             } => last = self.invoke(call, &tab, &tool, &input, &group),
+            HostMessage::Project { folder } => {
+                let folder = PathBuf::from(folder);
+                self.session.set_project(&folder);
+                self.project = Some(folder);
+                // In a project every change is in its file, so there is
+                // nothing to recover.
+                self.chrome.set_recoveries(Vec::new());
+                self.deferred.clear();
+            }
+            // A path outside the project opens nothing.
+            HostMessage::Open { path: Some(path) } if !self.allowed_project_path(std::path::Path::new(&path)) => {}
             HostMessage::Open { path } => {
                 let known: Vec<SketchId> = if self.hidden {
                     Vec::new()
@@ -189,12 +223,27 @@ impl Server {
                     }
                 }
             }
+            HostMessage::Keep { tab } if self.project.is_some() => {
+                let kept = match sketch_named(&self.session, Some(&tab)).filter(|_| !self.hidden) {
+                    None => Ok(None),
+                    Some(id) => self.write(id),
+                };
+                last.push(match kept {
+                    Ok(path) => AppMessage::Kept { tab, path: path.map(path_text), error: None },
+                    Err(error) => AppMessage::Kept { tab, path: None, error: Some(error) },
+                });
+            }
             HostMessage::Keep { tab } => match sketch_named(&self.session, Some(&tab)).filter(|_| !self.hidden) {
-                None => last.push(AppMessage::Kept { tab, path: None }),
+                None => last.push(AppMessage::Kept {
+                    tab,
+                    path: None,
+                    error: None,
+                }),
                 Some(id) => match self.session.file_path(id) {
                     Some(path) => last.push(AppMessage::Kept {
                         tab,
                         path: Some(path_text(path)),
+                        error: None,
                     }),
                     None => {
                         self.session.request_save_dialog(id, false);
@@ -268,10 +317,19 @@ impl Server {
             HostMessage::FileResult { id, path } => {
                 camera = self.file_result(&id, path);
             }
-            HostMessage::Quit => self.chrome.note_quit(&mut self.session),
+            HostMessage::Quit => {
+                if self.project.is_some() {
+                    // Everything is written first, so the quit asks nothing.
+                    for id in self.session.unwritten(true) {
+                        let _ = self.write(id);
+                    }
+                }
+                self.chrome.note_quit(&mut self.session)
+            }
             HostMessage::Claim { id, path } => replies.push(AppMessage::Claimed {
                 id,
-                yours: crate::store::readable_smx(std::path::Path::new(&path)),
+                yours: crate::store::readable_smx(std::path::Path::new(&path))
+                    && self.allowed_project_path(std::path::Path::new(&path)),
             }),
             HostMessage::EditCell { .. }
             | HostMessage::CellResult { .. }
@@ -282,8 +340,12 @@ impl Server {
             | HostMessage::DeleteCell { .. }
             | HostMessage::ShowSource { .. } => {}
         }
-        self.session.poll_recovery(Instant::now());
-        self.session.publish_emergency();
+        if self.project.is_some() {
+            self.write_due(Instant::now());
+        } else {
+            self.session.poll_recovery(Instant::now());
+            self.session.publish_emergency();
+        }
         persist_tools(&mut self.session);
         replies.extend(self.updates(camera));
         replies.extend(last);
@@ -371,6 +433,57 @@ impl Server {
         self.chrome.set_recoveries(std::mem::take(&mut self.deferred));
     }
 
+    /// Writes, inside a project, every sketch whose change is a second old,
+    /// and tries a failed one again after a while. Words still being typed
+    /// wait until the text box closes.
+    fn write_due(&mut self, now: Instant) {
+        let unwritten = self.session.unwritten(false);
+        self.unwritten_since.retain(|id, _| unwritten.contains(id));
+        for id in unwritten {
+            let since = *self.unwritten_since.entry(id).or_insert(now);
+            if now.duration_since(since) < WRITE_AFTER {
+                continue;
+            }
+            if let Some((_, failed)) = self.write_failed.get(&id)
+                && now.duration_since(*failed) < RETRY_AFTER
+            {
+                continue;
+            }
+            let _ = self.write(id);
+        }
+    }
+
+    /// Writes one sketch into the project's folder. A failure is shown once,
+    /// when it is new, and is kept for a `keep` to report.
+    fn write(&mut self, id: SketchId) -> Result<Option<PathBuf>, String> {
+        let result = self.session.write_into_project(id);
+        match &result {
+            Ok(_) => {
+                self.unwritten_since.remove(&id);
+                self.write_failed.remove(&id);
+            }
+            Err(error) => {
+                let repeated = self.write_failed.contains_key(&id);
+                if repeated {
+                    // Shown already: do not ask again each time.
+                    let _ = self.session.take_file_error();
+                }
+                self.write_failed.insert(id, (error.clone(), Instant::now()));
+            }
+        }
+        result
+    }
+
+    /// The loop's wake with no message: writes what is due, and sends what
+    /// that changed, such as a tab's new name.
+    pub fn tick(&mut self) -> Vec<AppMessage> {
+        if self.project.is_none() {
+            return Vec::new();
+        }
+        self.write_due(Instant::now());
+        self.updates(false)
+    }
+
     /// The answer to a `keep` once its Save is done or cancelled.
     fn resolve_keep(&mut self) -> Option<AppMessage> {
         let (_, id) = self.keeping.as_ref()?;
@@ -379,12 +492,38 @@ impl Server {
         }
         let path = self.session.file_path(*id).map(path_text);
         let (tab, _) = self.keeping.take()?;
-        Some(AppMessage::Kept { tab, path })
+        Some(AppMessage::Kept {
+            tab,
+            path,
+            error: None,
+        })
     }
 
     fn note_viewport(&mut self, viewport: [f64; 2]) {
         if viewport[0] > 1.0 && viewport[1] > 1.0 {
             self.viewport = Some(viewport);
+        }
+    }
+
+    fn allowed_project_path(&self, path: &std::path::Path) -> bool {
+        let Some(project) = &self.project else {
+            return true;
+        };
+        let project = project.canonicalize().unwrap_or_else(|_| project.clone());
+        let candidate = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            project.join(path)
+        };
+        let candidate = candidate.canonicalize().unwrap_or(candidate);
+        candidate.starts_with(&project)
+    }
+
+    /// Inside a project, a closing tab's work is written first, so closing
+    /// asks nothing. A sketch that could not be written still asks.
+    fn write_before_closing(&mut self, id: SketchId) {
+        if self.project.is_some() && self.session.unwritten(true).contains(&id) {
+            let _ = self.write(id);
         }
     }
 
@@ -397,22 +536,39 @@ impl Server {
         node: Option<u64>,
         viewport: [f64; 2],
     ) {
-        let session = &mut self.session;
         match id {
-            "select_tab" => activate(session, tab),
+            "select_tab" => activate(&mut self.session, tab),
             "close_tab" => {
-                if let Some(id) = sketch_named(session, tab) {
-                    let _ = self.chrome.close(session, id);
+                if let Some(id) = sketch_named(&self.session, tab) {
+                    self.write_before_closing(id);
+                    let _ = self.chrome.close(&mut self.session, id);
                 }
             }
             "close" => {
-                activate(session, tab);
-                let id = session.active_id();
-                let _ = self.chrome.close(session, id);
+                activate(&mut self.session, tab);
+                let id = self.session.active_id();
+                self.write_before_closing(id);
+                let _ = self.chrome.close(&mut self.session, id);
+            }
+            "save" if self.project.is_some() => {
+                activate(&mut self.session, tab);
+                let id = self.session.active_id();
+                let _ = self.write(id);
+            }
+            "save_as" | "save_copy" if self.project.is_some() => {}
+            "open_recent" => {
+                let allowed = arg
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| self.allowed_project_path(std::path::Path::new(path)));
+                if !allowed {
+                    return;
+                }
+                activate(&mut self.session, tab);
+                run_action(&mut self.session, id, arg, node, viewport);
             }
             _ => {
-                activate(session, tab);
-                run_action(session, id, arg, node, viewport);
+                activate(&mut self.session, tab);
+                run_action(&mut self.session, id, arg, node, viewport);
             }
         }
     }
@@ -473,7 +629,6 @@ impl Server {
             self.waiting = Some((request, wait));
             return false;
         }
-        let session = &mut self.session;
         let Some(path) = path.map(PathBuf::from) else {
             if let Waiting::Save {
                 close_after: true, ..
@@ -483,6 +638,16 @@ impl Server {
             }
             return false;
         };
+        if !self.allowed_project_path(&path) {
+            if let Waiting::Save {
+                close_after: true, ..
+            } = wait
+            {
+                self.chrome.cancel_save_as();
+            }
+            return false;
+        }
+        let session = &mut self.session;
         session.note_dialog_folder(&path);
         match wait {
             Waiting::Save {
@@ -620,10 +785,29 @@ pub fn run() {
     for message in server.greeting() {
         send(&message);
     }
-    let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else {
-            break;
+    // Lines arrive on their own thread, so the loop also wakes with no
+    // message and writes a project's changes that are due.
+    let (lines, incoming) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    loop {
+        let line = match incoming.recv_timeout(TICK) {
+            Ok(line) => line,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                for reply in &server.tick() {
+                    send(reply);
+                }
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
         let Ok(message) = protocol::parse_host_message(&line) else {
             continue;
@@ -633,6 +817,12 @@ pub fn run() {
         };
         for reply in &replies {
             send(reply);
+        }
+    }
+    // The host is gone: whatever a project has not written yet is written.
+    for id in server.session.unwritten(true) {
+        if server.project.is_some() {
+            let _ = server.write(id);
         }
     }
     server.session.finish_size_edit();
@@ -1074,4 +1264,121 @@ fn tab_id(id: SketchId) -> String {
 
 fn path_text(path: PathBuf) -> String {
     path.display().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("simple-sketch-project-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch folder");
+        dir
+    }
+
+    fn command(id: &str, tab: Option<String>) -> HostMessage {
+        HostMessage::Command { id: id.to_string(), tab, arg: None, node: None, viewport: [800.0, 600.0] }
+    }
+
+    /// A server inside `folder`, its one tab, and that tab changed.
+    fn changed_in(folder: &std::path::Path) -> (Server, String) {
+        let mut server = Server::new(None);
+        let _ = server.greeting();
+        let _ = server.handle(HostMessage::Project { folder: folder.display().to_string() });
+        let tab = tab_id(server.session.active_id());
+        let _ = server.handle(command("new_canvas", Some(tab.clone())));
+        (server, tab)
+    }
+
+    fn smx_files(folder: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(folder)
+            .expect("the folder")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".smx"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Catches a sketch that waits for Save, or one written outside the
+    /// project: a second after a change, it is a file in the project's folder.
+    #[test]
+    fn a_change_is_written_into_the_project_by_itself() {
+        let folder = scratch("written");
+        let (mut server, _) = changed_in(&folder);
+        server.write_due(Instant::now());
+        assert!(smx_files(&folder).is_empty(), "written before a second passed");
+        server.write_due(Instant::now() + WRITE_AFTER * 2);
+        assert_eq!(smx_files(&folder), vec!["Untitled 1.smx".to_string()]);
+        assert!(server.session.unwritten(true).is_empty(), "the sketch still counts as unsaved");
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    /// Catches two sessions writing one file: a second sketch named the same
+    /// as one already in the folder gets the next free name.
+    #[test]
+    fn a_new_sketch_never_replaces_another_sessions_file() {
+        let folder = scratch("names");
+        let (mut first, _) = changed_in(&folder);
+        first.write_due(Instant::now() + WRITE_AFTER * 2);
+        let before = std::fs::read(folder.join("Untitled 1.smx")).expect("the first file");
+        let (mut second, _) = changed_in(&folder);
+        let _ = second.handle(command("new_canvas", None));
+        second.write_due(Instant::now() + WRITE_AFTER * 2);
+        assert_eq!(smx_files(&folder), vec!["Untitled 1.smx".to_string(), "Untitled 2.smx".to_string()]);
+        assert_eq!(std::fs::read(folder.join("Untitled 1.smx")).expect("the first file"), before);
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    /// Catches a `keep` that opens a save dialog or reports nothing: in a
+    /// project it writes and names the file, an untouched tab has nothing to
+    /// keep, and a write that fails says so.
+    #[test]
+    fn keep_writes_and_reports_a_failure() {
+        let folder = scratch("keep");
+        let (mut server, tab) = changed_in(&folder);
+        let replies = server.handle(HostMessage::Keep { tab: tab.clone() }).expect("replies");
+        let kept = replies.iter().find_map(|reply| match reply {
+            AppMessage::Kept { path, error, .. } => Some((path.clone(), error.clone())),
+            _ => None,
+        });
+        let expected = folder.canonicalize().expect("the folder").join("Untitled 1.smx");
+        assert_eq!(kept, Some((Some(path_text(expected)), None)));
+        assert!(!replies.iter().any(|reply| matches!(reply, AppMessage::File { .. })), "a save dialog opened");
+
+        let mut untouched = Server::new(None);
+        let _ = untouched.greeting();
+        let _ = untouched.handle(HostMessage::Project { folder: folder.display().to_string() });
+        let blank = tab_id(untouched.session.active_id());
+        let replies = untouched.handle(HostMessage::Keep { tab: blank }).expect("replies");
+        assert!(replies.iter().any(|reply| matches!(reply, AppMessage::Kept { path: None, error: None, .. })));
+
+        let locked = scratch("locked");
+        let (mut failing, tab) = changed_in(&locked);
+        let mut permissions = std::fs::metadata(&locked).expect("the folder").permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&locked, permissions.clone()).expect("read-only");
+        let replies = failing.handle(HostMessage::Keep { tab }).expect("replies");
+        permissions.set_readonly(false);
+        let _ = std::fs::set_permissions(&locked, permissions);
+        assert!(
+            replies.iter().any(|reply| matches!(reply, AppMessage::Kept { error: Some(_), .. })),
+            "a failed write was reported as kept"
+        );
+        assert!(!failing.session.unwritten(true).is_empty(), "the change was lost");
+        let _ = std::fs::remove_dir_all(folder);
+        let _ = std::fs::remove_dir_all(locked);
+    }
+
+    /// Catches Save offered where every change is written by itself.
+    #[test]
+    fn a_project_offers_no_save() {
+        let folder = scratch("menu");
+        let (mut server, _) = changed_in(&folder);
+        let rows: Vec<String> = server.session.declare_menu().into_iter().map(|row| row.label).collect();
+        assert!(!rows.iter().any(|label| label.starts_with("Save")), "{rows:?}");
+        let _ = std::fs::remove_dir_all(folder);
+    }
 }

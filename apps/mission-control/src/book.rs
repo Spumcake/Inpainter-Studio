@@ -4,6 +4,11 @@
 //! The host draws the cells and runs them. This process only keeps them.
 //! A run is kept for good: the runs live apart from the undo history, so no
 //! undo or redo ever adds or removes one, as the owner set on 2026-10-28.
+//!
+//! Inside a project, which the host names with `project`, every notebook is
+//! written into the project's folder by itself, a second after it changes,
+//! and before its tab closes, a `keep` is answered, or the host quits. Save
+//! and Save As are not offered there, and nothing asks to save.
 
 use protocol::{
     Action, AppMessage, Ask, AskButton, Cell, CellPart, CellState, CellVersion, Chord,
@@ -13,6 +18,13 @@ use protocol::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// How long a change waits before it is written, so a burst of edits is
+/// written once.
+const WRITE_AFTER: Duration = Duration::from_secs(1);
+/// How long a failed write waits before it is tried again by itself.
+const RETRY_AFTER: Duration = Duration::from_secs(5);
 
 const VERSION: u32 = 2;
 const UNTITLED: &str = "Untitled Notebook";
@@ -35,6 +47,10 @@ struct Book {
     undo: Vec<Snap>,
     redo: Vec<Snap>,
     dirty: bool,
+    /// Inside a project: when its change was first seen unwritten, and its
+    /// last failed write, why and when.
+    unwritten_since: Option<Instant>,
+    write_failed: Option<(String, Instant)>,
 }
 
 /// What a save during quit is waiting on.
@@ -62,6 +78,8 @@ pub struct Session {
     adding: String,
     /// The cell cut or copied last, with its runs.
     clipboard: Option<Cell>,
+    /// The project's folder, when the host runs this inside a project.
+    project: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -105,6 +123,7 @@ impl Session {
             next_file: 1,
             adding: String::from(TEXT_KIND),
             clipboard: None,
+            project: None,
         }
     }
 
@@ -143,7 +162,22 @@ impl Session {
         match message {
             HostMessage::Shutdown => return Vec::new(),
             HostMessage::Ping => return vec![AppMessage::Pong],
-            HostMessage::Quit => self.note_quit(&mut out),
+            HostMessage::Quit => {
+                if self.project.is_some() {
+                    // Everything is written first, so the quit asks nothing.
+                    for index in 0..self.books.len() {
+                        let _ = self.write_into_project(index);
+                    }
+                }
+                self.note_quit(&mut out)
+            }
+            HostMessage::Project { folder } => {
+                let folder = PathBuf::from(folder);
+                self.project = Some(folder.canonicalize().unwrap_or(folder));
+                out.extend(self.declared());
+            }
+            // A path outside the project opens nothing.
+            HostMessage::Open { path } if path.as_deref().is_some_and(|path| !self.in_project(Path::new(path))) => {}
             HostMessage::Open { path } => self.open_path(path, &mut out),
             HostMessage::Command { id, tab, .. } => self.command(&id, tab.as_deref(), &mut out),
             HostMessage::Answer { button, .. } => {
@@ -170,13 +204,123 @@ impl Session {
             HostMessage::ShowSource { tab, cell } => self.show_source(&tab, &cell, &mut out),
             HostMessage::Claim { id, path } => out.push(AppMessage::Claimed {
                 id,
-                yours: claims(Path::new(&path)),
+                yours: claims(Path::new(&path)) && self.in_project(Path::new(&path)),
             }),
             HostMessage::Invoke { call, .. } => out.extend(self.invoke(call)),
-            HostMessage::Keep { tab } => out.push(AppMessage::Kept { tab, path: None }),
+            HostMessage::Keep { tab } => {
+                let kept = match self.books.iter().position(|book| book.id == tab) {
+                    Some(index) if self.project.is_some() => self.write_into_project(index),
+                    Some(index) => Ok(self.books[index].path.clone()),
+                    None => Ok(None),
+                };
+                out.extend(self.declared());
+                out.push(match kept {
+                    Ok(path) => AppMessage::Kept {
+                        tab,
+                        path: path.map(|path| path.display().to_string()),
+                        error: None,
+                    },
+                    Err(error) => AppMessage::Kept { tab, path: None, error: Some(error) },
+                });
+            }
             _ => {}
         }
+        if self.project.is_some() && self.write_due(Instant::now()) {
+            out.extend(self.declared());
+        }
         out
+    }
+
+    /// The loop's wake with no message: writes what is due inside a project,
+    /// and sends what that changed, such as a tab's new name.
+    pub fn tick(&mut self) -> Vec<AppMessage> {
+        if self.project.is_some() && self.write_due(Instant::now()) {
+            return self.declared();
+        }
+        Vec::new()
+    }
+
+    /// Inside a project, writes every notebook not yet written, as when the
+    /// host has gone.
+    pub fn write_all(&mut self) {
+        if self.project.is_some() {
+            for index in 0..self.books.len() {
+                let _ = self.write_into_project(index);
+            }
+        }
+    }
+
+    /// Whether `path` is inside the project's folder. Always true outside a
+    /// project.
+    fn in_project(&self, path: &Path) -> bool {
+        let Some(project) = &self.project else {
+            return true;
+        };
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        path.starts_with(project)
+    }
+
+    /// Writes every notebook whose change is a second old, and tries a failed
+    /// one again after a while. Returns whether any was written.
+    fn write_due(&mut self, now: Instant) -> bool {
+        let mut wrote = false;
+        for index in 0..self.books.len() {
+            let book = &mut self.books[index];
+            if !book.dirty {
+                book.unwritten_since = None;
+                continue;
+            }
+            let since = *book.unwritten_since.get_or_insert(now);
+            if now.duration_since(since) < WRITE_AFTER {
+                continue;
+            }
+            if book.write_failed.as_ref().is_some_and(|(_, failed)| now.duration_since(*failed) < RETRY_AFTER) {
+                continue;
+            }
+            wrote |= self.write_into_project(index).is_ok();
+        }
+        wrote
+    }
+
+    /// Writes one notebook into the project's folder: to its own file, or,
+    /// for one never written, to a new file named after it that replaces
+    /// nothing, such as `Untitled Notebook.smx`, then `Untitled Notebook
+    /// 2.smx`. Returns the file, or none for an untouched notebook.
+    fn write_into_project(&mut self, index: usize) -> Result<Option<PathBuf>, String> {
+        let Some(folder) = self.project.clone() else {
+            return Err("No project folder.".into());
+        };
+        let Some(book) = self.books.get(index) else {
+            return Ok(None);
+        };
+        if !book.dirty {
+            return Ok(book.path.clone());
+        }
+        let path = match &book.path {
+            Some(path) => path.clone(),
+            None => match free_names(&book.label)
+                .map(|name| folder.join(format!("{name}.smx")))
+                .find(|path| !path.exists())
+            {
+                Some(path) => path,
+                None => return Err("No free file name.".into()),
+            },
+        };
+        let book = &mut self.books[index];
+        match write_book(&path, &book.cells, book.selected.as_deref()) {
+            Ok(()) => {
+                book.label = file_title(&path);
+                book.path = Some(path.clone());
+                book.dirty = false;
+                book.unwritten_since = None;
+                book.write_failed = None;
+                Ok(Some(path))
+            }
+            Err(reason) => {
+                book.write_failed = Some((reason.clone(), Instant::now()));
+                Err(reason)
+            }
+        }
     }
 
     fn command(&mut self, id: &str, tab: Option<&str>, out: &mut Vec<AppMessage>) {
@@ -210,6 +354,11 @@ impl Session {
             "copy" => self.copy_active(),
             "paste" => self.paste(out),
             "open" => self.ask_file(FileKind::Open, None, false, out),
+            "save" if self.project.is_some() => {
+                let _ = self.write_into_project(self.active);
+                out.extend(self.declared());
+            }
+            "save_as" if self.project.is_some() => {}
             "save" => self.save_active(false, out),
             "save_as" => self.save_active(true, out),
             "add_cell" => self.add_cell(out),
@@ -248,6 +397,8 @@ impl Session {
             undo: Vec::new(),
             redo: Vec::new(),
             dirty: false,
+            unwritten_since: None,
+            write_failed: None,
         });
         self.active = self.books.len() - 1;
         self.active
@@ -593,6 +744,11 @@ impl Session {
         let Some(index) = self.books.iter().position(|book| book.id == tab) else {
             return;
         };
+        if self.project.is_some() {
+            // Written first, so closing asks nothing. A notebook that could
+            // not be written still asks.
+            let _ = self.write_into_project(index);
+        }
         if self.books[index].dirty {
             self.ask = Some(keep_ask());
             self.saving = None;
@@ -646,7 +802,7 @@ impl Session {
             id,
             kind,
             name,
-            folder: None,
+            folder: self.project.as_ref().map(|folder| folder.display().to_string()),
             filter: Some(FileFilter {
                 name: "Notebook".into(),
                 extensions: vec!["smx".into()],
@@ -669,6 +825,9 @@ impl Session {
         let path = PathBuf::from(path);
         if let Some(saving) = self.saving.take() {
             self.write_at(saving.book, &path, saving.then_quit, out);
+            return;
+        }
+        if !self.in_project(&path) {
             return;
         }
         // An Open.
@@ -870,7 +1029,7 @@ impl Session {
     fn declared(&self) -> Vec<AppMessage> {
         let mut messages = vec![
             AppMessage::Toolbar(toolbar(&self.adding)),
-            AppMessage::Menu { rows: menu() },
+            AppMessage::Menu { rows: menu(self.project.is_some()) },
             AppMessage::Keys(keys()),
         ];
         if let Some(book) = self.books.get(self.active) {
@@ -1028,15 +1187,35 @@ fn kind_label(kind: &str) -> &'static str {
     if kind == MARKDOWN_KIND { "Markdown" } else { "LLM" }
 }
 
-fn menu() -> Vec<MenuEntry> {
-    vec![
-        row("New notebook", "new_book"),
-        row("Open", "open"),
-        row("Save", "save"),
-        row("Save As", "save_as"),
-        row("Undo", "undo"),
-        row("Redo", "redo"),
-    ]
+/// The menu. In a project every change is written by itself, so Save and
+/// Save As are not offered.
+fn menu(in_project: bool) -> Vec<MenuEntry> {
+    let mut rows = vec![row("New notebook", "new_book"), row("Open", "open")];
+    if !in_project {
+        rows.push(row("Save", "save"));
+        rows.push(row("Save As", "save_as"));
+    }
+    rows.push(row("Undo", "undo"));
+    rows.push(row("Redo", "redo"));
+    rows
+}
+
+/// `name`, then the names after it: "Untitled Notebook" gives "Untitled
+/// Notebook", "Untitled Notebook 2", and on; "Notes 3" gives "Notes 3",
+/// "Notes 4".
+fn free_names(name: &str) -> impl Iterator<Item = String> {
+    let (stem, first) = match name.rsplit_once(' ') {
+        Some((stem, number)) if !stem.is_empty() => match number.parse::<u32>() {
+            Ok(number) => (stem.to_string(), Some(number)),
+            Err(_) => (name.to_string(), None),
+        },
+        _ => (name.to_string(), None),
+    };
+    let start = first.unwrap_or(1);
+    (start..start + 10_000).map(move |number| match first {
+        None if number == 1 => stem.clone(),
+        _ => format!("{stem} {number}"),
+    })
 }
 
 fn row(label: &str, id: &str) -> MenuEntry {
@@ -1418,5 +1597,86 @@ mod tests {
         std::fs::write(&path, r#"{"version":1,"cells":[]}"#).unwrap();
         assert!(claims(&path));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn project_folder(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("inpainter-book-project-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    /// A launched session inside `folder`, its notebook changed.
+    fn changed_in(folder: &Path) -> Session {
+        let mut session = Session::launch();
+        let _ = session.handle(HostMessage::Project { folder: folder.display().to_string() });
+        let _ = command(&mut session, "add_cell");
+        session
+    }
+
+    fn notebooks(folder: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(folder)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".smx"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Catches a notebook that waits for Save, or two sessions writing one
+    /// file: a second after a change it is in the project's folder, and a
+    /// second notebook of the same name gets the next free name.
+    #[test]
+    fn a_notebook_is_written_into_the_project_by_itself() {
+        let folder = project_folder("written");
+        let mut first = changed_in(&folder);
+        first.write_due(Instant::now());
+        assert!(notebooks(&folder).is_empty(), "written before a second passed");
+        first.write_due(Instant::now() + WRITE_AFTER * 2);
+        assert_eq!(notebooks(&folder), vec!["Untitled Notebook.smx".to_string()]);
+        let written = std::fs::read(folder.join("Untitled Notebook.smx")).unwrap();
+        let mut second = changed_in(&folder);
+        second.write_due(Instant::now() + WRITE_AFTER * 2);
+        assert_eq!(
+            notebooks(&folder),
+            vec!["Untitled Notebook 2.smx".to_string(), "Untitled Notebook.smx".to_string()]
+        );
+        assert_eq!(std::fs::read(folder.join("Untitled Notebook.smx")).unwrap(), written);
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    /// Catches a `keep` that never writes, a failed write reported as kept,
+    /// Save offered in a project, and a path from outside it opened.
+    #[test]
+    fn a_project_notebook_keeps_and_refuses() {
+        let folder = project_folder("keep");
+        let mut session = changed_in(&folder);
+        let replies = session.handle(HostMessage::Keep { tab: "1".into() });
+        let expected = folder.join("Untitled Notebook.smx").display().to_string();
+        assert!(replies.iter().any(|reply| matches!(reply, AppMessage::Kept { path: Some(path), error: None, .. } if *path == expected)));
+        let labels: Vec<String> = menu(true).into_iter().map(|row| row.label).collect();
+        assert!(!labels.iter().any(|label| label.starts_with("Save")), "{labels:?}");
+
+        let outside = project_folder("outside").join("Elsewhere.smx");
+        write_book(&outside, &[], None).unwrap();
+        let before = session.books.len();
+        let _ = session.handle(HostMessage::Open { path: Some(outside.display().to_string()) });
+        assert_eq!(session.books.len(), before, "a notebook from outside the project opened");
+
+        let locked = project_folder("locked");
+        let mut failing = changed_in(&locked);
+        let mut permissions = std::fs::metadata(&locked).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&locked, permissions.clone()).unwrap();
+        let replies = failing.handle(HostMessage::Keep { tab: "1".into() });
+        permissions.set_readonly(false);
+        let _ = std::fs::set_permissions(&locked, permissions);
+        assert!(replies.iter().any(|reply| matches!(reply, AppMessage::Kept { error: Some(_), .. })), "a failed write was reported as kept");
+        assert!(failing.books[0].dirty, "the change was lost");
+        for dir in [folder, locked, outside.parent().unwrap().to_path_buf()] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }

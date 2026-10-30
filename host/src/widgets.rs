@@ -701,6 +701,11 @@ pub(crate) fn disc(painter: &Painter, center: Pos2, radius: f32, color: Color32)
     painter.circle_filled(center, radius, color);
 }
 
+/// A ring of `width` around `center`, such as a brush's outline at the pointer.
+pub(crate) fn ring(painter: &Painter, center: Pos2, radius: f32, width: f32, color: Color32) {
+    painter.circle_stroke(center, radius, Stroke::new(width, color));
+}
+
 /// A soft shadow under a raised rounded box, as under the menus.
 pub(crate) fn soft_shadow(painter: &Painter, rect: Rect, radius: f32) {
     let shadow = egui::epaint::Shadow {

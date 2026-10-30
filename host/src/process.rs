@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use draw::document::{Camera, NodeId, Sketch};
 use protocol::{
     Accept, AppMessage, Ask, Canvas, Declaration, FileFilter, FileKind, HostMessage, Keys,
-    MenuEntry, Properties, Skill, TabEntry, Tabs, Toolbar, ToolResult,
+    MenuEntry, Properties, RasterView, Skill, TabEntry, Tabs, Toolbar, ToolResult,
 };
 
 /// How long a closing window waits for the sub-application to exit after
@@ -43,6 +43,17 @@ pub struct Display {
     pub version: u64,
 }
 
+/// A raster tab as the host shows it: the latest view, and the camera the
+/// host keeps while the tab is shown.
+pub struct RasterDisplay {
+    pub view: RasterView,
+    /// None until the tab is first drawn, which fits the picture to it.
+    pub camera: Option<Camera>,
+    /// Counts the views this tab has received, so a preview held for a sent
+    /// gesture ends when the answer arrives.
+    pub version: u64,
+}
+
 /// A file dialog a sub-application asked for.
 pub struct FileRequest {
     pub id: String,
@@ -57,6 +68,8 @@ pub struct FileRequest {
 pub struct Declared {
     pub tabs: Option<Tabs>,
     pub documents: HashMap<String, Display>,
+    /// The raster tabs' pictures, by tab.
+    pub rasters: HashMap<String, RasterDisplay>,
     pub keys: Keys,
     pub toolbar: Option<Toolbar>,
     pub menu: Vec<MenuEntry>,
@@ -464,6 +477,9 @@ impl Running {
                 declared
                     .documents
                     .retain(|id, _| tabs.tabs.iter().any(|tab| tab.id == *id));
+                declared
+                    .rasters
+                    .retain(|id, _| tabs.tabs.iter().any(|tab| tab.id == *id));
                 if let Some(log) = &mut declared.tab_log {
                     log.push(
                         tabs.tabs
@@ -475,6 +491,28 @@ impl Running {
                 declared.tabs = Some(tabs);
             }
             AppMessage::Canvas(canvas) => declared.canvas = Some(canvas),
+            // The camera a view carries is taken only when a picture is
+            // opened or made; otherwise the host's own camera stays.
+            AppMessage::Raster(view) => {
+                let previous = declared.rasters.remove(&view.tab);
+                let version = previous.as_ref().map_or(1, |previous| previous.version + 1);
+                let camera = match (&view.camera, previous) {
+                    (Some(camera), _) => Some(Camera {
+                        origin: camera.origin,
+                        zoom: camera.zoom,
+                    }),
+                    (None, Some(previous)) => previous.camera,
+                    (None, None) => None,
+                };
+                declared.rasters.insert(
+                    view.tab.clone(),
+                    RasterDisplay {
+                        view,
+                        camera,
+                        version,
+                    },
+                );
+            }
             AppMessage::Ask(ask) => declared.ask = Some(ask),
             AppMessage::QuitReady => declared.quit_ready = true,
             AppMessage::Pong => self.last_pong = Instant::now(),

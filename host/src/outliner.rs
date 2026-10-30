@@ -1,14 +1,18 @@
 //! The Layers tree, from Simple Sketch 1.0.1's `outliner.rs`. Rows, eyes,
 //! locks, and right-click menus come from the declared layers. Dragging a row
-//! reorders it among its siblings. Moving a node into or out of a group is not
-//! specified, so that drop stays unwired. Canvases, groups, and palette colors
-//! are renamed in place, by double-clicking a name or from the row's menu.
+//! reorders it among its siblings. When the layers declare `nest`, a row can
+//! also be dragged into and out of groups, as in Photoshop's Layers panel:
+//! dropped on the middle of a group's row it goes to the top of that group,
+//! and dropped between rows it goes there, under the parent of the row below
+//! the drop, or at the bottom of the top level below the last row. Canvases,
+//! groups, and palette colors are renamed in place, by double-clicking a name
+//! or from the row's menu.
 
 use crate::panel::Sent;
 use crate::toolbar;
 use crate::widgets::{self, BORDER, MUTED, SELECTED, Scale, TEXT};
 use eframe::egui::{self, Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
-use protocol::{Action, ColorRow, FlagIcons, LayerRow, Layers};
+use protocol::{Action, ColorRow, FlagIcons, HeadingAction, LayerRow, Layers};
 use serde_json::json;
 use std::collections::HashSet;
 
@@ -22,17 +26,27 @@ fn name_font() -> egui::FontId {
     egui::FontId::proportional(15.0)
 }
 
-pub(crate) fn show(ui: &mut egui::Ui, layers: &Layers, sent: &mut Vec<Sent>) {
+/// The layers. `paged` is a panel with page tabs, where the list follows the
+/// sections rather than starting the page.
+pub(crate) fn show(ui: &mut egui::Ui, layers: &Layers, paged: bool, sent: &mut Vec<Sent>) {
     let flags = &layers.flags;
-    // The first row is centered on the same line as another page's first
-    // heading, so the panel does not jump when the select tool swaps pages.
-    ui.add_space(crate::panel::FIRST_LINE - ROW / 2.0);
+    if !paged {
+        // The first row is centered on the same line as another page's first
+        // heading, so the panel does not jump when the select tool swaps pages.
+        ui.add_space(crate::panel::FIRST_LINE - ROW / 2.0);
+    }
+    if !layers.actions.is_empty() {
+        heading(ui, &layers.actions, sent);
+    }
     let rows = &layers.rows;
+    // Rows with pictures are drawn as the asset-editor mockup draws them, and
+    // then every row is, so a group sits among its layers' pictures.
+    let pictures = rows.iter().any(|row| row.thumbnail.is_some());
     let toggled = toggled_set(ui);
     let mut toggle: Option<u64> = None;
     let drag_id = ui.id().with("object-drag");
     let mut dragging: Option<u64> = ui.data(|data| data.get_temp(drag_id));
-    let mut sibling_rects: Vec<(u64, Rect)> = Vec::new();
+    let mut spots: Vec<Spot> = Vec::new();
     let color_id = ui.id().with("color-drag");
     let mut color_drag: Option<(u64, u64)> = ui.data(|data| data.get_temp(color_id));
     let mut color_rects: Vec<(u64, Rect)> = Vec::new();
@@ -55,20 +69,21 @@ pub(crate) fn show(ui: &mut egui::Ui, layers: &Layers, sent: &mut Vec<Sent>) {
             } else {
                 toggled_here
             };
-        object_row(ui, node, flags, open, &mut toggle, &mut dragging, sent);
-        if dragging.is_some_and(|id| {
-            rows.iter()
-                .find(|item| item.id == id)
-                .is_some_and(|item| item.parent == node.parent)
-        }) && let Some(rect) = ui.data(|data| data.get_temp::<Rect>(row_rect_id(ui, node.id)))
+        if pictures {
+            picture_row(ui, node, flags, open, &mut toggle, &mut dragging, sent);
+        } else {
+            object_row(ui, node, flags, open, &mut toggle, &mut dragging, sent);
+        }
+        if dragging.is_some()
+            && let Some(rect) = ui.data(|data| data.get_temp::<Rect>(row_rect_id(ui, node.id)))
         {
-            sibling_rects.push((node.id, rect));
+            spots.push(Spot { id: node.id, parent: node.parent, depth: node.depth, group: node.group, rect });
         }
         if !open {
             hidden_at = Some(node.depth);
             continue;
         }
-        if node.group {
+        if node.group || pictures {
             continue;
         }
         for color in &node.colors {
@@ -88,7 +103,7 @@ pub(crate) fn show(ui: &mut egui::Ui, layers: &Layers, sent: &mut Vec<Sent>) {
         }
     }
 
-    if finish_object_drag(ui, dragging, &sibling_rects, &layers.reorder, sent) {
+    if finish_object_drag(ui, dragging, &spots, layers, sent) {
         dragging = None;
     }
     if finish_color_drag(ui, color_drag, &color_rects, Some(&layers.sort_color), sent) {
@@ -163,13 +178,47 @@ fn object_row(
     let lock_x = rect.right() - S.of(22.0);
     let eye_x = lock_x - S.of(24.0);
     let name_rect = Rect::from_min_max(pos2(x, rect.top()), pos2(eye_x - S.of(4.0), rect.bottom()));
+    name_area(ui, node, name_rect, name_rect, dragging, sent);
+    flag_button(
+        ui,
+        Flag::Eye,
+        flags,
+        node.visible,
+        &node.toggle_visible,
+        eye_x,
+        rect,
+        sent,
+    );
+    flag_button(
+        ui,
+        Flag::Lock,
+        flags,
+        node.locked,
+        &node.toggle_locked,
+        lock_x,
+        rect,
+        sent,
+    );
+}
+
+/// A row's name: renamed in place by a double-click or its menu, clicked to
+/// select, dragged to reorder, and right-clicked for its menu. `area` takes
+/// the pointer; the name is drawn in `name_rect`.
+fn name_area(
+    ui: &mut egui::Ui,
+    node: &LayerRow,
+    name_rect: Rect,
+    area: Rect,
+    dragging: &mut Option<u64>,
+    sent: &mut Vec<Sent>,
+) {
     let target = Renaming::Node(node.id);
     let renamed = rename_field(ui, target, name_rect, &node.name, |name| {
         sent.push(Sent::Run(node.rename.with_value(json!(name))));
     });
     if !renamed {
         let response = ui.interact(
-            name_rect,
+            area,
             ui.id().with(("layer", node.id)),
             Sense::click_and_drag(),
         );
@@ -201,26 +250,133 @@ fn object_row(
             *dragging = Some(node.id);
         }
     }
-    flag_button(
-        ui,
-        Flag::Eye,
-        flags,
-        node.visible,
-        &node.toggle_visible,
-        eye_x,
-        rect,
-        sent,
+}
+
+/// The "Layers" heading over the list, with its icon buttons at the right,
+/// as the asset-editor mockup shows add, group, and delete.
+fn heading(ui: &mut egui::Ui, actions: &[HeadingAction], sent: &mut Vec<Sent>) {
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(vec2(width, HEADING_H), Sense::hover());
+    ui.painter().text(
+        pos2(rect.left(), rect.center().y),
+        Align2::LEFT_CENTER,
+        "Layers",
+        widgets::semibold(14.5),
+        TEXT,
     );
-    flag_button(
-        ui,
-        Flag::Lock,
-        flags,
-        node.locked,
-        &node.toggle_locked,
-        lock_x,
-        rect,
-        sent,
-    );
+    let mut right = rect.right();
+    for (index, action) in actions.iter().enumerate().rev() {
+        let spot = Rect::from_min_max(pos2(right - HEADING_BUTTON, rect.top()), pos2(right, rect.bottom()));
+        right = spot.left();
+        let sense = if action.enabled { Sense::click() } else { Sense::hover() };
+        let response = ui
+            .interact(spot, ui.id().with(("layers-heading", index)), sense)
+            .on_hover_text(&action.tip);
+        let color = match (action.enabled, response.hovered()) {
+            (true, true) => toolbar::ICON_ACTIVE,
+            (true, false) => toolbar::ICON,
+            (false, _) => toolbar::ICON_QUIET,
+        };
+        toolbar::paint_icon(ui.painter(), spot.center(), &action.icon, 18.0, color);
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, action.enabled, &action.tip));
+        if action.enabled && response.clicked() {
+            sent.push(Sent::Run(action.action.clone()));
+        }
+    }
+    let (line, _) = ui.allocate_exact_size(vec2(width, 1.0), Sense::hover());
+    ui.painter().hline(line.x_range(), line.center().y, Stroke::new(1.0, ROW_RULE));
+}
+
+/// The heading's height and each of its buttons' width.
+const HEADING_H: f32 = 40.0;
+const HEADING_BUTTON: f32 = 34.0;
+/// A row with a picture, as tall as the mockup's.
+const PICTURE_ROW: f32 = 52.0;
+/// The picture's box in a row.
+const THUMB: egui::Vec2 = vec2(56.0, 38.0);
+/// The hairline between rows.
+const ROW_RULE: Color32 = Color32::from_rgb(238, 240, 243);
+/// A chosen row with a picture, pale blue as the mockup's Background Photo.
+const PICKED: Color32 = Color32::from_rgb(226, 236, 252);
+const PICKED_EDGE: Color32 = Color32::from_rgb(37, 99, 235);
+
+/// A row as the asset-editor mockup draws it: the eye, the layer's picture
+/// in a small box, its name, and its lock when it is locked or the pointer is
+/// over the row. A group shows its icon in the box and a disclosure arrow.
+#[allow(clippy::too_many_arguments)]
+fn picture_row(
+    ui: &mut egui::Ui,
+    node: &LayerRow,
+    flags: &FlagIcons,
+    open: bool,
+    toggle: &mut Option<u64>,
+    dragging: &mut Option<u64>,
+    sent: &mut Vec<Sent>,
+) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), PICTURE_ROW), Sense::hover());
+    ui.data_mut(|data| data.insert_temp(row_rect_id(ui, node.id), rect));
+    let hovered = ui.rect_contains_pointer(rect);
+    if node.selected {
+        ui.painter().rect_filled(rect.shrink2(vec2(0.0, 1.0)), 8.0, PICKED);
+    } else {
+        ui.painter().hline(
+            (rect.left() + 4.0)..=(rect.right() - 4.0),
+            rect.bottom() - 0.5,
+            Stroke::new(1.0, ROW_RULE),
+        );
+    }
+    flag_button(ui, Flag::Eye, flags, node.visible, &node.toggle_visible, rect.left() + 2.0, rect, sent);
+    // Every row keeps room for a group's disclosure triangle, and each level
+    // indents further than that room, so a group's layers sit clearly
+    // inside it rather than level with its picture.
+    let x0 = rect.left() + 34.0 + node.depth as f32 * 20.0;
+    if node.group {
+        let spot = Rect::from_min_size(pos2(x0 - 2.0, rect.top()), vec2(14.0, PICTURE_ROW));
+        let response = ui.interact(spot, ui.id().with(("disclose", node.id)), Sense::click_and_drag());
+        disclosure(ui.painter(), spot.center(), open, if response.hovered() { TEXT } else { MUTED });
+        if response.clicked() {
+            *toggle = Some(node.id);
+        }
+    }
+    let x = x0 + 14.0;
+    let frame = Rect::from_min_size(pos2(x, rect.center().y - THUMB.y / 2.0), THUMB);
+    let edge = if node.selected { PICKED_EDGE } else { BORDER };
+    ui.painter().rect_filled(frame, 4.0, Color32::WHITE);
+    match &node.thumbnail {
+        Some(thumbnail) => {
+            let inside = frame.shrink(1.0);
+            let size = vec2(thumbnail.width.max(1) as f32, thumbnail.height.max(1) as f32);
+            let scale = (inside.width() / size.x).min(inside.height() / size.y);
+            let picture = Rect::from_center_size(inside.center(), size * scale);
+            let painter = ui.painter().with_clip_rect(inside);
+            match crate::raster::raw_picture(
+                ui.ctx(),
+                &thumbnail.path,
+                thumbnail.width,
+                thumbnail.height,
+                thumbnail.revision,
+            ) {
+                Some((texture, opaque)) => {
+                    if !opaque {
+                        crate::raster::checker(ui.ctx(), &painter, picture);
+                    }
+                    painter.image(texture, picture, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                }
+                None => crate::raster::checker(ui.ctx(), &painter, picture),
+            }
+        }
+        None => toolbar::paint_icon(ui.painter(), frame.center(), &node.icon, 18.0, TEXT),
+    }
+    ui.painter().rect_stroke(frame, 4.0, Stroke::new(1.0, edge), egui::StrokeKind::Inside);
+    let lock_x = rect.right() - 30.0;
+    let name_rect = Rect::from_min_max(pos2(frame.right() + 12.0, rect.top()), pos2(lock_x - 4.0, rect.bottom()));
+    // The whole row between the eye and the lock takes the pointer, so the
+    // picture is clicked and dragged as the name is.
+    let area = Rect::from_min_max(pos2(frame.left(), rect.top()), name_rect.max);
+    name_area(ui, node, name_rect, area, dragging, sent);
+    if node.locked || hovered {
+        flag_button(ui, Flag::Lock, flags, node.locked, &node.toggle_locked, lock_x, rect, sent);
+    }
 }
 
 /// Where a palette row is drawn: under its canvas in the outliner, or in an
@@ -358,49 +514,102 @@ fn color_row(
     name_rect
 }
 
-fn finish_object_drag(
-    ui: &mut egui::Ui,
-    dragging: Option<u64>,
-    rects: &[(u64, Rect)],
-    reorder: &Action,
-    sent: &mut Vec<Sent>,
-) -> bool {
+/// A row drawn this frame, as a drag sees it.
+#[derive(Clone, Copy, Debug)]
+struct Spot {
+    id: u64,
+    parent: Option<u64>,
+    depth: u32,
+    group: bool,
+    rect: Rect,
+}
+
+/// Where a dragged row would go: under `parent`, `value` rows from the top
+/// of its children, as `reorder` says it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Drop {
+    parent: Option<u64>,
+    value: usize,
+    /// Dropped on the middle of a group's row, which is then marked whole.
+    into: Option<Rect>,
+    /// Where the line between rows is drawn, when it is not `into`.
+    line: f32,
+}
+
+/// Where `dragged` goes when let go at height `y`, or nothing when it would
+/// stay where it is. Without `nest`, only among its siblings.
+fn drop_place(spots: &[Spot], dragged: u64, y: f32, nest: bool) -> Option<Drop> {
+    let at = spots.iter().position(|spot| spot.id == dragged)?;
+    let me = spots[at];
+    // The dragged row's own rows, below it and deeper, are no place for it.
+    let inside = spots[at + 1..].iter().take_while(|spot| spot.depth > me.depth).count();
+    let others: Vec<Spot> = spots
+        .iter()
+        .enumerate()
+        .filter(|(index, spot)| {
+            *index != at && (if nest { *index <= at || *index > at + inside } else { spot.parent == me.parent })
+        })
+        .map(|(_, spot)| *spot)
+        .collect();
+    let now = spots[..at].iter().filter(|spot| spot.parent == me.parent).count();
+    let stays = |parent: Option<u64>, value: usize| parent == me.parent && value == now;
+    if nest
+        && let Some(group) = others.iter().find(|spot| {
+            spot.group && y > spot.rect.top() + spot.rect.height() / 4.0 && y < spot.rect.bottom() - spot.rect.height() / 4.0
+        })
+    {
+        let parent = Some(group.id);
+        return (!stays(parent, 0)).then_some(Drop { parent, value: 0, into: Some(group.rect), line: y });
+    }
+    let gap = others.iter().filter(|spot| spot.rect.center().y < y).count();
+    let (parent, value) = match others.get(gap) {
+        _ if !nest => (me.parent, gap),
+        Some(below) => (below.parent, others[..gap].iter().filter(|spot| spot.parent == below.parent).count()),
+        None => (None, others.iter().filter(|spot| spot.parent.is_none()).count()),
+    };
+    if stays(parent, value) {
+        return None;
+    }
+    let line = match others.get(gap) {
+        Some(spot) => spot.rect.top(),
+        None => others.last().map(|spot| spot.rect.bottom()).unwrap_or(me.rect.center().y),
+    };
+    Some(Drop { parent, value, into: None, line })
+}
+
+fn finish_object_drag(ui: &mut egui::Ui, dragging: Option<u64>, spots: &[Spot], layers: &Layers, sent: &mut Vec<Sent>) -> bool {
     let Some(id) = dragging else {
         return false;
     };
     let Some(pointer) = ui.input(|input| input.pointer.interact_pos()) else {
         return false;
     };
-    let Some(from) = rects.iter().position(|(node, _)| *node == id) else {
+    let Some(me) = spots.iter().find(|spot| spot.id == id) else {
         return false;
     };
-    let others: Vec<Rect> = rects
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| *index != from)
-        .map(|(_, (_, rect))| *rect)
-        .collect();
-    let target = others
-        .iter()
-        .filter(|rect| rect.center().y < pointer.y)
-        .count();
-    let y = rects[from].1.center().y;
-    if target != from {
-        let mark = match others.get(target) {
-            Some(rect) => rect.top(),
-            None => others.last().map(|rect| rect.bottom()).unwrap_or(y),
-        };
-        ui.painter().hline(
-            (rects[from].1.left() - S.of(8.0))..=(rects[from].1.right()),
-            mark,
-            Stroke::new(S.of(2.0), widgets::INK),
-        );
+    let drop = drop_place(spots, id, pointer.y, layers.nest);
+    match drop.and_then(|drop| drop.into) {
+        Some(group) => {
+            ui.painter().rect_stroke(group.shrink(1.0), S.of(4.0), Stroke::new(S.of(2.0), widgets::INK), egui::StrokeKind::Inside);
+        }
+        None => {
+            if let Some(drop) = drop {
+                ui.painter().hline(
+                    (me.rect.left() - S.of(8.0))..=(me.rect.right()),
+                    drop.line,
+                    Stroke::new(S.of(2.0), widgets::INK),
+                );
+            }
+        }
     }
     if ui.input(|input| input.pointer.any_released()) {
-        if target != from {
-            let mut action = reorder.with_value(json!(target));
+        if let Some(drop) = drop {
+            let mut action = layers.reorder.with_value(json!(drop.value));
             if let Some(serde_json::Value::Object(arg)) = action.arg.as_mut() {
                 arg.insert("node".to_string(), json!(id));
+                if layers.nest {
+                    arg.insert("parent".to_string(), json!(drop.parent));
+                }
             }
             sent.push(Sent::Run(action));
         }

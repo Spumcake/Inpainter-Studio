@@ -1463,6 +1463,7 @@ impl Surface {
         if !doc.text_editing() {
             self.editor_rect = None;
         }
+        let mut ring = None;
         if self.pan.is_some() {
             response.on_hover_cursor(CursorIcon::Grabbing);
         } else if space && !doc.text_editing() {
@@ -1473,10 +1474,25 @@ impl Surface {
             response.on_hover_cursor(self.select_cursor(ui, doc, rect));
         } else if doc.mode() == Mode::Text {
             response.on_hover_cursor(self.text_cursor(ui, doc, rect));
+        } else if let Some(width) = doc.tool_width() {
+            // The brush and eraser show a ring of their size in place of the
+            // pointer, as on a raster tab, as the owner asked on
+            // 2026-10-30. It is drawn over the drawing, below.
+            response.on_hover_cursor(CursorIcon::None);
+            ring = ui
+                .input(|input| input.pointer.hover_pos())
+                .filter(|pos| rect.contains(*pos))
+                // A small brush still shows a ring the eye can find.
+                .map(|pos| (pos, ((width / 2.0) as f32).max(3.0)));
         } else {
             response.on_hover_cursor(CursorIcon::Crosshair);
         }
         self.paint(ui, doc, rect);
+        if let Some((pos, radius)) = ring {
+            let painter = ui.painter().with_clip_rect(rect);
+            widgets::ring(&painter, pos, radius, 1.0, Color32::from_black_alpha(160));
+            widgets::ring(&painter, pos, radius + 1.0, 1.0, Color32::from_white_alpha(200));
+        }
     }
 }
 

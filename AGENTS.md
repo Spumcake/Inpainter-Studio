@@ -13,6 +13,7 @@ The stack is Rust, egui through eframe, and Iconoir icons.
 - `apps/<id>/` — one sub-application per folder: its crate, its `manifest.json`, and its own `AGENTS.md`. It depends on `protocol`, and on `draw` when it uses the drawing surface, never on the host or another sub-application.
 - `apps/template/` — the smallest correct sub-application. New ones are copied from it.
 - `apps/mission-control/` — notebooks. It stores cells and declares them. The host draws and runs them.
+- `apps/image-editor/` — layered pictures. It owns every pixel, layer, and step of history, composites the picture, and declares a raster tab; the host draws it, previews strokes, and sends gestures. Its `.ipx` format is in its own AGENTS.md.
 - `.project/scripts/check.sh` — the one check to run before calling work done (see Working rules).
 - `client/` — `sketch-client`, the no-host check: it drives `simple-sketch` through the protocol alone, including every skill tool, one undo per request, and `open` and `keep`, and compares every reply with an in-process session. Its coverage check fails when a hand action that changes a sketch has no tool.
 

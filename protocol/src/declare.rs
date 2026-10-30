@@ -168,6 +168,38 @@ pub enum ToolItem {
         set: Action,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         finish: Option<Action>,
+        /// Written after the value, such as "px" or "%".
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        suffix: String,
+    },
+    /// Gray words, such as a control's caption, or, `strong`, a value.
+    Label {
+        text: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        strong: bool,
+    },
+    /// The current colour, as a round chip. A click opens a palette of
+    /// swatches; a choice sends `set` with `{"value": [r, g, b]}`.
+    Color { rgb: [u8; 3], tip: String, set: Action },
+    /// A caption and a switch. A click sends `action`.
+    Switch { caption: String, on: bool, action: Action },
+    /// Words in one bordered row, the chosen one shaded. A click sends `set`
+    /// with `{"value": index}`.
+    Segmented { options: Vec<String>, selected: usize, set: Action },
+    /// A caption and a dropdown of words. A choice sends `set` with
+    /// `{"value": index}`.
+    Choice { caption: String, options: Vec<String>, selected: usize, set: Action },
+    /// A caption and a number that can be typed, with its suffix. A change
+    /// sends `set` with `{"value": n}`.
+    Number { caption: String, value: f64, min: f64, max: f64, suffix: String, set: Action },
+    /// A button of words, bordered, or `dark` for the one that commits.
+    Push {
+        label: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        dark: bool,
+        #[serde(default = "yes")]
+        enabled: bool,
+        action: Action,
     },
     /// The host window's maximize toggle.
     Maximize {
@@ -198,6 +230,13 @@ pub struct Toolbar {
     pub items: Vec<ToolItem>,
     #[serde(default)]
     pub trailing: Vec<ToolItem>,
+    /// A second row under the toolbar: the chosen tool's settings, as the
+    /// image-editor views show. None of it is drawn when both are empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<ToolItem>,
+    /// Pinned to that row's right, laid out from its right edge.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options_trailing: Vec<ToolItem>,
 }
 
 /// A property's value, as the panel shows it and sends it back.
@@ -260,6 +299,9 @@ pub enum RowKind {
         quick: Vec<[u8; 3]>,
     },
     Curve,
+    /// A row of icons that each turn on and off, such as a layer's locks.
+    /// A click sends `property` with the icon's index as `Index`.
+    Icons { icons: Vec<IconToggle> },
     /// An object's colors, as the same rows the outliner draws.
     Palette {
         owner: u64,
@@ -278,6 +320,14 @@ pub struct Row {
     #[serde(flatten)]
     pub kind: RowKind,
     pub value: PropValue,
+}
+
+/// One icon of an `Icons` row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IconToggle {
+    pub icon: String,
+    pub tip: String,
+    pub on: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -332,17 +382,54 @@ pub struct LayerRow {
     pub menu: Vec<MenuEntry>,
     #[serde(default)]
     pub colors: Vec<ColorRow>,
+    /// A small picture of the layer, drawn in place of its icon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<crate::Thumbnail>,
 }
 
 /// The outliner. Dragging a row among its siblings sends `reorder` with
-/// `{"node": id, "value": position}`; a color among its canvas's colors
-/// sends `sort_color` with `{"color": id, "value": position}`.
+/// `{"node": id, "value": position}`, the position counted from the top;
+/// a color among its canvas's colors sends `sort_color` with
+/// `{"color": id, "value": position}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Layers {
     pub rows: Vec<LayerRow>,
     pub reorder: Action,
     pub sort_color: Action,
     pub flags: FlagIcons,
+    /// Rows can also be dragged into and out of groups: a row dropped on the
+    /// middle of a group's row goes to the top of that group, and one dropped
+    /// between rows goes there, under the parent of the row below the drop.
+    /// `reorder` then also carries `"parent"`: the group's id, or null for
+    /// the top level.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub nest: bool,
+    /// A "Layers" heading with these icon buttons at its right, such as
+    /// add, group, and delete. With none, no heading is drawn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<HeadingAction>,
+}
+
+/// An icon button on the Layers heading.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeadingAction {
+    pub icon: String,
+    pub tip: String,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    pub action: Action,
+}
+
+/// A page tab at the top of the panel. A page that is not enabled is drawn
+/// lighter and does nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PanelPage {
+    pub label: String,
+    pub active: bool,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<Action>,
 }
 
 /// The icons a row's eye and lock are drawn with, shown and hidden, locked
@@ -375,6 +462,11 @@ pub struct Properties {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layers: Option<Layers>,
     pub sections: Vec<Section>,
+    /// Page tabs across the panel's top, as the asset-editor mockup shows.
+    /// With pages, the panel draws the tabs, then the sections, then the
+    /// layers, so a layer's settings sit above the list of layers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pages: Vec<PanelPage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -308,10 +308,13 @@ pub(crate) fn icon_button(
     )
 }
 
-/// Draws the selected tab's toolbar, or the empty bar when it declares none.
-/// The trailing group is laid out first, from the right edge, so a narrow
-/// window scrolls the other groups instead. Returns the actions chosen.
-pub(crate) fn show(ui: &mut egui::Ui, toolbar: Option<&Toolbar>) -> Vec<Action> {
+/// Draws the selected tab's toolbar, or the empty bar when it declares none,
+/// and under it the settings row when the toolbar declares one. The trailing
+/// group is laid out first, from the right edge, so a narrow window scrolls
+/// the other groups instead. The settings row's trailing group ends
+/// `options_inset` short of the right edge, above the contents' own edge
+/// when the panel is open. Returns the actions chosen.
+pub(crate) fn show(ui: &mut egui::Ui, toolbar: Option<&Toolbar>, options_inset: f32) -> Vec<Action> {
     let mut chosen = Vec::new();
     let empty = Toolbar::default();
     let toolbar = toolbar.unwrap_or(&empty);
@@ -355,8 +358,341 @@ pub(crate) fn show(ui: &mut egui::Ui, toolbar: Option<&Toolbar>) -> Vec<Action> 
             });
         });
     let rect = bar.response.rect;
-    hairline(ui, rect.left(), rect.right(), rect.bottom());
+    // The views draw no line between the toolbar and its settings row, only
+    // under the row.
+    if toolbar.options.is_empty() && toolbar.options_trailing.is_empty() {
+        hairline(ui, rect.left(), rect.right(), rect.bottom());
+    } else {
+        options_row(ui, toolbar, options_inset, &mut chosen);
+    }
     chosen
+}
+
+/// A settings-row control's height: the views draw them smaller than the
+/// toolbar's buttons.
+const OPTION: f32 = 28.0;
+/// Space above and below the settings row's controls: the row is 40 tall.
+const OPTION_MARGIN: i8 = 6;
+/// Space between the settings row's controls, and between a caption and
+/// its control.
+const OPTION_GAP: f32 = 14.0;
+const CAPTION_GAP: f32 = 10.0;
+/// The settings row's words.
+const OPTION_TEXT: f32 = 13.5;
+/// A switch that is on, as brush.png draws Pen pressure.
+const SWITCH_ON: Color32 = Color32::from_rgb(37, 99, 235);
+
+fn option_font() -> FontId {
+    FontId::proportional(OPTION_TEXT)
+}
+
+/// The chosen tool's settings, as a second white row under the toolbar.
+fn options_row(ui: &mut egui::Ui, toolbar: &Toolbar, inset: f32, chosen: &mut Vec<Action>) {
+    let row = egui::Frame::new()
+        .fill(Color32::WHITE)
+        .inner_margin(egui::Margin::symmetric(12, OPTION_MARGIN))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_height(OPTION);
+            ui.spacing_mut().item_spacing.x = OPTION_GAP;
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if inset > 0.0 {
+                    // The frame's own margin already stands in for the gap.
+                    ui.add_space((inset - OPTION_GAP).max(0.0));
+                }
+                for item in toolbar.options_trailing.iter().rev() {
+                    option_ui(ui, item, chosen);
+                }
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.set_height(OPTION);
+                    for item in &toolbar.options {
+                        option_ui(ui, item, chosen);
+                    }
+                });
+            });
+        });
+    let rect = row.response.rect;
+    hairline(ui, rect.left(), rect.right(), rect.bottom());
+}
+
+/// One settings-row item, drawn at the row's size. Items the views do not
+/// show in the row are drawn as the toolbar draws them.
+fn option_ui(ui: &mut egui::Ui, item: &ToolItem, chosen: &mut Vec<Action>) {
+    match item {
+        ToolItem::Separator => {
+            let (rect, _) = ui.allocate_exact_size(vec2(1.0, OPTION), Sense::hover());
+            ui.painter().vline(
+                rect.center().x,
+                (rect.center().y - 10.0)..=(rect.center().y + 10.0),
+                Stroke::new(1.0, SEPARATOR),
+            );
+        }
+        ToolItem::Label { text, strong } => {
+            let color = if *strong { widgets::TEXT } else { widgets::MUTED };
+            caption(ui, text, color);
+        }
+        ToolItem::Color { rgb, tip, set } => color_chip(ui, *rgb, tip, set, chosen),
+        ToolItem::Slider {
+            caption,
+            width,
+            value,
+            min,
+            max,
+            tint,
+            set,
+            finish,
+            suffix,
+        } => {
+            let tint = tint.map_or(widgets::INK, |rgb| Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+            let id = ui.id().with(("option-slider", caption.as_str()));
+            let look = SliderLook {
+                height: OPTION,
+                caption: widgets::MUTED,
+                suffix: spaced(suffix),
+            };
+            let edit = bar_slider(ui, id, caption, *width, *value, (*min, *max), tint, &look);
+            slider_actions(edit, set, finish.as_ref(), chosen);
+        }
+        ToolItem::Switch { caption: words, on, action } => {
+            let font = option_font();
+            let text_w = ui.painter().layout_no_wrap(words.clone(), font.clone(), widgets::MUTED).size().x;
+            let (rect, response) =
+                ui.allocate_exact_size(vec2(text_w + CAPTION_GAP + 34.0, OPTION), Sense::click());
+            ui.painter().text(rect.left_center(), Align2::LEFT_CENTER, words, font, widgets::MUTED);
+            let track = Rect::from_min_size(
+                pos2(rect.right() - 34.0, rect.center().y - 10.0),
+                vec2(34.0, 20.0),
+            );
+            ui.painter().rect_filled(track, 10.0, if *on { SWITCH_ON } else { widgets::RAIL });
+            let knob = if *on { track.right() - 10.0 } else { track.left() + 10.0 };
+            widgets::disc(ui.painter(), pos2(knob, track.center().y), 7.5, Color32::WHITE);
+            response.widget_info(|| {
+                egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, *on, words)
+            });
+            if response.clicked() {
+                chosen.push(action.clone());
+            }
+        }
+        ToolItem::Segmented { options, selected, set } => segmented_words(ui, options, *selected, set, chosen),
+        ToolItem::Choice {
+            caption: words,
+            options,
+            selected,
+            set,
+        } => {
+            let font = option_font();
+            let widest = options
+                .iter()
+                .map(|option| ui.painter().layout_no_wrap(option.clone(), font.clone(), widgets::TEXT).size().x)
+                .fold(0.0, f32::max);
+            let rect = captioned(ui, words, (widest + 48.0).max(92.0));
+            let labels: Vec<&str> = options.iter().map(String::as_str).collect();
+            let text = labels.get(*selected).copied().unwrap_or_default();
+            let id = ui.id().with(("option-choice", words.as_str()));
+            if let Some(index) =
+                widgets::dropdown(ui, rect, id, text, &labels, Some(*selected), None, widgets::Scale(1.0))
+                && index != *selected
+            {
+                chosen.push(set.with_value(json!(index)));
+            }
+        }
+        ToolItem::Number {
+            caption: words,
+            value,
+            min,
+            max,
+            suffix,
+            set,
+        } => {
+            // Whole numbers unless the declared value or range has a fraction.
+            let places: u8 = if [*value, *min, *max].iter().all(|number| number.fract() == 0.0) { 0 } else { 1 };
+            let scale = 10f64.powi(i32::from(places));
+            let rect = captioned(ui, words, 64.0);
+            let id = ui.id().with(("option-number", words.as_str()));
+            let shown = |number: f64| (number * scale).round() as i32;
+            let edit = widgets::number_field(
+                ui,
+                rect,
+                id,
+                shown(*value),
+                (shown(*min), shown(*max)),
+                &spaced(suffix),
+                false,
+                places,
+                widgets::Scale(1.0),
+            );
+            if let Some(next) = edit.value
+                && next != shown(*value)
+            {
+                chosen.push(set.with_value(json!(f64::from(next) / scale)));
+            }
+        }
+        ToolItem::Push {
+            label,
+            dark,
+            enabled,
+            action,
+        } => {
+            let font = option_font();
+            let text_w = ui.painter().layout_no_wrap(label.clone(), font.clone(), widgets::TEXT).size().x;
+            let sense = if *enabled { Sense::click() } else { Sense::hover() };
+            let (rect, response) = ui.allocate_exact_size(vec2((text_w + 28.0).max(64.0), OPTION), sense);
+            let hovered = *enabled && response.hovered();
+            let (fill, edge, text) = match (*dark, *enabled) {
+                (true, true) => (if hovered { ICON } else { widgets::INK }, widgets::INK, Color32::WHITE),
+                (true, false) => (ICON_QUIET, ICON_QUIET, Color32::WHITE),
+                (false, true) => (if hovered { widgets::SELECTED } else { Color32::WHITE }, widgets::BORDER, widgets::TEXT),
+                (false, false) => (Color32::WHITE, widgets::BORDER, ICON_QUIET),
+            };
+            widgets::outlined(ui.painter(), rect, 6.0, fill, edge);
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, font, text);
+            response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, *enabled, label));
+            if *enabled && response.clicked() {
+                chosen.push(action.clone());
+            }
+        }
+        ToolItem::Inset
+        | ToolItem::Swatches { .. }
+        | ToolItem::Button { .. }
+        | ToolItem::Menu { .. }
+        | ToolItem::Maximize { .. } => item_ui(ui, item, chosen),
+    }
+}
+
+/// Words in the settings row, such as a control's caption.
+fn caption(ui: &mut egui::Ui, text: &str, color: Color32) {
+    let font = option_font();
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, color);
+    let (rect, _) = ui.allocate_exact_size(vec2(galley.size().x, OPTION), Sense::hover());
+    ui.painter().galley(pos2(rect.left(), rect.center().y - galley.size().y / 2.0), galley, color);
+}
+
+/// Room for a caption and a control `width` wide, taken as one piece so a
+/// right-hand group keeps the caption first. Paints the caption and returns
+/// the control's place.
+fn captioned(ui: &mut egui::Ui, words: &str, width: f32) -> Rect {
+    let font = option_font();
+    let galley = ui.painter().layout_no_wrap(words.to_string(), font, widgets::MUTED);
+    let lead = if words.is_empty() { 0.0 } else { galley.size().x + CAPTION_GAP };
+    let (rect, _) = ui.allocate_exact_size(vec2(lead + width, OPTION), Sense::hover());
+    if !words.is_empty() {
+        ui.painter().galley(pos2(rect.left(), rect.center().y - galley.size().y / 2.0), galley, widgets::MUTED);
+    }
+    Rect::from_min_max(pos2(rect.left() + lead, rect.top()), rect.max)
+}
+
+/// A unit after a number, as the views write them: "24 px", but "80%".
+fn spaced(suffix: &str) -> String {
+    if suffix.chars().next().is_some_and(char::is_alphabetic) {
+        format!(" {suffix}")
+    } else {
+        suffix.to_string()
+    }
+}
+
+/// Studio's swatches, then white, which painting needs and the palette lacks.
+fn chip_palette() -> Vec<[u8; 3]> {
+    let mut colors: Vec<[u8; 3]> = draw::defaults::PALETTE.iter().map(|color| color.rgb).collect();
+    colors.push([255, 255, 255]);
+    colors
+}
+
+/// The current colour as a round chip. A click opens Studio's swatches and
+/// a picker on the menus' white card; a choice sends `set` with the colour.
+fn color_chip(ui: &mut egui::Ui, rgb: [u8; 3], tip: &str, set: &Action, chosen: &mut Vec<Action>) {
+    let (rect, response) = ui.allocate_exact_size(vec2(24.0, OPTION), Sense::click());
+    let color = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+    widgets::disc(ui.painter(), rect.center(), 10.0, color);
+    if u16::from(rgb[0]) + u16::from(rgb[1]) + u16::from(rgb[2]) > 3 * 236 {
+        widgets::ring(ui.painter(), rect.center(), 10.0, 1.0, widgets::BORDER);
+    }
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ColorButton, true, tip));
+    let response = response.on_hover_text(tip);
+    egui::Popup::menu(&response)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .gap(4.0)
+        .show(|ui| {
+            ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
+            ui.set_max_width(9.0 * 26.0);
+            ui.horizontal_wrapped(|ui| {
+                for swatch in chip_palette() {
+                    let (spot, picked) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
+                    let fill = Color32::from_rgb(swatch[0], swatch[1], swatch[2]);
+                    if swatch == rgb {
+                        widgets::ring(ui.painter(), spot.center(), 11.0, 1.5, fill);
+                    }
+                    widgets::disc(ui.painter(), spot.center(), 9.0, fill);
+                    widgets::ring(ui.painter(), spot.center(), 9.0, 1.0, widgets::BORDER);
+                    if picked.clicked() {
+                        chosen.push(set.with_value(json!(swatch)));
+                        ui.close();
+                    }
+                }
+            });
+            ui.separator();
+            let mut picked = color;
+            if egui::color_picker::color_picker_color32(ui, &mut picked, egui::color_picker::Alpha::Opaque)
+                && picked != color
+            {
+                chosen.push(set.with_value(json!([picked.r(), picked.g(), picked.b()])));
+            }
+        });
+}
+
+/// Words side by side in one bordered field, the chosen one shaded, as
+/// selection.png draws New, Add, Subtract, and Intersect. A click sends `set`
+/// with the word's index.
+fn segmented_words(ui: &mut egui::Ui, options: &[String], selected: usize, set: &Action, chosen: &mut Vec<Action>) {
+    let font = option_font();
+    let widths: Vec<f32> = options
+        .iter()
+        .map(|option| ui.painter().layout_no_wrap(option.clone(), font.clone(), widgets::TEXT).size().x + 22.0)
+        .collect();
+    let (rect, _) = ui.allocate_exact_size(vec2(widths.iter().sum::<f32>() + 4.0, OPTION), Sense::hover());
+    widgets::outlined(ui.painter(), rect, 6.0, Color32::WHITE, widgets::BORDER);
+    let mut x = rect.left() + 2.0;
+    for (index, option) in options.iter().enumerate() {
+        let cell = Rect::from_min_size(pos2(x, rect.top()), vec2(widths[index], OPTION));
+        x += widths[index];
+        let response = ui.interact(cell, ui.id().with(("option-segment", option.as_str(), index)), Sense::click());
+        if index == selected {
+            ui.painter().rect_filled(cell.shrink2(vec2(0.0, 3.0)), 4.0, widgets::SELECTED);
+        } else if response.hovered() {
+            ui.painter().rect_filled(cell.shrink2(vec2(0.0, 3.0)), 4.0, widgets::SELECTED.gamma_multiply(0.6));
+        }
+        // A divider between two words that are both unshaded.
+        if index > 0 && index != selected && index - 1 != selected {
+            ui.painter().vline(
+                cell.left(),
+                (cell.top() + 7.0)..=(cell.bottom() - 7.0),
+                Stroke::new(1.0, widgets::BORDER),
+            );
+        }
+        ui.painter().text(cell.center(), Align2::CENTER_CENTER, option, font.clone(), widgets::TEXT);
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, index == selected, option)
+        });
+        if response.clicked() && index != selected {
+            chosen.push(set.with_value(json!(index)));
+        }
+    }
+}
+
+/// A slider's edit as its declared actions: `set` with the value and whether
+/// it is still held, and `finish` on release.
+fn slider_actions(edit: BarEdit, set: &Action, finish: Option<&Action>, chosen: &mut Vec<Action>) {
+    if let Some((value, live)) = edit.value {
+        let mut action = set.with_value(json!(value));
+        if let Some(serde_json::Value::Object(arg)) = action.arg.as_mut() {
+            arg.insert("live".to_string(), json!(live));
+        }
+        chosen.push(action);
+    }
+    if edit.finished
+        && let Some(finish) = finish
+    {
+        chosen.push(finish.clone());
+    }
 }
 
 /// One declared item, drawn with the reference's widget for its kind.
@@ -403,24 +739,33 @@ fn item_ui(ui: &mut egui::Ui, item: &ToolItem, chosen: &mut Vec<Action>) {
             tint,
             set,
             finish,
+            suffix,
         } => {
             let tint = tint.map_or(widgets::INK, |rgb| {
                 Color32::from_rgb(rgb[0], rgb[1], rgb[2])
             });
             let id = ui.id().with(("bar-slider", caption.as_str()));
-            let edit = bar_slider(ui, id, caption, *width, *value, (*min, *max), tint);
-            if let Some((value, live)) = edit.value {
-                let mut action = set.with_value(json!(value));
-                if let Some(serde_json::Value::Object(arg)) = action.arg.as_mut() {
-                    arg.insert("live".to_string(), json!(live));
-                }
-                chosen.push(action);
-            }
-            if edit.finished
-                && let Some(finish) = finish
-            {
-                chosen.push(finish.clone());
-            }
+            let look = SliderLook {
+                height: ROW,
+                caption: ICON,
+                suffix: spaced(suffix),
+            };
+            let edit = bar_slider(ui, id, caption, *width, *value, (*min, *max), tint, &look);
+            slider_actions(edit, set, finish.as_ref(), chosen);
+        }
+        // The settings row's own controls, should a tab declare one in the
+        // toolbar itself.
+        ToolItem::Label { .. }
+        | ToolItem::Color { .. }
+        | ToolItem::Switch { .. }
+        | ToolItem::Segmented { .. }
+        | ToolItem::Choice { .. }
+        | ToolItem::Number { .. }
+        | ToolItem::Push { .. } => {
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                option_ui(ui, item, chosen);
+            });
         }
         ToolItem::Maximize {
             icon,
@@ -643,8 +988,17 @@ struct BarEdit {
     finished: bool,
 }
 
+/// How a slider is drawn where it sits: the toolbar's row or the settings
+/// row, with its caption's colour and the unit after its value.
+struct SliderLook {
+    height: f32,
+    caption: Color32,
+    suffix: String,
+}
+
 /// A caption, a slider, and its value as a number that can be typed, on one
 /// row. The Size control and the text tool's sliders are this one control.
+#[allow(clippy::too_many_arguments)]
 fn bar_slider(
     ui: &mut egui::Ui,
     id: egui::Id,
@@ -653,18 +1007,29 @@ fn bar_slider(
     value: i32,
     (min, max): (i32, i32),
     tint: Color32,
+    look: &SliderLook,
 ) -> BarEdit {
-    let (rect, _) = ui.allocate_exact_size(vec2(width, ROW), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(vec2(width, look.height), Sense::hover());
     let caption_rect = ui.painter().text(
         rect.left_center(),
         Align2::LEFT_CENTER,
         caption,
         FontId::proportional(13.5),
-        ICON,
+        look.caption,
     );
+    // The value takes room for its widest number and its unit.
+    let unit_w = if look.suffix.is_empty() {
+        0.0
+    } else {
+        ui.painter()
+            .layout_no_wrap(look.suffix.clone(), FontId::proportional(13.5), ICON)
+            .size()
+            .x
+    };
+    let value_w = 32.0 + unit_w;
     let track = Rect::from_min_max(
         pos2(caption_rect.right() + 10.0, rect.top()),
-        pos2(rect.right() - 32.0, rect.bottom()),
+        pos2(rect.right() - value_w, rect.bottom()),
     );
     let value_rect = Rect::from_min_max(pos2(track.right() + 6.0, rect.top()), rect.max);
     let span = (max - min).max(1) as f32;
@@ -704,7 +1069,8 @@ fn bar_slider(
         egui::DragValue::new(&mut typed)
             .range(min..=max)
             .speed(0.08)
-            .max_decimals(0),
+            .max_decimals(0)
+            .suffix(look.suffix.as_str()),
     );
     if typed_response.changed() {
         edit.value = Some((typed.clamp(min, max), typed_response.dragged()));

@@ -94,6 +94,8 @@ fn quill_program(dir: &Path) -> PathBuf {
 mod cells_checks;
 mod settings_checks;
 mod image_checks;
+mod editor_checks;
+mod raster_checks;
 
 /// A folder of the check's own, which it removes when done.
 fn scratch(name: &str) -> PathBuf {
@@ -325,6 +327,8 @@ struct Window {
     texts: Vec<(String, Rect)>,
     /// Where the last frame painted pictures, larger than the logo.
     pictures: Vec<Rect>,
+    /// Everything the last frame painted.
+    shapes: Vec<egui::epaint::ClippedShape>,
 }
 
 impl Window {
@@ -345,6 +349,7 @@ impl Window {
             close_next: false,
         texts: Vec::new(),
         pictures: Vec::new(),
+        shapes: Vec::new(),
             events: Vec::new(),
         };
         // Every application here declares skills just after its greeting.
@@ -374,6 +379,7 @@ impl Window {
         let Self { ctx, app, frame, .. } = self;
         let mut output = ctx.run_ui(input, |ui| app.ui(ui, frame));
         output.textures_delta.clear();
+        self.shapes = output.shapes.clone();
         self.texts = output
             .shapes
             .iter()
@@ -724,6 +730,7 @@ fn project_window(specs: Vec<super::AppSpec>, stand_in: &StandIn, data: &Path) -
         close_next: false,
         texts: Vec::new(),
         pictures: Vec::new(),
+        shapes: Vec::new(),
         events: Vec::new(),
     };
     window.until(|app| {

@@ -275,6 +275,8 @@ impl Server {
                     replies.push(request);
                 }
             }
+            // A raster tab's gesture is another application's.
+            HostMessage::RasterGesture { .. } => {}
             HostMessage::Gesture { tab, gesture } => {
                 // A gesture is always answered with the document, even when
                 // it changed nothing, so the host's preview of it can end.

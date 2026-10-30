@@ -90,8 +90,27 @@ pub(crate) fn show(ui: &mut egui::Ui, properties: Option<&Properties>, rect: Rec
                 ui.add_space(PAD);
                 return;
             };
+            // With page tabs, as the asset-editor mockup shows: the tabs,
+            // then the chosen layer's settings, then the list of layers.
+            if !properties.pages.is_empty() {
+                page_tabs(ui, &properties.pages, &mut sent);
+                for (index, section) in properties.sections.iter().enumerate() {
+                    draw_section(ui, &section.title, &section.rows, &properties.finish, index == 0, &mut sent);
+                }
+                if let Some(layers) = &properties.layers {
+                    if !properties.sections.is_empty() {
+                        ui.add_space(S.of(14.0));
+                        let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+                        ui.painter().hline(line.x_range(), line.center().y, Stroke::new(1.0, BORDER));
+                        ui.add_space(S.of(4.0));
+                    }
+                    crate::outliner::show(ui, layers, true, &mut sent);
+                }
+                ui.add_space(PAD);
+                return;
+            }
             if let Some(layers) = &properties.layers {
-                crate::outliner::show(ui, layers, &mut sent);
+                crate::outliner::show(ui, layers, false, &mut sent);
             }
             // A page opened from another, such as a color from an object's
             // palette or the outliner, starts with the way back to it.
@@ -169,6 +188,103 @@ pub(crate) fn toggle_tab(
         });
     clicked
 }
+
+/// The page tabs' height, and the space above them.
+const PAGE_H: f32 = S.of(40.0);
+const PAGE_TOP: f32 = S.of(14.0);
+/// A page tab's words, and the room on either side of them.
+const PAGE_TEXT: f32 = S.of(15.5);
+const PAGE_PAD: f32 = S.of(14.0);
+
+/// Page tabs across the panel's top, as the asset-editor mockup shows: the
+/// chosen page underlined, the others in gray,
+/// and a page that waits lighter still. A click on another page that can be
+/// used sends its action.
+fn page_tabs(ui: &mut egui::Ui, pages: &[protocol::PanelPage], sent: &mut Vec<Sent>) {
+    ui.add_space(PAGE_TOP);
+    let width = ui.available_width();
+    let (row, _) = ui.allocate_exact_size(vec2(width, PAGE_H), Sense::hover());
+    let font = |active: bool| {
+        if active {
+            widgets::semibold(PAGE_TEXT)
+        } else {
+            egui::FontId::proportional(PAGE_TEXT)
+        }
+    };
+    let galleys: Vec<_> = pages
+        .iter()
+        .map(|page| ui.painter().layout_no_wrap(page.label.clone(), font(page.active), TEXT))
+        .collect();
+    let words: f32 = galleys.iter().map(|galley| galley.size().x).sum();
+    // Narrow panels squeeze the room around the words before the words.
+    let pad = PAGE_PAD.min(((width - words) / (2.0 * pages.len().max(1) as f32)).max(S.of(4.0)));
+    let mut x = row.left();
+    for (index, (page, galley)) in pages.iter().zip(galleys).enumerate() {
+        let tab = Rect::from_min_size(pos2(x, row.top()), vec2(galley.size().x + 2.0 * pad, PAGE_H));
+        x = tab.right();
+        let usable = page.enabled && !page.active && page.action.is_some();
+        let sense = if usable { Sense::click() } else { Sense::hover() };
+        let response = ui.interact(tab, ui.id().with(("panel-page", index)), sense);
+        // The chosen page is marked by its underline alone, with no raised
+        // tab or shadow, as the owner set on 2026-10-30.
+        if page.active {
+            ui.painter().rect_filled(
+                Rect::from_min_max(pos2(tab.left() + pad, tab.bottom() - 2.0), pos2(tab.right() - pad, tab.bottom())),
+                0.0,
+                INK,
+            );
+        }
+        let color = match (page.active, page.enabled, usable && response.hovered()) {
+            (true, _, _) => TEXT,
+            (false, false, _) => widgets::quiet(false),
+            (false, true, true) => TEXT,
+            (false, true, false) => MUTED,
+        };
+        let at = pos2(tab.center().x - galley.size().x / 2.0, tab.center().y - galley.size().y / 2.0);
+        ui.painter().galley_with_override_text_color(at, galley, color);
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, page.enabled, page.active, &page.label)
+        });
+        if usable
+            && response.clicked()
+            && let Some(action) = &page.action
+        {
+            sent.push(Sent::Run(action.clone()));
+        }
+    }
+}
+
+/// A caption and a row of icons that each turn on and off, as the mockup
+/// draws "Lock:" and its four locks. A click sends the icon's index.
+fn icons_row(ui: &mut egui::Ui, prop: &Value, row: Rect, label: &str, icons: &[protocol::IconToggle], sent: &mut Vec<Sent>) {
+    let mut x = row.left();
+    if !label.is_empty() {
+        let shown = ui.painter().text(row.left_center(), Align2::LEFT_CENTER, label, widgets::body(S), MUTED);
+        x = shown.right() + S.of(14.0);
+    }
+    let cell = S.of(34.0);
+    for (index, icon) in icons.iter().enumerate() {
+        let spot = Rect::from_min_size(pos2(x + index as f32 * (cell + S.of(6.0)), row.top()), vec2(cell, row.height()));
+        let response = ui
+            .interact(spot, ui.id().with(("panel-icon", prop.to_string(), index)), Sense::click_and_drag())
+            .on_hover_text(&icon.tip);
+        let plate = Rect::from_center_size(spot.center(), vec2(cell, cell).min(spot.size()));
+        if icon.on {
+            ui.painter().rect_filled(plate, S.of(6.0), ICON_ON_PLATE);
+        } else if response.hovered() {
+            ui.painter().rect_filled(plate, S.of(6.0), widgets::SELECTED);
+        }
+        let color = if icon.on { crate::toolbar::ICON_ACTIVE } else { TEXT };
+        crate::toolbar::paint_icon(ui.painter(), spot.center(), &icon.icon, S.of(19.0), color);
+        response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, icon.on, &icon.tip));
+        if response.clicked() {
+            set(sent, prop, PropValue::Index(index as u8));
+        }
+    }
+}
+
+/// The plate behind an icon that is on.
+const ICON_ON_PLATE: Color32 = Color32::from_rgb(226, 236, 252);
 
 /// A left chevron and the name of the page this one was opened from, on the
 /// panel's first line. Clicking it returns there.
@@ -299,6 +415,7 @@ fn draw_row(ui: &mut egui::Ui, desc: &Row, finish: &Action, sent: &mut Vec<Sent>
     let id = row_id(ui, &desc.prop);
     let prop = &desc.prop;
     match (&desc.kind, value) {
+        (RowKind::Icons { icons }, _) => icons_row(ui, prop, row, &desc.label, icons, sent),
         (RowKind::Toggle, PropValue::Bool(on)) => {
             ui.painter().text(
                 row.left_center(),

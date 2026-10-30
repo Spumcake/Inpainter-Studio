@@ -1191,6 +1191,8 @@ fn toolbar(adding: &str) -> Toolbar {
             },
         ],
         trailing: Vec::new(),
+        options: Vec::new(),
+        options_trailing: Vec::new(),
     }
 }
 

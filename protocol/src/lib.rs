@@ -8,9 +8,11 @@ use serde::{Deserialize, Serialize};
 
 mod cell;
 mod declare;
+mod raster;
 mod skills;
 pub use cell::*;
 pub use declare::*;
+pub use raster::*;
 pub use skills::*;
 
 /// The version this crate speaks. A sub-application's first message says
@@ -65,6 +67,8 @@ pub enum AppMessage {
     Tabs(Tabs),
     /// The drawing surface's current tool and the text being typed.
     Canvas(Canvas),
+    /// A raster tab's picture, tool, selection, crop box, and layer box.
+    Raster(RasterView),
     /// A question for the host to show. The host answers once.
     Ask(Ask),
     /// Every unsaved document has been resolved after `quit`. The host may exit.
@@ -123,6 +127,8 @@ pub enum HostMessage {
         tab: String,
         gesture: serde_json::Value,
     },
+    /// One finished gesture on a raster tab.
+    RasterGesture { tab: String, gesture: RasterGesture },
     /// A click, a marquee, or a cancelled drag on the drawing surface. The
     /// host shows the selection the next `document` states.
     Select { tab: String, op: SelectOp },
@@ -267,6 +273,8 @@ pub enum ContentsKind {
     Canvas,
     /// A list of cells. The host draws them; the sub-application keeps them.
     Cells,
+    /// A picture of pixels the sub-application composites: see `RasterView`.
+    Raster,
 }
 
 /// Where the properties panel sits. Only the right side has a reference.
@@ -380,6 +388,7 @@ impl Declaration {
             | AppMessage::Properties(_)
             | AppMessage::Tabs(_)
             | AppMessage::Canvas(_)
+            | AppMessage::Raster(_)
             | AppMessage::Ask(_)
             | AppMessage::QuitReady
             | AppMessage::Pong

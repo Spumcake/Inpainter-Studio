@@ -345,7 +345,7 @@ impl Session {
                 trailing.push(self.command_button(*id));
             }
         }
-        Toolbar { items, trailing }
+        Toolbar { items, trailing, options: Vec::new(), options_trailing: Vec::new() }
     }
 
     fn command_button(&self, id: CommandId) -> ToolItem {
@@ -377,6 +377,7 @@ impl Session {
                         tint: control.tint,
                         set: Action::new("set_size"),
                         finish: Some(Action::new("finish_edit")),
+                        suffix: String::new(),
                     });
                 }
                 registry::BarControl::Divider => items.push(ToolItem::Separator),
@@ -398,6 +399,7 @@ impl Session {
                         tint: None,
                         set: Action::with_arg("set_bar", json!({ "prop": prop.key() })),
                         finish: Some(Action::new("finish_edit")),
+                        suffix: String::new(),
                     });
                 }
                 registry::BarControl::Choice { prop, options } => {
@@ -476,6 +478,7 @@ impl Session {
             back,
             layers,
             sections,
+            pages: Vec::new(),
         }
     }
 
@@ -607,6 +610,7 @@ impl Session {
                             .map(|color| self.color_row(node.id, color, true))
                             .collect()
                     },
+                    thumbnail: None,
                 }
             })
             .collect();
@@ -614,7 +618,9 @@ impl Session {
             rows,
             reorder: Action::new("reorder"),
             sort_color: Action::new("sort_color"),
+            nest: false,
             flags: flag_icons(),
+            actions: Vec::new(),
         }
     }
 

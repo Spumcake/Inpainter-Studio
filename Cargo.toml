@@ -9,6 +9,7 @@ members = [
     "apps/template",
     "apps/simple-sketch",
     "apps/mission-control",
+    "apps/image-editor",
 ]
 
 # octotablet 0.1.0 binds tablet protocol versions it cannot parse, which

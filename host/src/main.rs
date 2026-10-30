@@ -14,6 +14,7 @@ mod markdown;
 mod outliner;
 mod panel;
 mod process;
+mod raster;
 mod sessions;
 mod settings_panel;
 mod route;

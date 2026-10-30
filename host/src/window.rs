@@ -116,6 +116,8 @@ struct HostWindow {
     selected: usize,
     surface: Surface,
     live: Live,
+    /// The pointer on a raster tab, and the previews of what it sent.
+    raster: crate::raster::Pointer,
     /// The tab drawn last frame, so a switch ends what was dragged on it.
     shown: Option<(usize, String)>,
     /// The panel of a tab that declares the panel but no properties.
@@ -248,6 +250,7 @@ impl HostWindow {
             selected: 0,
             surface: Surface::new(tablet),
             live: Live::default(),
+            raster: crate::raster::Pointer::default(),
             shown: None,
             panel_open: false,
             viewport: [0.0, 0.0],
@@ -385,6 +388,25 @@ impl HostWindow {
                 return;
             };
             let declared = &mut started.running.declared;
+            // A raster tab's camera answers the drawing surface's own
+            // commands, and `canvas.zoom` sets a zoom by number.
+            if let Some(display) = declared.rasters.get_mut(&tab)
+                && Doc::moves_camera_only(&action.id)
+            {
+                match action.id.as_str() {
+                    "canvas.zoom_in" => crate::raster::zoom_step(display, true, viewport),
+                    "canvas.zoom_out" => crate::raster::zoom_step(display, false, viewport),
+                    "canvas.fit" => crate::raster::fit(display, viewport),
+                    "canvas.zoom_to_selection" => crate::raster::zoom_to_selection(display, viewport),
+                    _ => {
+                        if let Some(zoom) = asked_zoom(action) {
+                            crate::raster::set_zoom(display, zoom, viewport);
+                        }
+                    }
+                }
+                self.live.moved = true;
+                return self.send_camera();
+            }
             let canvas = declared.canvas.as_ref().filter(|canvas| canvas.tab == tab);
             match declared.documents.get_mut(&tab) {
                 Some(display) => {
@@ -423,11 +445,14 @@ impl HostWindow {
         let Some(tab) = self.active_tab() else {
             return;
         };
-        let Some(camera) = self
-            .apps
-            .get(app)
-            .and_then(|started| started.running.declared.documents.get(&tab))
+        let Some(declared) = self.apps.get(app).map(|started| &started.running.declared) else {
+            return;
+        };
+        let Some(camera) = declared
+            .documents
+            .get(&tab)
             .map(|display| display.camera)
+            .or_else(|| declared.rasters.get(&tab).and_then(|display| display.camera))
         else {
             return;
         };
@@ -665,6 +690,7 @@ impl eframe::App for HostWindow {
         if shown != self.shown {
             self.surface.reset();
             self.live.reset();
+            self.raster.reset();
             self.shown = shown;
         }
 
@@ -1839,14 +1865,25 @@ fn workspace_bar(ui: &egui::Ui, edge_x: f32, inside_workspace: bool, bounds: Rec
     (bar, clicked)
 }
 
+/// The zoom a `canvas.zoom` action asks for, such as 1 for 100%.
+fn asked_zoom(action: &Action) -> Option<f64> {
+    action
+        .arg
+        .as_ref()?
+        .get("zoom")?
+        .as_f64()
+        .filter(|zoom| zoom.is_finite() && *zoom > 0.0)
+}
+
 /// While the assistant works, these wait: commands, gestures, selections,
 /// and property edits. Selecting a tab is a command that still goes.
 fn waits_while_locked(message: &HostMessage) -> bool {
     match message {
         HostMessage::Command { id, .. } => id != "select_tab",
-        HostMessage::Gesture { .. } | HostMessage::Select { .. } | HostMessage::Property { .. } => {
-            true
-        }
+        HostMessage::Gesture { .. }
+        | HostMessage::RasterGesture { .. }
+        | HostMessage::Select { .. }
+        | HostMessage::Property { .. } => true,
         _ => false,
     }
 }
@@ -1940,13 +1977,16 @@ impl HostWindow {
             .apps
             .get(app)
             .and_then(|started| started.running.declared.toolbar.clone());
+        // The settings row's right-hand group ends above the contents' right
+        // edge, beside the panel, as 0.10's approved views show.
+        let panel_inset = self.panel_width(app, tab.as_deref());
         let picked = ui
             .scope(|ui| {
                 if locked {
                     ui.style_mut().visuals.disabled_alpha = LOCKED_ALPHA;
                     ui.disable();
                 }
-                toolbar::show(ui, toolbar.as_ref())
+                toolbar::show(ui, toolbar.as_ref(), panel_inset)
             })
             .inner;
         if !locked {
@@ -1994,6 +2034,7 @@ impl HostWindow {
         match self.contents(app, &tab) {
             Some(ContentsKind::Canvas) => self.show_canvas(ui, app, &tab, rect, dismissing),
             Some(ContentsKind::Cells) => self.show_cells(ui, app, &tab, rect),
+            Some(ContentsKind::Raster) => self.show_raster(ui, app, &tab, rect, dismissing),
             Some(ContentsKind::Grid) => {
                 let painter = ui.painter().with_clip_rect(rect);
                 painter.rect_filled(rect, 0.0, CANVAS);
@@ -2312,6 +2353,38 @@ impl HostWindow {
         }
         for message in out {
             self.send(app, message);
+        }
+    }
+
+    /// A raster tab: its picture through the host's camera, and the pointer's
+    /// gestures sent to the sub-application.
+    fn show_raster(&mut self, ui: &mut egui::Ui, app: usize, tab: &str, rect: Rect, dismissing: bool) {
+        let mut out = Vec::new();
+        {
+            let Some(started) = self.apps.get_mut(app) else {
+                return;
+            };
+            let Some(display) = started.running.declared.rasters.get_mut(tab) else {
+                ui.painter().with_clip_rect(rect).rect_filled(rect, 0.0, crate::raster::GROUND);
+                return;
+            };
+            let locked = self.surface.locked;
+            if self.raster.show(ui, display, rect, &self.surface.tablet, locked, dismissing, &mut out) {
+                self.live.moved = true;
+            }
+        }
+        for item in out {
+            let gesture = match item {
+                crate::raster::Out::Gesture(gesture) => gesture,
+                crate::raster::Out::Painted(points) => protocol::RasterGesture::Stroke { points },
+            };
+            self.send(
+                app,
+                HostMessage::RasterGesture {
+                    tab: tab.to_string(),
+                    gesture,
+                },
+            );
         }
     }
 

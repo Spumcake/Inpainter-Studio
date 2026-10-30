@@ -18,6 +18,7 @@ const SEARCHED: &[&str] = &[
     "src/endpoints.rs",
     "src/keys.rs",
     "src/window/settings.rs",
+    "src/raster.rs",
 ];
 
 /// Words that would mean one of these parts was written for a particular
@@ -126,6 +127,7 @@ fn no_declared_skill_or_tool_is_named_in_the_host_or_the_assistant() {
     for (program, skill) in declared_skills("simple-sketch")
         .into_iter()
         .chain(declared_skills("template"))
+        .chain(declared_skills("image-editor"))
         // Mission Control declares no skills yet; its own words are searched for below.
     {
         words.push(format!("\"{}\"", skill.id));
@@ -137,10 +139,19 @@ fn no_declared_skill_or_tool_is_named_in_the_host_or_the_assistant() {
     // `tab` is the protocol's own word: the host gives every tool a `tab`.
     // A skill that happens to share it names nothing the host was written for.
     words.retain(|word| word != "\"tab\"");
+    // `image` is also the model APIs' own word for a picture, which the
+    // assistant sends; the Image Editor's skill sharing it names nothing.
+    words.retain(|word| word != "\"image\"");
     // The application's own name. `cells` and `cell` are the protocol's words.
     words.push(String::from("mission-control"));
     words.push(String::from("mission control"));
     words.push(String::from("Mission Control"));
+    // The Image Editor's names and its file's extension: a raster tab is the
+    // protocol's, and the host draws it knowing no editor.
+    words.push(String::from("image-editor"));
+    words.push(String::from("image editor"));
+    words.push(String::from("Image Editor"));
+    words.push(String::from(".ipx"));
     let mut found = Vec::new();
     for crate_src in [root.join("src"), root.join("../assistant/src")] {
         for (file, text) in product_code(&crate_src) {

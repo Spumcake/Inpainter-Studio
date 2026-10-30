@@ -106,7 +106,11 @@ impl Doc<'_> {
     pub(crate) fn moves_camera_only(id: &str) -> bool {
         matches!(
             id,
-            "canvas.zoom_in" | "canvas.zoom_out" | "canvas.fit" | "canvas.zoom_to_selection"
+            "canvas.zoom_in"
+                | "canvas.zoom_out"
+                | "canvas.fit"
+                | "canvas.zoom_to_selection"
+                | "canvas.zoom"
         )
     }
 
@@ -117,6 +121,7 @@ impl Doc<'_> {
             "canvas.zoom_out" => self.zoom_at_center(false),
             "canvas.fit" => self.fit(),
             "canvas.zoom_to_selection" => self.zoom_to_selection(),
+            "canvas.zoom" => self.set_zoom(action),
             _ => self.out.push(HostMessage::Command {
                 id: action.id.clone(),
                 tab: Some(self.tab.to_string()),
@@ -137,6 +142,25 @@ impl Doc<'_> {
         self.display.camera.zoom
     }
 
+    /// How wide the brush or eraser draws, in screen points, for the ring
+    /// that follows the pointer: the tool's size, or else its layer's.
+    pub(crate) fn tool_width(&self) -> Option<f64> {
+        let width = match self.canvas.map(|canvas| &canvas.tool)? {
+            CanvasTool::Brush { canvas, layer, size, look, .. } => {
+                let layer_size = canvas
+                    .filter(|id| *id != 0)
+                    .zip(layer.filter(|id| *id != 0))
+                    .and_then(|(canvas, layer)| self.display.sketch.color_style(NodeId::new(canvas), ColorId::new(layer)))
+                    .map(|style| style.size)
+                    .or_else(|| draw::document::snapshot::stroke_look_from(look).map(|look| look.0));
+                f64::from(size.or(layer_size)?)
+            }
+            CanvasTool::Erase { size, .. } => f64::from(*size),
+            _ => return None,
+        };
+        Some(width * self.display.camera.zoom)
+    }
+
     pub(crate) fn pan_screen(&mut self, delta: Point) {
         camera::pan_screen(&mut self.display.camera, delta);
         self.live.moved = true;
@@ -149,6 +173,24 @@ impl Doc<'_> {
 
     fn zoom_at_center(&mut self, zoom_in: bool) {
         camera::zoom_at_center(&mut self.display.camera, zoom_in, self.viewport);
+        self.live.moved = true;
+    }
+
+    /// `canvas.zoom` with `{"zoom": n}`, such as 1 for 100%, about the
+    /// viewport's center.
+    fn set_zoom(&mut self, action: &Action) {
+        let Some(zoom) = action
+            .arg
+            .as_ref()
+            .and_then(|arg| arg.get("zoom"))
+            .and_then(serde_json::Value::as_f64)
+            .filter(|zoom| zoom.is_finite() && *zoom > 0.0)
+        else {
+            return;
+        };
+        let center = [self.viewport[0] / 2.0, self.viewport[1] / 2.0];
+        let factor = zoom / self.display.camera.zoom;
+        camera::zoom_toward(&mut self.display.camera, factor, center);
         self.live.moved = true;
     }
 

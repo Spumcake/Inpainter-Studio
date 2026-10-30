@@ -1916,6 +1916,18 @@ dependencies = [
  "num-traits",
  "png 0.18.1",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
+]
+
+[[package]]
+name = "image-editor"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "protocol",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

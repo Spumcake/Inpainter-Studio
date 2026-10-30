@@ -712,6 +712,10 @@ fn compact(history: &mut [Value]) {
     }
 }
 
-const EARLIER: &str = "Left out: this came from an earlier request. Read or look again for what is there now.";
+// Each stub says the earlier reply did see what it stands for, so a model
+// that reads the history, whichever level it is, never takes a removed
+// picture for one that was never looked at and retracts a true answer, as
+// the owner saw on 2026-10-30.
+const EARLIER: &str = "This tool's output was seen when an earlier request ran and is no longer kept here. The replies after it were based on it. To know what is there now, read or look again.";
 const PICTURES_LEAD: &str = "The pictures ";
-const EARLIER_PICTURES: &str = "[Pictures from an earlier request, left out.]";
+const EARLIER_PICTURES: &str = "[The pictures the tools returned here were seen when an earlier request ran; they are no longer kept, to save space. The replies after them were based on them. To see what is there now, look again.]";

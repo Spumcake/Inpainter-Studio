@@ -26,6 +26,9 @@ pub struct Cell {
     /// That endpoint's model id. Set when it runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The reasoning effort it ran at, such as `"medium"`, if one was set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// The result. Empty until a run finishes, fails, or is stopped.
     #[serde(default)]
     pub output: Vec<CellPart>,
@@ -36,7 +39,7 @@ pub struct Cell {
     /// Every run, oldest first. A run always exists: nothing removes one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub versions: Vec<CellVersion>,
-    /// The version the cell shows. The top-level `endpoint`, `model`,
+    /// The version the cell shows. The top-level `endpoint`, `model`, `effort`,
     /// `output`, `state`, and `error` always equal it; only `input` may
     /// differ, as an edit not yet run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -55,6 +58,8 @@ pub struct CellVersion {
     pub endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     #[serde(default)]
     pub output: Vec<CellPart>,
     /// Done, failed, or stopped.
@@ -110,6 +115,7 @@ impl Cell {
             input: vec![CellPart::Text { text: prompt.into() }],
             endpoint: None,
             model: None,
+            effort: None,
             output: Vec::new(),
             state: CellState::Idle,
             error: None,
@@ -138,6 +144,7 @@ impl Cell {
         let version = &self.versions[index];
         self.endpoint = version.endpoint.clone();
         self.model = version.model.clone();
+        self.effort = version.effort.clone();
         self.output = version.output.clone();
         self.state = version.state;
         self.error = version.error.clone();

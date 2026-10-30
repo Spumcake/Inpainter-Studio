@@ -6,7 +6,7 @@
 //! and posts its reply there too, so a stop is heard while the model thinks.
 
 use crate::prompt;
-use crate::{Attachment, Command, Config, Entry, Event, MAX_CALLS, Request, Role, Target, now};
+use crate::{Attachment, Command, Config, Endpoint, Entry, Event, MAX_CALLS, Reasoning, Request, Role, Target, now};
 use base64::Engine;
 use serde_json::{Map, Value, json};
 use std::collections::VecDeque;
@@ -45,6 +45,9 @@ enum Woke {
 struct Busy {
     group: String,
     model: String,
+    effort: Option<String>,
+    /// The endpoint as the request began.
+    endpoint: Endpoint,
     selected: Option<(String, String)>,
     targets: Vec<Target>,
     stopped: bool,
@@ -54,6 +57,9 @@ struct Busy {
 struct Agent {
     base_url: String,
     api_key: Option<String>,
+    reasoning: Reasoning,
+    voice: String,
+    refusal: Option<String>,
     wake: Arc<dyn Fn() + Send + Sync>,
     events: Sender<Event>,
     inbox: Receiver<Input>,
@@ -88,6 +94,9 @@ pub fn run(config: Config, commands: Receiver<Command>, events: Sender<Event>) {
     let mut agent = Agent {
         base_url: config.base_url,
         api_key: config.api_key,
+        reasoning: Reasoning::OpenRouter,
+        voice: String::new(),
+        refusal: None,
         wake: config.wake,
         events,
         inbox,
@@ -102,6 +111,16 @@ pub fn run(config: Config, commands: Receiver<Command>, events: Sender<Event>) {
 }
 
 impl Agent {
+    /// The Discussion skill's endpoint and prompt, for every request from
+    /// now on.
+    fn configure(&mut self, endpoint: Endpoint) {
+        self.base_url = endpoint.base_url;
+        self.api_key = endpoint.api_key;
+        self.reasoning = endpoint.reasoning;
+        self.voice = endpoint.voice;
+        self.refusal = endpoint.refusal;
+    }
+
     fn emit(&self, event: Event) {
         let _ = self.events.send(event);
         (self.wake)();
@@ -142,6 +161,7 @@ impl Agent {
             };
             match command {
                 Command::Send(request) => self.request(request),
+                Command::Configure(endpoint) => self.configure(endpoint),
                 Command::ListModels => self.list_models(),
                 Command::Restore(entries) => self.restore(entries),
                 Command::Clear => {
@@ -159,12 +179,13 @@ impl Agent {
     fn list_models(&self) {
         let base_url = self.base_url.clone();
         let key = self.api_key.clone();
+        let tools_only = self.reasoning == Reasoning::OpenRouter;
         let events = self.events.clone();
         let wake = self.wake.clone();
         let started = std::thread::Builder::new()
             .name(String::from("assistant-models"))
             .spawn(move || {
-                let models = crate::openrouter::models(&base_url, key.as_deref());
+                let models = crate::openrouter::models(&base_url, key.as_deref(), tools_only);
                 let _ = events.send(Event::Models(models));
                 wake();
             });
@@ -242,6 +263,14 @@ impl Agent {
         let mut busy = Busy {
             group: format!("request-{}-{}", now(), self.requests),
             model: request.model,
+            effort: request.effort,
+            endpoint: Endpoint {
+                base_url: self.base_url.clone(),
+                api_key: self.api_key.clone(),
+                reasoning: self.reasoning,
+                voice: self.voice.clone(),
+                refusal: self.refusal.clone(),
+            },
             selected: request.selected,
             targets: request.targets,
             stopped: false,
@@ -255,8 +284,14 @@ impl Agent {
 
     /// The request's turns. Returns the note it ends with, if any.
     fn converse(&mut self, busy: &mut Busy) -> Option<String> {
-        let Some(key) = self.api_key.clone() else {
-            return Some(String::from(NO_KEY));
+        if let Some(refusal) = &busy.endpoint.refusal {
+            return Some(refusal.clone());
+        }
+        // OpenRouter needs a key; a local OpenAI-compatible server may not.
+        let key = match busy.endpoint.api_key.clone() {
+            Some(key) => key,
+            None if busy.endpoint.reasoning == Reasoning::OpenRouter => return Some(String::from(NO_KEY)),
+            None => String::new(),
         };
         if busy.model.trim().is_empty() {
             return Some(String::from(NO_MODEL));
@@ -324,15 +359,18 @@ impl Agent {
         let turn = self.turns;
         let mut messages = vec![json!({
             "role": "system",
-            "content": prompt::system(&busy.targets, busy.selected.as_ref()),
+            "content": prompt::with_voice(prompt::system(&busy.targets, busy.selected.as_ref()), &busy.endpoint.voice),
         })];
         messages.extend(self.history.iter().cloned());
         let mut body = json!({"model": busy.model, "messages": messages});
+        for (field, value) in crate::effort_fields(busy.endpoint.reasoning, busy.effort.as_deref()) {
+            body[field] = value;
+        }
         let tools = prompt::tools(&busy.targets);
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
         }
-        let base_url = self.base_url.clone();
+        let base_url = busy.endpoint.base_url.clone();
         let key = key.to_string();
         let outbox = self.outbox.clone();
         let started = std::thread::Builder::new()
@@ -428,6 +466,7 @@ impl Agent {
                     Command::Targets(targets) => busy.targets = targets,
                     Command::Send(_) => {}
                     Command::ListModels => self.list_models(),
+                    Command::Configure(endpoint) => self.configure(endpoint),
                     Command::Note(text) => self.aside(text),
                     command @ (Command::Restore(_) | Command::Clear) => {
                         self.deferred.push_back(command)

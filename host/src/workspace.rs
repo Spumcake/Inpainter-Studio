@@ -127,6 +127,9 @@ pub(crate) struct SessionFile {
     pub workspace_open: bool,
     #[serde(default)]
     pub conversation: Vec<assistant::Entry>,
+    /// The level this session's composer chose. None means the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
 }
 
 /// A tab entry in a session file, with a project-relative path.
@@ -721,6 +724,7 @@ pub(crate) fn migrate_old_projects_to(
             selected,
             workspace_open: old.workspace_open,
             conversation,
+            level: None,
         };
         let record = ProjectRecord {
             version: VERSION,
@@ -775,18 +779,9 @@ pub(crate) fn migrate_old_projects_to(
     Ok(notes)
 }
 
-/// The model the picker chose, by id, with the name it shows.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct ModelChoice {
-    pub id: String,
-    pub name: String,
-}
-
 /// What the host remembers between runs.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Settings {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<ModelChoice>,
     /// The current project's id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
@@ -794,9 +789,146 @@ pub(crate) struct Settings {
     /// last dragged it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_width: Option<f32>,
+    /// Where New Project suggests new projects, and where Studio makes one
+    /// by itself. None means `~/Inpainter`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projects_root: Option<String>,
+    /// Where Studio sends prompts. Their keys are never here: see `keys.rs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<EndpointSetting>,
+    /// The skills, the built-in Discussion first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<SkillSetting>,
+    /// The assistant's levels, in the picker's order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub levels: Vec<Level>,
+    /// The level a new session starts on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_level: Option<String>,
+    /// Anything another Studio wrote, such as the model picked before 0.8,
+    /// kept as it was.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
     /// Where these settings live. None in frame tests, which never write.
     #[serde(skip)]
     file: Option<PathBuf>,
+}
+
+/// What kind of service an endpoint is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EndpointKind {
+    Openrouter,
+    Openai,
+    Comfyui,
+}
+
+impl EndpointKind {
+    pub(crate) const ALL: [EndpointKind; 3] = [EndpointKind::Openrouter, EndpointKind::Openai, EndpointKind::Comfyui];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            EndpointKind::Openrouter => "OpenRouter",
+            EndpointKind::Openai => "OpenAI-compatible",
+            EndpointKind::Comfyui => "ComfyUI",
+        }
+    }
+
+    /// What the form fills in for a new endpoint of this kind.
+    pub(crate) fn suggested(self) -> (&'static str, &'static str) {
+        match self {
+            EndpointKind::Openrouter => ("OpenRouter", "https://openrouter.ai/api/v1"),
+            EndpointKind::Openai => ("Ollama", "http://localhost:11434/v1"),
+            EndpointKind::Comfyui => ("Local ComfyUI", "http://127.0.0.1:8188"),
+        }
+    }
+
+    /// A chat endpoint answers prompts; ComfyUI runs graphs.
+    pub(crate) fn chats(self) -> bool {
+        self != EndpointKind::Comfyui
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct EndpointSetting {
+    pub id: String,
+    pub name: String,
+    pub kind: EndpointKind,
+    pub address: String,
+}
+
+/// The built-in skill's id.
+pub(crate) const DISCUSSION: &str = "discussion";
+
+/// What the Discussion skill's prompt starts as: how the assistant speaks,
+/// apart from Studio's own rules for its tools.
+pub(crate) const DEFAULT_VOICE: &str = "\
+Speak plainly and briefly, one idea per sentence.
+Say what you did, or what you found, then what the person can do next.";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SkillSetting {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// An endpoint's id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// The model it runs on, for a skill other than Discussion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub prompt: String,
+}
+
+/// How hard a level thinks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Effort {
+    Low,
+    Medium,
+    High,
+}
+
+impl Effort {
+    pub(crate) fn label(effort: Option<Effort>) -> &'static str {
+        match effort {
+            None => "No effort set",
+            Some(Effort::Low) => "Low effort",
+            Some(Effort::Medium) => "Medium effort",
+            Some(Effort::High) => "High effort",
+        }
+    }
+
+    pub(crate) fn from_word(word: &str) -> Option<Effort> {
+        match word {
+            "low" => Some(Effort::Low),
+            "medium" => Some(Effort::Medium),
+            "high" => Some(Effort::High),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Level {
+    pub id: String,
+    pub name: String,
+    /// An endpoint's id.
+    #[serde(default)]
+    pub endpoint: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<Effort>,
 }
 
 impl Settings {
@@ -829,74 +961,104 @@ impl Settings {
     }
 
     /// Another run may have changed the file since this one read it, so
-    /// read it again and change only this one value.
-    fn update(&mut self, change: impl FnOnce(&mut Settings)) {
+    /// read it again, make this one change, and write it.
+    pub(crate) fn update(&mut self, change: impl FnOnce(&mut Settings)) {
         if self.file.is_some() {
-            let fresh = Self::load(self.file.clone());
-            self.project = fresh.project;
-            self.model = fresh.model;
-            self.chat_width = fresh.chat_width;
+            *self = Self::load(self.file.clone());
         }
         change(self);
         self.write();
     }
 
-    pub(crate) fn choose_model(&mut self, choice: ModelChoice) {
-        self.update(|settings| settings.model = Some(choice));
+    pub(crate) fn endpoint(&self, id: &str) -> Option<&EndpointSetting> {
+        self.endpoints.iter().find(|endpoint| endpoint.id == id)
+    }
+
+    pub(crate) fn discussion(&self) -> Option<&SkillSetting> {
+        self.skills.iter().find(|skill| skill.id == DISCUSSION)
+    }
+
+    /// The Discussion skill's endpoint.
+    pub(crate) fn discussion_endpoint(&self) -> Option<&EndpointSetting> {
+        self.endpoint(self.discussion()?.endpoint.as_deref()?)
+    }
+
+    /// The level `chosen` names, or else the default, or else the first.
+    pub(crate) fn level_or_default(&self, chosen: Option<&str>) -> Option<&Level> {
+        let find = |id: Option<&str>| id.and_then(|id| self.levels.iter().find(|level| level.id == id));
+        find(chosen).or_else(|| find(self.default_level.as_deref())).or_else(|| self.levels.first())
+    }
+
+    pub(crate) fn skill(&self, id: &str) -> Option<&SkillSetting> {
+        self.skills.iter().find(|skill| skill.id == id)
+    }
+
+    /// The skills using an endpoint, by name, so its deletion can be refused.
+    pub(crate) fn users_of(&self, endpoint: &str) -> Vec<String> {
+        self.skills
+            .iter()
+            .filter(|skill| skill.endpoint.as_deref() == Some(endpoint))
+            .map(|skill| skill.name.clone())
+            .collect()
+    }
+
+    /// Settings from before 0.8 gain an OpenRouter endpoint, the Discussion
+    /// skill on it with the default voice, and the five default levels with
+    /// Haiku Medium chosen. Returns the new endpoint's id, so its key can be
+    /// stored, or none when there were endpoints already.
+    pub(crate) fn first_start(&mut self, openrouter: &str) -> Option<String> {
+        if !self.endpoints.is_empty() {
+            return None;
+        }
+        let id = protocol::cell_id();
+        let level = |name: &str, model: &str, effort: Effort| Level {
+            id: protocol::cell_id(),
+            name: name.to_string(),
+            endpoint: id.clone(),
+            model: model.to_string(),
+            effort: Some(effort),
+        };
+        let haiku = "anthropic/claude-haiku-5.5";
+        let sonnet = "anthropic/claude-sonnet-5.5";
+        let levels = vec![
+            level("Haiku Low", haiku, Effort::Low),
+            level("Haiku Medium", haiku, Effort::Medium),
+            level("Haiku High", haiku, Effort::High),
+            level("Sonnet Medium", sonnet, Effort::Medium),
+            level("Sonnet High", sonnet, Effort::High),
+        ];
+        let default = levels[1].id.clone();
+        let endpoint = EndpointSetting {
+            id: id.clone(),
+            name: "OpenRouter".to_string(),
+            kind: EndpointKind::Openrouter,
+            address: openrouter.to_string(),
+        };
+        let discussion = SkillSetting {
+            id: DISCUSSION.to_string(),
+            name: "Discussion".to_string(),
+            description: "How the assistant talks with you".to_string(),
+            endpoint: Some(id.clone()),
+            model: None,
+            prompt: DEFAULT_VOICE.to_string(),
+        };
+        self.update(move |settings| {
+            if !settings.endpoints.is_empty() {
+                return;
+            }
+            settings.endpoints.push(endpoint);
+            settings.skills.retain(|skill| skill.id != DISCUSSION);
+            settings.skills.insert(0, discussion);
+            settings.levels = levels;
+            settings.default_level = Some(default);
+        });
+        Some(id)
     }
 
     pub(crate) fn choose_chat_width(&mut self, width: f32) {
         self.update(|settings| settings.chat_width = Some(width));
     }
 
-}
-
-/// The models the picker offers, in its order, as the owner asked on
-/// 2026-10-15: a few recent, well-known models in the class of Claude Haiku
-/// 5.5 and Claude Sonnet 5.5, each able to use tools and see pictures. One
-/// the OpenRouter list no longer offers is left out.
-pub(crate) const PICKER: &[&str] = &[
-    "anthropic/claude-haiku-5.5",
-    "anthropic/claude-sonnet-5.5",
-    "anthropic/claude-opus-5.5",
-    "openai/gpt-6-luna",
-    "openai/gpt-6.1-sol",
-    "google/gemini-3.8-flash",
-    "google/gemini-4-argon",
-];
-
-/// The models of [`PICKER`] that the list offers, in the picker's order.
-pub(crate) fn picker_models(list: Vec<assistant::Model>) -> Vec<assistant::Model> {
-    PICKER
-        .iter()
-        .filter_map(|id| list.iter().find(|model| model.id == *id && model.images).cloned())
-        .collect()
-}
-
-/// The model to use when none is chosen: the newest Claude Haiku the list
-/// offers, or else the first model in it.
-pub(crate) fn default_model(models: &[assistant::Model]) -> Option<&assistant::Model> {
-    // The newest Claude Haiku, as the owner chose on 2026-10-15.
-    let haiku = models
-        .iter()
-        .filter(|model| {
-            let id = model.id.to_ascii_lowercase();
-            // A variant such as `:batch` or `:free` is never the default.
-            id.contains("claude") && id.contains("haiku") && !id.contains(':')
-        })
-        .max_by(|a, b| version_of(&a.id).cmp(&version_of(&b.id)));
-    haiku.or_else(|| models.first())
-}
-
-/// The numbers in a model id, in order, so `claude-sonnet-4.5` is newer
-/// than `claude-sonnet-4` and `claude-3.7-sonnet`.
-fn version_of(id: &str) -> Vec<u32> {
-    let name = id.split_once('/').map_or(id, |(_, name)| name);
-    let name = name.split_once(':').map_or(name, |(name, _)| name);
-    name.split(|c: char| !c.is_ascii_digit())
-        .filter(|part| !part.is_empty() && part.len() < 6)
-        .filter_map(|part| part.parse().ok())
-        .collect()
 }
 
 /// A new session's name: "Untitled Session", then "Untitled Session 2",
@@ -927,6 +1089,7 @@ pub(crate) fn new_session(project_folder: &Path, name: String) -> Result<Session
         selected: None,
         workspace_open: false,
         conversation: Vec::new(),
+        level: None,
     };
     session.write(project_folder)?;
     Ok(session)
@@ -1223,7 +1386,7 @@ pub(crate) fn empty_trash(data: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use assistant::{Entry, Model, Role};
+    use assistant::{Entry, Role};
 
     fn entry(role: Role, text: &str) -> Entry {
         Entry {
@@ -1380,22 +1543,44 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// Catches settings that forget the model or the current project, or
-    /// that another run's write is lost.
+    /// Catches settings that lose another run's change, or a field an
+    /// older or newer Studio wrote.
     #[test]
-    fn settings_keep_the_model_and_the_panel_width() {
+    fn settings_keep_each_change_and_unknown_fields() {
         let folder = scratch("set");
         let file = folder.join("settings.json");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(&file, r#"{"model":{"id":"x/y","name":"Y"},"chat_width":300.0}"#).unwrap();
         let mut settings = Settings::load(Some(file.clone()));
         let mut other = Settings::load(Some(file.clone()));
-        other.choose_model(ModelChoice {
-            id: "x/y".to_string(),
-            name: "Y".to_string(),
-        });
+        other.update(|settings| settings.projects_root = Some("/elsewhere".into()));
         settings.choose_chat_width(480.0);
-        let read = Settings::load(Some(file));
+        let read = Settings::load(Some(file.clone()));
         assert_eq!(read.chat_width, Some(480.0));
-        assert_eq!(read.model.map(|model| model.id).as_deref(), Some("x/y"));
+        assert_eq!(read.projects_root.as_deref(), Some("/elsewhere"));
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("\"x/y\""), "{text}");
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    /// Catches a first start that leaves Studio with nowhere to send a
+    /// prompt, or one that runs again over the person's own settings.
+    #[test]
+    fn the_first_start_makes_openrouter_discussion_and_five_levels() {
+        let folder = scratch("first");
+        let mut settings = Settings::load(Some(folder.join("settings.json")));
+        let endpoint = settings.first_start("https://stand-in/v1").expect("made");
+        assert_eq!(settings.discussion_endpoint().map(|e| e.address.as_str()), Some("https://stand-in/v1"));
+        assert_eq!(settings.discussion().map(|s| s.prompt.as_str()), Some(DEFAULT_VOICE));
+        let names: Vec<&str> = settings.levels.iter().map(|level| level.name.as_str()).collect();
+        assert_eq!(names, ["Haiku Low", "Haiku Medium", "Haiku High", "Sonnet Medium", "Sonnet High"]);
+        assert!(settings.levels.iter().all(|level| level.endpoint == endpoint));
+        assert_eq!(settings.level_or_default(None).map(|l| l.name.as_str()), Some("Haiku Medium"));
+        let sonnet = settings.levels[4].id.clone();
+        assert_eq!(settings.level_or_default(Some(&sonnet)).map(|l| l.name.as_str()), Some("Sonnet High"));
+        assert_eq!(settings.level_or_default(Some("gone")).map(|l| l.name.as_str()), Some("Haiku Medium"));
+        assert_eq!(settings.first_start("https://other/v1"), None);
+        assert_eq!(Settings::load(Some(folder.join("settings.json"))).endpoints.len(), 1);
         std::fs::remove_dir_all(&folder).unwrap();
     }
 
@@ -1413,53 +1598,6 @@ mod tests {
         let again = try_lock(&path).unwrap();
         drop(again);
         std::fs::remove_dir_all(&folder).unwrap();
-    }
-
-    /// Catches a picker that offers every model OpenRouter lists, or one
-    /// that cannot see pictures.
-    #[test]
-    fn the_picker_offers_its_short_list_in_order() {
-        let model = |id: &str, images: bool| Model {
-            id: id.to_string(),
-            name: id.to_string(),
-            images,
-        };
-        let list = vec![
-            model("some/other-model", true),
-            model("anthropic/claude-sonnet-5.5", true),
-            model("anthropic/claude-sonnet-5.5:batch", true),
-            model("anthropic/claude-haiku-5.5", true),
-            model("openai/gpt-6-luna", false),
-        ];
-        let ids: Vec<String> = picker_models(list).into_iter().map(|model| model.id).collect();
-        assert_eq!(ids, ["anthropic/claude-haiku-5.5", "anthropic/claude-sonnet-5.5"]);
-    }
-
-    #[test]
-    fn the_default_model_is_the_newest_haiku() {
-        let model = |id: &str| Model {
-            id: id.to_string(),
-            name: id.to_string(),
-            images: true,
-        };
-        let models = vec![
-            model("openai/gpt-5"),
-            model("anthropic/claude-sonnet-5.5"),
-            model("anthropic/claude-3.5-haiku"),
-            model("anthropic/claude-haiku-5.5"),
-            // Seen on 2026-10-15: the batch variant sorts after the plain one.
-            model("anthropic/claude-haiku-5.5:batch"),
-            model("anthropic/claude-haiku-4.5"),
-            model("anthropic/claude-opus-4.1"),
-        ];
-        assert_eq!(
-            default_model(&models).map(|model| model.id.as_str()),
-            Some("anthropic/claude-haiku-5.5")
-        );
-        assert_eq!(
-            default_model(&models[..1]).map(|model| model.id.as_str()),
-            Some("openai/gpt-5")
-        );
     }
 
     #[test]
@@ -1507,6 +1645,7 @@ mod tests {
             selected: Some(0),
             workspace_open: true,
             conversation: vec![entry(Role::Assistant, "Done.")],
+            level: Some("l1".to_string()),
         };
         session.write(&project).unwrap();
         assert_eq!(SessionFile::read(&project, "s1").unwrap(), session);

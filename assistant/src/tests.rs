@@ -24,6 +24,8 @@ type Script = dyn Fn(usize, &Received) -> (u16, String) + Send + Sync;
 struct StandIn {
     url: String,
     chats: Arc<Mutex<Vec<Value>>>,
+    /// Each chat request's `Authorization` header, if it had one.
+    keys: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 impl StandIn {
@@ -33,17 +35,20 @@ impl StandIn {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let url = format!("http://{}/api/v1", listener.local_addr().expect("addr"));
         let chats = Arc::new(Mutex::new(Vec::new()));
+        let keys = Arc::new(Mutex::new(Vec::new()));
         let recorded = chats.clone();
+        let recorded_keys = keys.clone();
         let script: Arc<Script> = Arc::new(script);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { return };
                 let recorded = recorded.clone();
+                let recorded_keys = recorded_keys.clone();
                 let script = script.clone();
-                std::thread::spawn(move || serve(stream, &recorded, &*script));
+                std::thread::spawn(move || serve(stream, &recorded, &recorded_keys, &*script));
             }
         });
-        Self { url, chats }
+        Self { url, chats, keys }
     }
 
     fn chats(&self) -> Vec<Value> {
@@ -51,7 +56,7 @@ impl StandIn {
     }
 }
 
-fn serve(stream: std::net::TcpStream, chats: &Mutex<Vec<Value>>, script: &Script) {
+fn serve(stream: std::net::TcpStream, chats: &Mutex<Vec<Value>>, keys: &Mutex<Vec<Option<String>>>, script: &Script) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone"));
     let mut line = String::new();
     if reader.read_line(&mut line).is_err() {
@@ -62,6 +67,7 @@ fn serve(stream: std::net::TcpStream, chats: &Mutex<Vec<Value>>, script: &Script
     let path = parts.next().unwrap_or_default().to_string();
     let mut length = 0;
     let mut chunked = false;
+    let mut authorization = None;
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header).unwrap_or(0) == 0 || header.trim().is_empty() {
@@ -73,6 +79,9 @@ fn serve(stream: std::net::TcpStream, chats: &Mutex<Vec<Value>>, script: &Script
         }
         if lower.starts_with("transfer-encoding:") && lower.contains("chunked") {
             chunked = true;
+        }
+        if lower.starts_with("authorization:") {
+            authorization = Some(header.trim()["authorization:".len()..].trim().to_string());
         }
     }
     let mut body = Vec::new();
@@ -100,6 +109,7 @@ fn serve(stream: std::net::TcpStream, chats: &Mutex<Vec<Value>>, script: &Script
     let index = if received.path.ends_with("/chat/completions") {
         let mut chats = chats.lock().expect("lock");
         chats.push(received.body.clone());
+        keys.lock().expect("lock").push(authorization);
         chats.len() - 1
     } else {
         0
@@ -200,6 +210,7 @@ fn request(text: &str, targets: Vec<Target>) -> Request {
         text: text.to_string(),
         attachments: Vec::new(),
         model: String::from("fixture/model"),
+        effort: None,
         selected: Some((String::from("fixture-notes"), String::from("n1"))),
         targets,
     }
@@ -571,7 +582,49 @@ fn with_no_key_a_request_says_so() {
     assert_eq!(events[0], Event::Working(true));
     let notes = notes(&events);
     assert_eq!(notes.len(), 1);
-    assert!(notes[0].contains("No OpenRouter key") && notes[0].contains("OPENROUTER_API_KEY"));
+    assert!(notes[0].contains("No key") && notes[0].contains("Settings"));
+}
+
+/// Catches settings the assistant ignores: the chosen level's effort goes
+/// in the endpoint's own field, the Discussion prompt follows Studio's
+/// rules, and a local server with no key is sent none.
+#[test]
+fn the_endpoint_effort_and_voice_reach_the_model() {
+    let stand_in = StandIn::start(|_, _| text_reply("Done."));
+    let assistant = spawn(&stand_in.url, Some("first-key"));
+    assistant.send(Command::Configure(crate::Endpoint {
+        base_url: stand_in.url.clone(),
+        api_key: Some("router-key".into()),
+        reasoning: crate::Reasoning::OpenRouter,
+        voice: "Answer as a lighthouse keeper.".into(),
+        refusal: None,
+    }));
+    let mut asked = request("hi", targets());
+    asked.effort = Some("high".into());
+    assistant.send(Command::Send(asked));
+    drive(&assistant, |_, _| {});
+    let chat = stand_in.chats()[0].clone();
+    assert_eq!(chat["reasoning"]["effort"], "high");
+    let system = chat["messages"][0]["content"].as_str().unwrap();
+    assert!(system.contains("Ask before anything that costs money"));
+    assert!(system.ends_with("Answer as a lighthouse keeper."), "{system}");
+    assert_eq!(stand_in.keys.lock().unwrap()[0].as_deref(), Some("Bearer router-key"));
+
+    assistant.send(Command::Configure(crate::Endpoint {
+        base_url: stand_in.url.clone(),
+        api_key: None,
+        reasoning: crate::Reasoning::OpenAi,
+        voice: String::new(),
+        refusal: None,
+    }));
+    let mut asked = request("again", targets());
+    asked.effort = Some("low".into());
+    assistant.send(Command::Send(asked));
+    drive(&assistant, |_, _| {});
+    let chat = stand_in.chats()[1].clone();
+    assert_eq!(chat["reasoning_effort"], "low");
+    assert!(chat.get("reasoning").is_none());
+    assert_eq!(stand_in.keys.lock().unwrap()[1], None, "a keyless server was sent a key");
 }
 
 #[test]
@@ -596,7 +649,7 @@ fn failures_become_notes() {
     let unreachable = spawn("http://127.0.0.1:1/api/v1", Some("test-key"));
     unreachable.send(Command::Send(request("hi", targets())));
     let notes = notes(&drive(&unreachable, |_, _| {}));
-    assert!(notes[0].contains("Could not reach OpenRouter"), "{notes:?}");
+    assert!(notes[0].contains("Could not reach the endpoint"), "{notes:?}");
 }
 
 #[test]

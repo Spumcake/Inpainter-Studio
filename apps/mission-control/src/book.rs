@@ -192,10 +192,11 @@ impl Session {
                 input,
                 endpoint,
                 model,
+                effort,
                 state,
                 output,
                 error,
-            } => self.finish(&tab, &cell, Run { input, endpoint, model, state, output, error }, &mut out),
+            } => self.finish(&tab, &cell, Run { input, endpoint, model, effort, state, output, error }, &mut out),
             HostMessage::InsertCell { tab, index, cell } => self.insert(&tab, index, cell, &mut out),
             HostMessage::SelectCell { tab, cell } => self.select(&tab, &cell, &mut out),
             HostMessage::SetVersion { tab, cell, index } => self.set_version(&tab, &cell, index, &mut out),
@@ -605,6 +606,7 @@ impl Session {
                 input: run.input,
                 endpoint: Some(run.endpoint),
                 model: Some(run.model),
+                effort: run.effort,
                 output: run.output,
                 state: run.state,
                 error: run.error,
@@ -622,6 +624,7 @@ impl Session {
                 input: run.input,
                 endpoint: Some(run.endpoint),
                 model: Some(run.model),
+                effort: run.effort,
                 output: run.output,
                 state: run.state,
                 error: run.error,
@@ -1060,6 +1063,7 @@ struct Run {
     input: Vec<CellPart>,
     endpoint: String,
     model: String,
+    effort: Option<String>,
     state: CellState,
     output: Vec<CellPart>,
     error: Option<String>,
@@ -1291,6 +1295,7 @@ pub fn read_book(path: &Path) -> Result<Read, String> {
                         input: cell.input.clone(),
                         endpoint: cell.endpoint.clone(),
                         model: cell.model.clone(),
+                        effort: cell.effort.clone(),
                         output: cell.output.clone(),
                         state: cell.state,
                         error: cell.error.clone(),
@@ -1396,6 +1401,7 @@ mod tests {
             input: text(prompt),
             endpoint: "openrouter".into(),
             model: "stand-in/model".into(),
+            effort: Some("medium".into()),
             state: CellState::Done,
             output: text(result),
             error: None,
@@ -1480,6 +1486,7 @@ mod tests {
             input: Vec::new(),
             endpoint: String::new(),
             model: String::new(),
+            effort: None,
             state: CellState::Done,
             output: Vec::new(),
             error: None,
@@ -1522,6 +1529,7 @@ mod tests {
         let reopened = cells.iter().find(|cell| cell.id == first).unwrap();
         assert_eq!((reopened.versions.len(), reopened.current), (4, Some(3)));
         assert_eq!(reopened.prompt(), "A darker keeper.");
+        assert_eq!(reopened.effort.as_deref(), Some("medium"), "the effort a run had was lost");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

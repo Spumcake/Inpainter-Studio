@@ -11,7 +11,7 @@ use crate::process::Running;
 use crate::route::{self, Routing};
 use crate::tablet::Tablet;
 use crate::tabs::{StripTab, TabEvent};
-use crate::workspace::{self, ModelChoice, Settings};
+use crate::workspace::{self, Settings};
 use crate::{ask, grid, icons, panel, tabs, toolbar, widgets};
 use assistant::{Assistant, Command};
 use eframe::egui::{self, Color32, Event, Key, Rect};
@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 mod flows;
+mod settings;
 #[cfg(test)]
 mod checks;
 
@@ -143,8 +144,18 @@ struct HostWindow {
     /// Cells being typed or run. The host draws every cell from here and
     /// from what a sub-application reported.
     board: crate::cells::Board,
-    openrouter_url: String,
-    openrouter_key: Option<String>,
+    /// Endpoint keys, read once each from the keyring.
+    keys: crate::keys::Keys,
+    /// Connection tests and model lists, by endpoint.
+    probes: crate::endpoints::Probes,
+    /// The assistant's endpoint and prompt as last sent, so a change in
+    /// settings is sent again.
+    configured: Option<String>,
+    /// The level this session's composer chose, by id. None is the default.
+    level: Option<String>,
+    settings_panel: crate::settings_panel::SettingsPanel,
+    /// A cell's level picker, open under its chevron: the cell's id and where.
+    model_menu: Option<(String, Rect)>,
     /// A conversation cell the person is dragging.
     dragging: Option<protocol::Cell>,
     /// A notebook cell's "…" menu, open under that rect.
@@ -184,8 +195,6 @@ struct HostWindow {
     /// The change a write failed on. It is tried again only after a new one.
     failed_signature: Option<String>,
     flows: flows::Flows,
-    /// The model list has been asked for.
-    listed: bool,
     /// The gray bar, last drawn, so a check can press it.
     bar_rect: Rect,
     /// Paths that frame tests give in place of file dialogs.
@@ -203,7 +212,11 @@ impl HostWindow {
         window.data = workspace::data_folder();
         window.projects_root = workspace::default_projects_dir();
         window.settings = Settings::load(Settings::default_file());
-        window.chat.model = window.settings.model.clone();
+        window.keys = crate::keys::Keys::new(window.data.clone());
+        window.first_start();
+        if let Some(root) = &window.settings.projects_root {
+            window.projects_root = Some(PathBuf::from(root));
+        }
         window.open_current();
         window
     }
@@ -230,11 +243,6 @@ impl HostWindow {
         let wake_ctx = ctx.clone();
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || wake_ctx.request_repaint());
         let assistant = Assistant::spawn(assistant::Config::from_env(wake));
-        let openrouter_url = std::env::var("INPAINTER_OPENROUTER_URL")
-            .unwrap_or_else(|_| String::from("https://openrouter.ai/api/v1"));
-        let openrouter_key = std::env::var("OPENROUTER_API_KEY")
-            .ok()
-            .filter(|key| !key.trim().is_empty());
         Self {
             apps,
             selected: 0,
@@ -255,8 +263,12 @@ impl HostWindow {
             chat: Chat::default(),
             routing: Routing::default(),
             board: crate::cells::Board::default(),
-            openrouter_url,
-            openrouter_key,
+            keys: crate::keys::Keys::default(),
+            probes: crate::endpoints::Probes::default(),
+            configured: None,
+            level: None,
+            settings_panel: crate::settings_panel::SettingsPanel::default(),
+            model_menu: None,
             dragging: None,
             cell_menu: None,
             notebook_focus: false,
@@ -276,7 +288,6 @@ impl HostWindow {
             last_project_write: None,
             failed_signature: None,
             flows: flows::Flows::default(),
-            listed: false,
             bar_rect: Rect::NOTHING,
             #[cfg(test)]
             scripted_paths: std::collections::VecDeque::new(),
@@ -620,19 +631,14 @@ impl eframe::App for HostWindow {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         // A card names its model as the picker does, without the provider.
-        let mut names: Vec<(String, String)> = match &self.chat.models {
-            Some(Ok(models)) => models.iter().map(|model| (model.id.clone(), model.name.clone())).collect(),
-            _ => Vec::new(),
-        };
-        if let Some(chosen) = &self.chat.model {
-            names.push((chosen.id.clone(), chosen.name.clone()));
-        }
-        for (_, name) in &mut names {
-            if let Some((_, short)) = name.split_once(": ") {
-                *name = short.to_string();
-            }
-        }
+        let known = self.probes.known_models();
+        let names: Vec<(String, String)> = known
+            .iter()
+            .map(|model| (model.id.clone(), chat::short_name(&model.name).to_string()))
+            .collect();
         crate::cells::set_model_names(&ctx, &names);
+        self.show_levels(&known);
+        self.configure_assistant();
         let mut pending = false;
         for started in &mut self.apps {
             started.running.poll();
@@ -666,6 +672,7 @@ impl eframe::App for HostWindow {
         let mut visuals = egui::Visuals::light();
         visuals.panel_fill = Color32::WHITE;
         ctx.set_visuals(visuals);
+        ctx.style_mut_of(egui::Theme::Light, widgets::menu_card);
 
         let mut chosen: Vec<Action> = Vec::new();
         let mut sent: Vec<Sent> = Vec::new();
@@ -716,6 +723,8 @@ impl eframe::App for HostWindow {
                 bar_pressed = pressed;
             });
         self.sessions = menu;
+        self.draw_settings(&ctx, frame);
+        self.draw_model_menu(&ctx);
         if bar_pressed {
             self.toggle_workspace();
         }
@@ -939,17 +948,14 @@ impl HostWindow {
         let selected = self.apps.get(self.selected).and_then(|started| {
             Some((started.id.clone(), started.running.tabs().1?))
         });
+        let level = self.current_level();
         let request = assistant::Request {
             text,
             attachments,
-            model: self
-                .chat
-                .model
-                .as_ref()
-                .map(|model| model.id.clone())
-                .unwrap_or_default(),
+            model: level.as_ref().map(|level| level.model.clone()).unwrap_or_default(),
+            effort: level.and_then(|level| level.effort).map(|effort| effort.word().to_string()),
             selected,
-            targets: route::targets(&self.apps),
+            targets: route::targets(&self.apps, &self.settings),
         };
         self.assistant.send(Command::Send(request));
         for path in unread {
@@ -995,19 +1001,36 @@ impl HostWindow {
         self.chat.conversation.push(entry);
     }
 
-    fn begin_host_cell(&mut self, call: String, input: serde_json::Value) {
-        let prompt = input.get("prompt").and_then(|value| value.as_str()).unwrap_or("").to_string();
-        let model = self.chat.model.as_ref().map(|model| model.id.clone()).unwrap_or_default();
+    /// The host's own tool was called: a prompt, or one of the person's
+    /// skills, runs as a cell in the conversation.
+    fn begin_host_cell(&mut self, call: String, tool: &str, input: serde_json::Value) {
+        let text = |key: &str| input.get(key).and_then(|value| value.as_str()).unwrap_or("").to_string();
+        let (prompt, run_on) = match route::skill_for_tool(&self.settings, tool) {
+            Some(skill) => {
+                let asked = text("input");
+                let prompt = if skill.prompt.trim().is_empty() {
+                    asked
+                } else {
+                    format!("{}\n\n{asked}", skill.prompt.trim_end())
+                };
+                let keys = &mut self.keys;
+                (prompt, crate::endpoints::skill_route(&self.settings, &skill, |id| keys.get(id)))
+            }
+            None => (text("prompt"), self.level_route()),
+        };
         let mut cell = protocol::Cell::text(protocol::cell_id(), &prompt);
-        cell.endpoint = Some(String::from("openrouter"));
-        cell.model = Some(model.clone());
+        if let Ok(route) = &run_on {
+            cell.endpoint = Some(route.endpoint.clone());
+            cell.model = Some(route.model.clone());
+            cell.effort = route.effort.map(|effort| effort.word().to_string());
+        }
         if let Some(entry) = self.chat.conversation.iter_mut().rev().find(|entry| {
             entry.role == assistant::Role::Tool && entry.ok.is_none()
         }) {
             entry.cell = Some(cell.clone());
         }
         self.board.drafts.insert(cell.id.clone(), prompt.clone());
-        self.launch_run(crate::cells::Place::Conversation, cell.id, Some(call), model, prompt);
+        self.launch_run(crate::cells::Place::Conversation, cell.id, Some(call), run_on, prompt);
     }
 
     fn note_cell_actions(&mut self, actions: Vec<crate::cells::CardAction>) {
@@ -1031,6 +1054,10 @@ impl HostWindow {
                     }
                 }
                 crate::cells::CardAction::ShowSource(id) => self.show_source(&id),
+                crate::cells::CardAction::Models(id, at) => {
+                    let open = self.model_menu.as_ref().is_some_and(|(open, _)| *open == id);
+                    self.model_menu = if open { None } else { Some((id, at)) };
+                }
             }
         }
     }
@@ -1059,10 +1086,13 @@ impl HostWindow {
 
     fn run_from_card(&mut self, id: &str) {
         let prompt = self.board.drafts.get(id).cloned().unwrap_or_default();
-        if self.chat.conversation.iter().any(|entry| entry.cell.as_ref().is_some_and(|cell| cell.id == id)) {
+        let recorded = self.chat.conversation.iter().find_map(|entry| {
+            entry.cell.as_ref().filter(|cell| cell.id == id).cloned()
+        });
+        if let Some(cell) = recorded {
             self.edit_prompt(id, vec![protocol::CellPart::Text { text: prompt.clone() }]);
-            let model = self.model_id();
-            self.launch_run(crate::cells::Place::Conversation, id.to_string(), None, model, prompt);
+            let run_on = self.recorded_route(&cell);
+            self.launch_run(crate::cells::Place::Conversation, id.to_string(), None, run_on, prompt);
             return;
         }
         let Some((app, tab)) = self.cell_home(id) else {
@@ -1106,26 +1136,27 @@ impl HostWindow {
         None
     }
 
-    fn model_id(&self) -> String {
-        self.chat.model.as_ref().map(|model| model.id.clone()).unwrap_or_default()
-    }
-
     fn launch_run(
         &mut self,
         place: crate::cells::Place,
         id: String,
         call: Option<String>,
-        model: String,
+        run_on: Result<crate::endpoints::Route, String>,
         prompt: String,
     ) {
         self.board.runs.retain(|run| run.id != id);
-        let rx = crate::cells::start_run(&self.openrouter_url, self.openrouter_key.as_deref(), &model, &prompt);
-        let prompt = prompt.clone();
+        let (endpoint, model, effort) = match &run_on {
+            Ok(route) => (route.endpoint.clone(), route.model.clone(), route.effort.map(|effort| effort.word().to_string())),
+            Err(_) => (String::new(), String::new(), None),
+        };
+        let rx = crate::cells::start_run(run_on, &prompt);
         self.board.runs.push(crate::cells::Run {
             place,
             id,
             call,
+            endpoint,
             model,
+            effort,
             prompt,
             text: String::new(),
             rx,
@@ -1174,6 +1205,15 @@ impl HostWindow {
         if !crate::cells::runs(&cell.kind) {
             return;
         }
+        // A cell that has run goes back to its endpoint and model, or to the
+        // model chosen from its chevron; a new one runs on the session's level.
+        let mut cell = cell;
+        if let Some((endpoint, model, effort)) = self.board.chosen.get(id).cloned() {
+            cell.endpoint = Some(endpoint);
+            cell.model = Some(model);
+            cell.effort = effort;
+        }
+        let run_on = self.recorded_route(&cell);
         let prompt = self.board.drafts.get(id).cloned().unwrap_or_else(|| cell.prompt());
         if prompt.trim().is_empty() {
             return;
@@ -1199,6 +1239,7 @@ impl HostWindow {
                     input: Vec::new(),
                     endpoint: String::new(),
                     model: String::new(),
+                    effort: None,
                     state: protocol::CellState::Done,
                     output: Vec::new(),
                     error: None,
@@ -1213,7 +1254,7 @@ impl HostWindow {
             },
             id.to_string(),
             None,
-            self.model_id(),
+            run_on,
             prompt,
         );
     }
@@ -1279,6 +1320,8 @@ impl HostWindow {
         let id = run.id.clone();
         let text = run.text.clone();
         let model = run.model.clone();
+        let endpoint = run.endpoint.clone();
+        let effort = run.effort.clone();
         let ran = vec![protocol::CellPart::Text { text: run.prompt.clone() }];
         let call = run.call.clone();
         let place = match &run.place {
@@ -1286,6 +1329,8 @@ impl HostWindow {
             crate::cells::Place::Book { app, tab } => Some((*app, tab.clone())),
         };
         self.board.runs.remove(index);
+        // The run's result records the model a chevron chose.
+        self.board.chosen.remove(&id);
         let output = vec![protocol::CellPart::Text { text: text.clone() }];
         match place {
             None => {
@@ -1295,8 +1340,11 @@ impl HostWindow {
                     cell.output = output.clone();
                     cell.state = state;
                     cell.error = error.clone();
-                    cell.endpoint = Some(String::from("openrouter"));
-                    cell.model = Some(model.clone());
+                    if !endpoint.is_empty() {
+                        cell.endpoint = Some(endpoint.clone());
+                        cell.model = Some(model.clone());
+                        cell.effort = effort.clone();
+                    }
                 }
                 if let Some(call) = call {
                     let ok = state != protocol::CellState::Failed;
@@ -1323,8 +1371,9 @@ impl HostWindow {
                         tab,
                         cell: id,
                         input: ran,
-                        endpoint: String::from("openrouter"),
+                        endpoint,
                         model,
+                        effort,
                         state,
                         output,
                         error,
@@ -1346,11 +1395,19 @@ impl HostWindow {
     /// from it, a blue border. Cells are the conversation's cards; a
     /// Markdown cell that has run shows as rendered text.
     fn show_cells(&mut self, ui: &mut egui::Ui, app: usize, tab: &str, rect: Rect) {
-        let (listed, selected) = self
+        let (mut listed, selected) = self
             .apps
             .get(app)
             .and_then(|started| started.running.declared.cells.get(tab).cloned())
             .unwrap_or_default();
+        // A model chosen from a chevron shows before the run records it.
+        for cell in &mut listed {
+            if let Some((endpoint, model, effort)) = self.board.chosen.get(&cell.id) {
+                cell.endpoint = Some(endpoint.clone());
+                cell.model = Some(model.clone());
+                cell.effort = effort.clone();
+            }
+        }
         let painter = ui.painter().with_clip_rect(rect);
         painter.rect_filled(rect, 0.0, NOTEBOOK_GRAY);
         let width = (rect.width() - 2.0 * crate::typescale::GUTTER).min(NOTEBOOK_COLUMN).max(200.0);
@@ -1504,7 +1561,8 @@ impl HostWindow {
         active: Option<usize>,
         editing: bool,
     ) {
-        if !self.notebook_focus && !editing {
+        // While a cell's level picker is open, keys are not the notebook's.
+        if (!self.notebook_focus && !editing) || self.model_menu.is_some() {
             return;
         }
         let Some(index) = active else {
@@ -1960,10 +2018,6 @@ impl HostWindow {
     /// the sub-applications' answers, and tells the assistant when the
     /// running sub-applications' tabs or skills changed.
     fn pump_assistant(&mut self) {
-        if !self.listed && self.native_dialogs {
-            self.listed = true;
-            self.assistant.send(Command::ListModels);
-        }
         while let Some(event) = self.assistant.try_recv() {
             match event {
                 assistant::Event::Entry(entry) => self.note_entry(entry),
@@ -1983,26 +2037,9 @@ impl HostWindow {
                         }
                     }
                 }
-                assistant::Event::Models(models) => {
-                    // The picker offers its short list, each model able to see
-                    // the pictures the assistant looks at.
-                    let models = models.map(crate::workspace::picker_models);
-                    // A remembered model the list no longer offers, such as a
-                    // batch variant, gives way to the default.
-                    let offered = |chosen: &ModelChoice, list: &[assistant::Model]| {
-                        list.iter().any(|model| model.id == chosen.id)
-                    };
-                    if let Ok(list) = &models
-                        && self.chat.model.as_ref().is_none_or(|chosen| !offered(chosen, list))
-                        && let Some(model) = crate::workspace::default_model(list)
-                    {
-                        self.chat.model = Some(ModelChoice {
-                            id: model.id.clone(),
-                            name: model.name.clone(),
-                        });
-                    }
-                    self.chat.models = Some(models);
-                }
+                // The picker shows levels; each endpoint's models are
+                // listed by the Settings page that needs them.
+                assistant::Event::Models(_) => {}
                 assistant::Event::Call {
                     call,
                     app,
@@ -2012,7 +2049,7 @@ impl HostWindow {
                     group,
                 } => {
                     if app == route::HOST_ID {
-                        self.begin_host_cell(call, input);
+                        self.begin_host_cell(call, &tool, input);
                         continue;
                     }
                     let message = HostMessage::Invoke {
@@ -2031,7 +2068,7 @@ impl HostWindow {
         for answer in self.routing.poll(&mut self.apps) {
             self.assistant.send(answer);
         }
-        if let Some(targets) = self.routing.changed_targets(&self.apps) {
+        if let Some(targets) = self.routing.changed_targets(&self.apps, &self.settings) {
             self.assistant.send(Command::Targets(targets));
         }
     }
@@ -2097,18 +2134,8 @@ impl HostWindow {
                     }
                 }
             }
-            ChatEvent::ListModels => {
-                self.chat.models = None;
-                self.assistant.send(Command::ListModels);
-            }
-            ChatEvent::Model(model) => {
-                let choice = ModelChoice {
-                    id: model.id,
-                    name: model.name,
-                };
-                self.chat.model = Some(choice.clone());
-                self.settings.choose_model(choice);
-            }
+            ChatEvent::Level(id) => self.level = Some(id),
+            ChatEvent::LevelSettings => self.settings_panel.open_at(crate::settings_panel::Page::Discussion),
             ChatEvent::Logo(choice) => self.logo(choice, ctx, frame),
             ChatEvent::Session(choice) => self.session_choice(choice, frame),
         }
@@ -2851,7 +2878,7 @@ mod tests {
         assert_eq!(out, vec![Command::Result(answer("c2"))]);
         assert!(routing.poll(&mut apps).is_empty());
 
-        let targets = crate::route::targets(&apps);
+        let targets = crate::route::targets(&apps, &crate::workspace::Settings::default());
         assert!(targets.iter().all(|target| target.app != "gone"), "an exited process is offered");
         let here = targets.iter().find(|target| target.app == "here").expect("the living process was dropped");
         assert_eq!(here.tabs[0].label, "Template");

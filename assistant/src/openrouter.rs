@@ -37,14 +37,14 @@ pub fn chat_streamed(base_url: &str, key: &str, body: &Value, mut text: impl FnM
     let mut body = body.clone();
     body["stream"] = Value::Bool(true);
     let mut response = send(base_url, key, &body)
-        .map_err(|error| format!("Could not reach OpenRouter: {error}."))?;
+        .map_err(|error| format!("Could not reach the endpoint: {error}."))?;
     if !response.status().is_success() {
         return Err(failure(response.status().as_u16(), &body_text(&mut response)?));
     }
     let reader = response.body_mut().with_config().limit(BODY_LIMIT).reader();
     let mut whole = String::new();
     for line in std::io::BufReader::new(reader).lines() {
-        let line = line.map_err(|error| format!("OpenRouter's reply could not be read: {error}."))?;
+        let line = line.map_err(|error| format!("The endpoint's reply could not be read: {error}."))?;
         if let Some(data) = line.trim().strip_prefix("data:") {
             let data = data.trim();
             if !data.is_empty() && data != "[DONE]" {
@@ -72,16 +72,21 @@ pub fn stream_prompt(
     key: &str,
     model: &str,
     prompt: &str,
+    extra: &serde_json::Map<String, Value>,
     mut piece: impl FnMut(&str) -> bool,
 ) -> Result<(), String> {
     use std::io::BufRead;
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "stream": true,
         "messages": [{"role": "user", "content": prompt}],
     });
+    // A level's effort, in the endpoint's own field.
+    for (field, value) in extra {
+        body[field] = value.clone();
+    }
     let mut response = send(base_url, key, &body)
-        .map_err(|error| format!("Could not reach OpenRouter: {error}."))?;
+        .map_err(|error| format!("Could not reach the endpoint: {error}."))?;
     if !response.status().is_success() {
         return Err(failure(response.status().as_u16(), &body_text(&mut response)?));
     }
@@ -89,7 +94,7 @@ pub fn stream_prompt(
     let mut lines = std::io::BufReader::new(reader).lines();
     let mut first = String::new();
     while let Some(line) = lines.next() {
-        let line = line.map_err(|error| format!("OpenRouter's reply could not be read: {error}."))?;
+        let line = line.map_err(|error| format!("The endpoint's reply could not be read: {error}."))?;
         let Some(data) = line.trim().strip_prefix("data:") else {
             // Not server-sent events: keep it, in case the whole body is JSON.
             first.push_str(&line);
@@ -116,7 +121,7 @@ pub fn stream_prompt(
     }
     if !first.trim().is_empty() {
         let reply: Value = serde_json::from_str(first.trim())
-            .map_err(|_| String::from("OpenRouter's reply was not JSON."))?;
+            .map_err(|_| String::from("The endpoint's reply was not JSON."))?;
         let full = message(&reply)?;
         let text = full.get("content").and_then(Value::as_str).unwrap_or("");
         if !text.is_empty() {
@@ -132,9 +137,12 @@ fn send(
     body: &Value,
 ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    agent(CHAT_TIMEOUT)
-        .post(&url)
-        .header("Authorization", &format!("Bearer {key}"))
+    let mut request = agent(CHAT_TIMEOUT).post(&url);
+    // A local server, such as Ollama, takes no key.
+    if !key.is_empty() {
+        request = request.header("Authorization", &format!("Bearer {key}"));
+    }
+    request
         .header("HTTP-Referer", "https://github.com/Spumcake/Inpainter")
         .header("X-Title", "Inpainter")
         .header("Content-Type", "application/json")
@@ -145,7 +153,7 @@ fn send(
 pub fn assemble(text: &str) -> Result<Value, String> {
     if !text.contains("data:") {
         let reply: Value = serde_json::from_str(text.trim())
-            .map_err(|_| String::from("OpenRouter's reply was not JSON."))?;
+            .map_err(|_| String::from("The endpoint's reply was not JSON."))?;
         return message(&reply);
     }
     let mut content = String::new();
@@ -194,7 +202,7 @@ fn sse_choices(text: &str) -> Result<Vec<Value>, String> {
             break;
         }
         let value: Value = serde_json::from_str(data)
-            .map_err(|_| String::from("OpenRouter's reply was not JSON."))?;
+            .map_err(|_| String::from("The endpoint's reply was not JSON."))?;
         if let Some(error) = value.get("error") {
             return Err(format!("The model failed: {}.", error_text(error)));
         }
@@ -264,26 +272,32 @@ pub fn message(reply: &Value) -> Result<Value, String> {
     }
 }
 
-/// `GET {base}/models`, every page, keeping the models that can use tools,
-/// sorted by name.
-pub fn models(base_url: &str, key: Option<&str>) -> Result<Vec<Model>, String> {
+/// `GET {base}/models`, every page, sorted by name. With `tools_only`, as
+/// for OpenRouter, it keeps the models that can use tools; an
+/// OpenAI-compatible server does not say, so all of its models are kept.
+pub fn models(base_url: &str, key: Option<&str>, tools_only: bool) -> Result<Vec<Model>, String> {
     let base = base_url.trim_end_matches('/');
     let agent = agent(MODELS_TIMEOUT);
-    let mut url = format!("{base}/models?supported_parameters=tools");
+    let mut url = if tools_only {
+        format!("{base}/models?supported_parameters=tools")
+    } else {
+        format!("{base}/models")
+    };
     let mut found: Vec<Model> = Vec::new();
     for _ in 0..MODEL_PAGES {
         let mut request = agent.get(&url);
-        if let Some(key) = key {
+        if let Some(key) = key.filter(|key| !key.is_empty()) {
             request = request.header("Authorization", &format!("Bearer {key}"));
         }
         let page = read(request.call())?;
         if let Some(error) = page.get("error") {
-            return Err(format!("OpenRouter could not list the models: {}.", error_text(error)));
+            return Err(format!("The endpoint could not list the models: {}.", error_text(error)));
         }
         let Some(data) = page.get("data").and_then(Value::as_array) else {
-            return Err(String::from("OpenRouter's model list could not be read."));
+            return Err(String::from("The endpoint's model list could not be read."));
         };
-        for model in data.iter().filter_map(tool_model) {
+        let listed = data.iter().filter_map(|entry| if tools_only { tool_model(entry) } else { any_model(entry) });
+        for model in listed {
             if !found.iter().any(|known| known.id == model.id) {
                 found.push(model);
             }
@@ -303,6 +317,33 @@ pub fn models(base_url: &str, key: Option<&str>) -> Result<Vec<Model>, String> {
 }
 
 /// One entry of the model list, when it supports tools.
+/// A model of any kind, named by its `name` or else its `id`.
+/// `GET url`, with the key when there is one, within `limit`. The answer's
+/// status, or the reason nothing answered.
+pub fn status(url: &str, key: Option<&str>, limit: Duration) -> Result<u16, String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(limit))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut request = agent.get(url);
+    if let Some(key) = key.filter(|key| !key.is_empty()) {
+        request = request.header("Authorization", &format!("Bearer {key}"));
+    }
+    request.call().map(|response| response.status().as_u16()).map_err(|error| error.to_string())
+}
+
+pub fn any_model(entry: &Value) -> Option<Model> {
+    let id = entry.get("id")?.as_str()?.to_string();
+    let name = entry
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| id.clone());
+    Some(Model { id, name, images: false })
+}
+
 pub fn tool_model(entry: &Value) -> Option<Model> {
     let id = entry.get("id")?.as_str()?.to_string();
     let tools = entry
@@ -347,7 +388,7 @@ fn resolve(base: &str, next: &str) -> String {
 /// The body of a reply, or a sentence saying why not, with OpenRouter's own
 /// message for a status that is not a success.
 fn read_text(response: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<String, String> {
-    let mut response = response.map_err(|error| format!("Could not reach OpenRouter: {error}."))?;
+    let mut response = response.map_err(|error| format!("Could not reach the endpoint: {error}."))?;
     let status = response.status();
     let text = body_text(&mut response)?;
     if !status.is_success() {
@@ -362,7 +403,7 @@ fn body_text(response: &mut ureq::http::Response<ureq::Body>) -> Result<String, 
         .with_config()
         .limit(BODY_LIMIT)
         .read_to_string()
-        .map_err(|error| format!("OpenRouter's reply could not be read: {error}."))
+        .map_err(|error| format!("The endpoint's reply could not be read: {error}."))
 }
 
 /// A status that is not a success, with OpenRouter's own message.
@@ -378,13 +419,13 @@ fn failure(status: u16, text: &str) -> String {
                 text.chars().take(300).collect()
             }
         });
-    format!("OpenRouter answered {status}: {detail}.")
+    format!("The endpoint answered {status}: {detail}.")
 }
 
 /// The body of a reply as JSON, or a sentence saying why not.
 fn read(response: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<Value, String> {
     let text = read_text(response)?;
-    serde_json::from_str(&text).map_err(|_| String::from("OpenRouter's reply was not JSON."))
+    serde_json::from_str(&text).map_err(|_| String::from("The endpoint's reply was not JSON."))
 }
 
 /// OpenRouter's `{code, message, metadata?}`, as one line, with the

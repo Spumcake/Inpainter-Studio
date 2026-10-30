@@ -393,9 +393,10 @@ impl HostWindow {
             None => (String::new(), Vec::new(), true),
         };
         format!(
-            "{tabs:?}|{selected:?}|{}|{name}|{folders:?}|{open}|{}",
+            "{tabs:?}|{selected:?}|{}|{name}|{folders:?}|{open}|{}|{:?}",
             self.chat.conversation.len(),
-            self.flows.moved
+            self.flows.moved,
+            self.level
         )
     }
 
@@ -457,6 +458,7 @@ impl HostWindow {
             selected: None,
             workspace_open: false,
             conversation: Vec::new(),
+            level: self.level.clone(),
         };
         let session = workspace::file_as_session(&project.folder, &file, base);
         match session.write(&project.folder) {
@@ -616,6 +618,10 @@ impl HostWindow {
     /// The logo menu. It only quits, and quitting closes the window as its
     /// close button does.
     pub(super) fn logo(&mut self, choice: LogoChoice, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if choice == LogoChoice::Settings {
+            self.settings_panel.open_at(crate::settings_panel::Page::General);
+            return;
+        }
         if self.locked() || self.flows.busy() {
             return;
         }
@@ -1257,6 +1263,8 @@ impl HostWindow {
             session_created: session.created_at,
             workspace_open: file.workspace_open,
         });
+        // Each session keeps its own level; a new one starts on the default.
+        self.level = session.level.clone();
         self.sessions.renaming = None;
         // The menu's lists are read now, so the panel opens complete.
         self.refresh_sessions();

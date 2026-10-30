@@ -9,7 +9,6 @@ use super::{HostWindow, Started};
 use crate::chat::ChatEvent;
 use crate::process::Running;
 use crate::tablet::Tablet;
-use crate::workspace::ModelChoice;
 use assistant::{Assistant, Config, Role};
 use eframe::App;
 use eframe::egui::{self, Pos2, Rect};
@@ -93,6 +92,7 @@ fn quill_program(dir: &Path) -> PathBuf {
 }
 
 mod cells_checks;
+mod settings_checks;
 
 /// A folder of the check's own, which it removes when done.
 fn scratch(name: &str) -> PathBuf {
@@ -107,6 +107,10 @@ fn scratch(name: &str) -> PathBuf {
 struct StandIn {
     url: String,
     requests: Arc<Mutex<Vec<Value>>>,
+    /// Each request's `Authorization` header, if it had one, in order.
+    keys: Arc<Mutex<Vec<Option<String>>>>,
+    /// What a model list is answered with.
+    models: Arc<Mutex<Value>>,
     replies: Arc<Mutex<std::collections::VecDeque<Value>>>,
     /// While held, a streamed text reply sends its first part, flushes, and
     /// waits for `release` before it sends the rest, as a slow model does.
@@ -124,6 +128,10 @@ impl StandIn {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let seen_keys = keys.clone();
+        let models = Arc::new(Mutex::new(json!({"data": []})));
+        let listed = models.clone();
         let replies = Arc::new(Mutex::new(replies.into_iter().collect::<std::collections::VecDeque<_>>()));
         let script = replies.clone();
         let gate = Arc::new((Mutex::new(Gate::default()), std::sync::Condvar::new()));
@@ -135,23 +143,28 @@ impl StandIn {
                 let mut request_line = String::new();
                 reader.read_line(&mut request_line).unwrap();
                 let mut length = 0;
+                let mut authorization = None;
                 loop {
                     let mut header = String::new();
                     reader.read_line(&mut header).unwrap();
                     if header.trim().is_empty() {
                         break;
                     }
-                    if let Some((name, value)) = header.split_once(':')
-                        && name.eq_ignore_ascii_case("content-length")
-                    {
-                        length = value.trim().parse().unwrap();
+                    if let Some((name, value)) = header.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap();
+                        }
+                        if name.eq_ignore_ascii_case("authorization") {
+                            authorization = Some(value.trim().to_string());
+                        }
                     }
                 }
                 let mut body = vec![0; length];
                 reader.read_exact(&mut body).unwrap();
                 let reply = if request_line.starts_with("GET") {
-                    json!({"data": []})
+                    listed.lock().unwrap().clone()
                 } else {
+                    seen_keys.lock().unwrap().push(authorization);
                     seen.lock()
                         .unwrap()
                         .push(serde_json::from_slice(&body).unwrap());
@@ -189,9 +202,21 @@ impl StandIn {
         Self {
             url,
             requests,
+            keys,
+            models,
             replies,
             gate,
         }
+    }
+
+    /// The `Authorization` header of each request, in order.
+    fn keys(&self) -> Vec<Option<String>> {
+        self.keys.lock().unwrap().clone()
+    }
+
+    /// A model list asked for is answered with `list`.
+    fn list_models(&self, list: Value) {
+        *self.models.lock().unwrap() = list;
     }
 
     /// Streamed replies pause after their first part until `release`.
@@ -277,12 +302,7 @@ impl Window {
             api_key: Some(String::from("stand-in")),
             wake: Arc::new(move || wake_ctx.request_repaint()),
         });
-        app.openrouter_url = stand_in.url.clone();
-        app.openrouter_key = Some(String::from("stand-in"));
-        app.chat.model = Some(ModelChoice {
-            id: String::from("stand-in/model"),
-            name: String::from("Stand-in"),
-        });
+        use_stand_in(&mut app, &stand_in.url);
         let mut window = Self {
             ctx,
             app,
@@ -619,6 +639,23 @@ impl Window {
     }
 }
 
+/// Settings as a first start makes them, on the stand-in: its endpoint, with
+/// a key, and every level on its model.
+fn use_stand_in(app: &mut HostWindow, url: &str) -> String {
+    let endpoint = app
+        .settings
+        .first_start(url)
+        .or_else(|| app.settings.endpoints.first().map(|endpoint| endpoint.id.clone()))
+        .expect("an endpoint");
+    app.settings.update(|settings| {
+        for level in &mut settings.levels {
+            level.model = String::from("stand-in/model");
+        }
+    });
+    app.keys.set(&endpoint, "stand-in").expect("the key is kept");
+    endpoint
+}
+
 /// A window on a fresh data folder: every given sub-application is started
 /// inside the project the folder holds, which is a new one when it is empty.
 fn project_window(specs: Vec<super::AppSpec>, stand_in: &StandIn, data: &Path) -> Window {
@@ -632,14 +669,9 @@ fn project_window(specs: Vec<super::AppSpec>, stand_in: &StandIn, data: &Path) -
         api_key: Some(String::from("stand-in")),
         wake: Arc::new(move || wake_ctx.request_repaint()),
     });
-    app.openrouter_url = stand_in.url.clone();
-    app.openrouter_key = Some(String::from("stand-in"));
-    app.chat.model = Some(ModelChoice {
-        id: String::from("stand-in/model"),
-        name: String::from("Stand-in"),
-    });
     app.data = Some(data.to_path_buf());
     app.settings = crate::workspace::Settings::load(Some(data.join("settings.json")));
+    use_stand_in(&mut app, &stand_in.url);
     app.open_current();
     let mut window = Window {
         ctx,

@@ -4,7 +4,6 @@
 use crate::toolbar;
 use crate::typescale as ts;
 use crate::widgets::{self, BORDER, MUTED, TEXT};
-use assistant::{NO_KEY, NO_MODEL};
 use eframe::egui::{self, Align2, Color32, Rect, Sense, pos2, vec2};
 use protocol::{Cell, CellPart, CellState};
 use std::collections::HashMap;
@@ -24,6 +23,8 @@ pub(crate) enum CardAction {
     Drag(Cell),
     /// The card's "…" was clicked, at this place.
     More(String, Rect),
+    /// The card's chevron was clicked, at this place: choose its model.
+    Models(String, Rect),
     /// A rendered Markdown cell was double-clicked: show its source.
     ShowSource(String),
 }
@@ -44,7 +45,10 @@ pub(crate) struct Run {
     pub id: String,
     /// The assistant call this conversation cell answers, when it has one.
     pub call: Option<String>,
+    /// The endpoint id and model it runs on, recorded on the cell.
+    pub endpoint: String,
     pub model: String,
+    pub effort: Option<String>,
     /// The prompt as it was when the run began: the version the run makes
     /// holds this, whatever is typed meanwhile.
     pub prompt: String,
@@ -73,6 +77,10 @@ pub(crate) struct Board {
     /// The open cell menu's buttons last frame, by name, so a check can
     /// press them.
     pub menu_buttons: Vec<(&'static str, Rect)>,
+    /// A notebook cell's level chosen from its chevron, by cell id: the
+    /// endpoint id, model, and effort its next run uses. The run's result
+    /// records them.
+    pub chosen: HashMap<String, (String, String, Option<String>)>,
 }
 
 impl Default for Board {
@@ -86,6 +94,7 @@ impl Default for Board {
             cards: Vec::new(),
             bordered: None,
             menu_buttons: Vec::new(),
+            chosen: HashMap::new(),
         }
     }
 }
@@ -113,35 +122,38 @@ impl Board {
     }
 }
 
-/// Starts a text run. Its pieces arrive on the run's channel as they are read.
-pub(crate) fn start_run(base: &str, key: Option<&str>, model: &str, prompt: &str) -> Receiver<Piece> {
+/// Starts a text run on `route`, or fails at once with the reason there is
+/// none. Its pieces arrive on the run's channel as they are read.
+pub(crate) fn start_run(route: Result<crate::endpoints::Route, String>, prompt: &str) -> Receiver<Piece> {
     let (tx, rx) = channel();
-    let fail = if key.map(|key| key.trim().is_empty()).unwrap_or(true) {
-        Some(NO_KEY.to_string())
-    } else if model.trim().is_empty() {
-        Some(NO_MODEL.to_string())
-    } else {
-        None
+    let route = match route {
+        Ok(route) => match route.blocked() {
+            Some(reason) => Err(reason),
+            None => Ok(route),
+        },
+        Err(reason) => Err(reason),
     };
-    if let Some(reason) = fail {
-        let _ = tx.send(Piece::Failed(reason));
-        return rx;
-    }
-    let base = base.to_string();
-    let key = key.unwrap_or_default().to_string();
-    let model = model.to_string();
+    let route = match route {
+        Ok(route) => route,
+        Err(reason) => {
+            let _ = tx.send(Piece::Failed(reason));
+            return rx;
+        }
+    };
     let prompt = prompt.to_string();
     let _ = std::thread::Builder::new()
         .name(String::from("cell-run"))
-        .spawn(move || stream_into(base, key, model, prompt, tx));
+        .spawn(move || stream_into(route, prompt, tx));
     rx
 }
 
 /// Each piece goes to the window as soon as it is read. When the window
 /// drops the run, as Stop does, the next send fails and the stream ends.
-fn stream_into(base: String, key: String, model: String, prompt: String, tx: Sender<Piece>) {
+fn stream_into(route: crate::endpoints::Route, prompt: String, tx: Sender<Piece>) {
     let mut open = true;
-    let result = assistant::stream_prompt(&base, &key, &model, &prompt, |text| {
+    let key = route.key.clone().unwrap_or_default();
+    let extra = route.extra();
+    let result = assistant::stream_prompt(&route.base, &key, &route.model, &prompt, &extra, |text: &str| {
         open = tx.send(Piece::Text(text.to_string())).is_ok();
         open
     });
@@ -355,9 +367,19 @@ pub(crate) fn paint_card(
     if ui.interact(more, egui::Id::new(("cell-more", &cell.id)), Sense::click()).clicked() {
         actions.push(CardAction::More(cell.id.clone(), more));
     }
+    // The chevron chooses the model an LLM cell runs on, as the owner set
+    // on 2026-10-29.
     let menu = Rect::from_min_size(pos2(more.left() - 10.0 - BUTTON_H, mid - BUTTON_H / 2.0), vec2(BUTTON_H, BUTTON_H));
-    widgets::outlined(&painter, menu, 7.0, Color32::WHITE, BORDER);
-    toolbar::paint_icon(&painter, menu.center(), "nav-arrow-down", 14.0, TEXT);
+    let chooses = cell.kind == protocol::TEXT_KIND && !running;
+    let chevron = ui
+        .interact(menu, egui::Id::new(("cell-models", &cell.id)), Sense::click())
+        .on_hover_text("Model");
+    let fill = if chooses && chevron.hovered() { widgets::SELECTED } else { Color32::WHITE };
+    widgets::outlined(&painter, menu, 7.0, fill, BORDER);
+    toolbar::paint_icon(&painter, menu.center(), "nav-arrow-down", 14.0, if chooses { TEXT } else { DISABLED });
+    if chooses && chevron.clicked() {
+        actions.push(CardAction::Models(cell.id.clone(), menu));
+    }
 
     let can_run = runs(&cell.kind) && !draft.trim().is_empty() && !running;
     let enabled = running || can_run;

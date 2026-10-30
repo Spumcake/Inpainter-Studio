@@ -716,3 +716,33 @@ pub(crate) fn soft_shadow(painter: &Painter, rect: Rect, radius: f32) {
 pub(crate) fn vertical_rule(painter: &Painter, x: f32, top: f32, bottom: f32, color: Color32) {
     painter.vline(x, top..=bottom, Stroke::new(1.0, color));
 }
+
+/// Every menu floats on one card: white, a faint hairline, well-rounded
+/// corners, and a soft, wide shadow, as the owner set on 2026-10-29.
+const MENU_EDGE: Color32 = Color32::from_rgb(236, 237, 240);
+const MENU_RADIUS: u8 = 16;
+const MENU_SHADOW: egui::epaint::Shadow = egui::epaint::Shadow {
+    offset: [0, 8],
+    blur: 32,
+    spread: 0,
+    color: Color32::from_black_alpha(18),
+};
+
+/// Gives every menu, list, and popup the card.
+pub(crate) fn menu_card(style: &mut egui::Style) {
+    style.visuals.window_fill = Color32::WHITE;
+    style.visuals.window_stroke = Stroke::new(1.0, MENU_EDGE);
+    style.visuals.menu_corner_radius = MENU_RADIUS.into();
+    style.visuals.popup_shadow = MENU_SHADOW;
+    style.spacing.menu_margin = egui::Margin::same(8);
+}
+
+/// The card, with the room the level picker's contents want.
+pub(crate) fn floating_card() -> egui::Frame {
+    egui::Frame::new()
+        .fill(Color32::WHITE)
+        .stroke(Stroke::new(1.0, MENU_EDGE))
+        .corner_radius(MENU_RADIUS)
+        .inner_margin(12)
+        .shadow(MENU_SHADOW)
+}

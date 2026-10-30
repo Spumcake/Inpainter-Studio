@@ -8,8 +8,7 @@
 use crate::toolbar::{self, ICON};
 use crate::typescale as ts;
 use crate::widgets::{self, BORDER, MUTED, SELECTED, TEXT};
-use crate::workspace::ModelChoice;
-use assistant::{Attachment, Entry, Model, Role};
+use assistant::{Attachment, Entry, Role};
 use eframe::egui::{
     self, Align, Align2, Color32, Event, Galley, Key, Layout, Pos2, Rect, Sense,
     UiBuilder, pos2, vec2,
@@ -63,9 +62,12 @@ pub(crate) struct Chat {
     pub input: String,
     /// Files chosen with the plus and not yet sent.
     pub chips: Vec<PathBuf>,
-    /// The models that can use tools, once listed, or why not.
-    pub models: Option<Result<Vec<Model>, String>>,
-    pub model: Option<ModelChoice>,
+    /// The assistant's levels, as the picker shows them, lowest first.
+    pub levels: Vec<LevelView>,
+    /// The level this session uses, by index in `levels`.
+    pub current: Option<usize>,
+    /// Where the session menu's panel opens, so Settings opens there too.
+    pub anchor: Option<Pos2>,
     logo: Option<egui::TextureHandle>,
     /// The input sits in the middle: the conversation is empty and fills the window.
     pub input_centered: bool,
@@ -79,9 +81,21 @@ pub(crate) struct Chat {
     pub queued: Vec<(String, Vec<PathBuf>)>,
 }
 
-/// The logo menu has one row.
+/// One level, as the picker shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LevelView {
+    pub id: String,
+    pub name: String,
+    /// The model's name, without its maker.
+    pub model: String,
+    /// "Medium", or empty for no effort.
+    pub effort: String,
+}
+
+/// The logo menu's rows.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum LogoChoice {
+    Settings,
     Quit,
 }
 
@@ -96,9 +110,10 @@ pub(crate) enum ChatEvent {
     Retry(String),
     /// The plus: choose files to attach.
     Attach,
-    /// The model list is wanted.
-    ListModels,
-    Model(Model),
+    /// A level chosen on the picker's slider, by id.
+    Level(String),
+    /// The picker's chevron: open Settings at Discussion.
+    LevelSettings,
     Logo(LogoChoice),
     /// A choice in the session menu.
     Session(crate::sessions::SessionChoice),
@@ -158,6 +173,7 @@ pub(crate) fn show(
     chat.input_centered = centered;
     chat.centered_column = fills && !empty;
     let mut picks = Vec::new();
+    chat.anchor = Some(pos2(inner.center().x, inner.top() + LOGO_CENTER + 27.0));
     crate::sessions::pill(ui, pos2(inner.center().x, inner.top() + LOGO_CENTER), sessions, &mut picks);
     events.extend(picks.into_iter().map(ChatEvent::Session));
 
@@ -212,7 +228,7 @@ fn logo_texture(ui: &egui::Ui, chat: &mut Chat) -> Option<egui::TextureId> {
     chat.logo.as_ref().map(egui::TextureHandle::id)
 }
 
-/// The logo and its chevron, which open a menu with Quit.
+/// The logo and its chevron, which open a menu with Settings and Quit.
 fn logo_button(ui: &mut egui::Ui, center: Pos2, chat: &mut Chat, events: &mut Vec<ChatEvent>) {
     let logo = Rect::from_center_size(center, vec2(LOGO, LOGO));
     let chevron = pos2(logo.right() + 16.0, center.y);
@@ -240,8 +256,10 @@ fn logo_button(ui: &mut egui::Ui, center: Pos2, chat: &mut Chat, events: &mut Ve
 
     let waits = !chat.working;
     egui::Popup::menu(&response).show(|ui| {
-        if widgets::menu_rows(ui, &[item("Quit", waits, false, false)]).is_some() {
-            events.push(ChatEvent::Logo(LogoChoice::Quit));
+        match widgets::menu_rows(ui, &[item("Settings", true, false, false), item("Quit", waits, false, true)]) {
+            Some(0) => events.push(ChatEvent::Logo(LogoChoice::Settings)),
+            Some(1) => events.push(ChatEvent::Logo(LogoChoice::Quit)),
+            _ => {}
         }
     });
 }
@@ -445,8 +463,31 @@ fn can_send(chat: &Chat) -> bool {
     !chat.input.trim().is_empty() || !chat.chips.is_empty()
 }
 
-/// The quiet pill: a lightning mark, the model's name, and a chevron. It
-/// opens the list of models that can use tools.
+/// The slider's blue, as the level-picker view shows it.
+const SLIDER: Color32 = Color32::from_rgb(37, 99, 235);
+const TRACK: Color32 = Color32::from_rgb(236, 238, 241);
+
+/// The stop nearest `x` on a slider of `stops` stops across `track`.
+pub(crate) fn stop_at(track: Rect, stops: usize, x: f32) -> usize {
+    if stops <= 1 {
+        return 0;
+    }
+    let inner = track.shrink2(vec2(track.height() / 2.0, 0.0));
+    let t = ((x - inner.left()) / inner.width()).clamp(0.0, 1.0);
+    (t * (stops - 1) as f32).round() as usize
+}
+
+fn stop_x(track: Rect, stops: usize, index: usize) -> f32 {
+    let inner = track.shrink2(vec2(track.height() / 2.0, 0.0));
+    if stops <= 1 {
+        return inner.left();
+    }
+    inner.left() + inner.width() * index as f32 / (stops - 1) as f32
+}
+
+/// The quiet pill: a lightning mark, the level's name, and a chevron. It
+/// opens the level picker: the level's model and effort, a chevron to
+/// Settings, and a slider with a stop for each level.
 fn model_picker(
     ui: &mut egui::Ui,
     chat: &mut Chat,
@@ -455,11 +496,8 @@ fn model_picker(
     events: &mut Vec<ChatEvent>,
 ) {
     let font = ts::small();
-    let name = chat
-        .model
-        .as_ref()
-        .map_or("Choose a model", |model| short_name(&model.name))
-        .to_string();
+    let current = chat.current.and_then(|index| chat.levels.get(index)).cloned();
+    let name = current.as_ref().map_or("Set up a level", |level| level.name.as_str()).to_string();
     let room = (max_right - left_center.x - 10.0 - 14.0 - 6.0 - 8.0 - 12.0 - 10.0).max(20.0);
     let galley = ui.painter().layout(
         name,
@@ -472,7 +510,7 @@ fn model_picker(
     let pill = Rect::from_min_size(pos2(left_center.x, left_center.y - 16.0), vec2(width, 32.0));
     let response = ui
         .interact(pill, egui::Id::new("model-picker"), Sense::click())
-        .on_hover_text("Model");
+        .on_hover_text("Level");
     let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
     let fill = if response.hovered() || open { SELECTED } else { PILL };
     widgets::outlined(ui.painter(), pill, 16.0, fill, BORDER);
@@ -496,52 +534,111 @@ fn model_picker(
         MUTED,
         widgets::Scale(1.0),
     );
-    let listed = matches!(&chat.models, Some(Ok(models)) if !models.is_empty());
-    if response.clicked() && !listed {
-        events.push(ChatEvent::ListModels);
-    }
 
-    let chosen = chat.model.as_ref().map(|model| model.id.clone());
+    let levels = chat.levels.clone();
+    let chosen = chat.current;
     egui::Popup::menu(&response)
         .width(300.0)
-        .gap(6.0)
-        .show(|ui| {
-            ui.set_width(300.0);
-            let note = |ui: &mut egui::Ui, text: &str| {
-                ui.add(egui::Label::new(egui::RichText::new(text).color(MUTED).size(ts::body_size())).wrap());
-            };
-            match &chat.models {
-                None => note(ui, "Finding the models…"),
-                Some(Err(reason)) => note(ui, reason),
-                Some(Ok(models)) if models.is_empty() => note(ui, "No models that can use tools were found."),
-                Some(Ok(models)) => {
-                    egui::ScrollArea::vertical()
-                        .id_salt("model-list")
-                        .max_height(360.0)
-                        .show(ui, |ui| {
-                            ui.spacing_mut().item_spacing.y = 2.0;
-                            for model in models {
-                                let (row, row_response) =
-                                    ui.allocate_exact_size(vec2(288.0, 28.0), Sense::click());
-                                if Some(&model.id) == chosen.as_ref() || row_response.hovered() {
-                                    ui.painter().rect_filled(row, 4.0, SELECTED);
-                                }
-                                ui.painter().with_clip_rect(row.shrink(2.0)).text(
-                                    pos2(row.left() + 10.0, row.center().y),
-                                    Align2::LEFT_CENTER,
-                                    &model.name,
-                                    ts::body(),
-                                    TEXT,
-                                );
-                                if row_response.clicked() {
-                                    events.push(ChatEvent::Model(model.clone()));
-                                    ui.close();
-                                }
-                            }
-                        });
-                }
+        .gap(8.0)
+        .frame(widgets::floating_card())
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| match level_picker(ui, "composer", &levels, chosen, None) {
+            Some(LevelPick::Level(id)) => events.push(ChatEvent::Level(id)),
+            Some(LevelPick::Settings) => {
+                events.push(ChatEvent::LevelSettings);
+                ui.close();
             }
+            None => {}
         });
+}
+
+/// What the level picker chose.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum LevelPick {
+    Level(String),
+    /// Its chevron: the levels in Settings.
+    Settings,
+}
+
+/// The level picker, as the level-picker view shows it and the composer
+/// and every LLM cell's chevron open it, as the owner set on 2026-10-29:
+/// the level's model and effort, a chevron to Settings, and a slider with
+/// a stop for each level. `chosen` is the level in use; with none, as for
+/// a cell on a model no level names, `own` gives the model and effort shown,
+/// and the slider has no knob until a stop is chosen.
+pub(crate) fn level_picker(
+    ui: &mut egui::Ui,
+    salt: &str,
+    levels: &[LevelView],
+    chosen: Option<usize>,
+    own: Option<(String, String)>,
+) -> Option<LevelPick> {
+    ui.set_width(300.0);
+    let mut pick = None;
+    if levels.is_empty() {
+        ui.add(egui::Label::new(egui::RichText::new("No levels are set. Add one in Settings, under Discussion.").color(MUTED).size(ts::body_size())).wrap());
+        let (row, row_response) = ui.allocate_exact_size(vec2(288.0, 30.0), Sense::click());
+        ui.painter().text(row.left_center(), Align2::LEFT_CENTER, "Open Settings", ts::body(), TEXT);
+        if row_response.clicked() {
+            pick = Some(LevelPick::Settings);
+        }
+        return pick;
+    }
+    let (model, effort) = match chosen.and_then(|index| levels.get(index)) {
+        Some(level) => (level.model.clone(), level.effort.clone()),
+        None => own.unwrap_or_default(),
+    };
+    // The model, its effort in gray, and a chevron to Settings.
+    let (head, _) = ui.allocate_exact_size(vec2(300.0, 32.0), Sense::hover());
+    toolbar::paint_icon(ui.painter(), pos2(head.left() + 10.0, head.center().y), "flash-solid", 14.0, ICON);
+    let shown = ui.painter().text(pos2(head.left() + 26.0, head.center().y), Align2::LEFT_CENTER, &model, ts::title(), TEXT);
+    let mut right = shown.right();
+    if !effort.is_empty() {
+        right = ui.painter().text(pos2(right + 8.0, head.center().y), Align2::LEFT_CENTER, &effort, ts::body(), MUTED).right();
+    }
+    let to_settings = Rect::from_center_size(pos2(right + 16.0, head.center().y), vec2(24.0, 24.0));
+    let link = ui
+        .interact(to_settings, egui::Id::new(("level-settings", salt)), Sense::click())
+        .on_hover_text("Levels in Settings");
+    if link.hovered() {
+        ui.painter().rect_filled(to_settings, 6.0, SELECTED);
+    }
+    widgets::chevron_side(ui.painter(), to_settings.center(), true, MUTED);
+    if link.clicked() {
+        pick = Some(LevelPick::Settings);
+    }
+    // The slider: a stop for each level, blue up to the chosen one.
+    let (track_row, _) = ui.allocate_exact_size(vec2(300.0, 36.0), Sense::hover());
+    let track = Rect::from_center_size(track_row.center(), vec2(288.0, 26.0));
+    let slide = ui.interact(track, egui::Id::new(("level-slider", salt)), Sense::click_and_drag());
+    let stops = levels.len();
+    let mut at = chosen.map(|index| index.min(stops - 1));
+    if (slide.clicked() || slide.dragged())
+        && let Some(pointer) = slide.interact_pointer_pos()
+    {
+        let picked = stop_at(track, stops, pointer.x);
+        if Some(picked) != chosen {
+            pick = Some(LevelPick::Level(levels[picked].id.clone()));
+        }
+        at = Some(picked);
+    }
+    ui.painter().rect_filled(track, 13.0, TRACK);
+    if let Some(at) = at {
+        let knob = pos2(stop_x(track, stops, at), track.center().y);
+        ui.painter().rect_filled(Rect::from_min_max(track.min, pos2(knob.x + 13.0, track.bottom())), 13.0, SLIDER);
+        for index in 0..stops {
+            let color = if index < at { Color32::WHITE } else { MUTED };
+            widgets::disc(ui.painter(), pos2(stop_x(track, stops, index), track.center().y), 2.0, color);
+        }
+        widgets::disc(ui.painter(), knob, 12.0, BORDER);
+        widgets::disc(ui.painter(), knob, 11.0, Color32::WHITE);
+    } else {
+        for index in 0..stops {
+            widgets::disc(ui.painter(), pos2(stop_x(track, stops, index), track.center().y), 2.0, MUTED);
+        }
+    }
+    slide.widget_info(|| egui::WidgetInfo::slider(true, at.unwrap_or(0) as f64, "Level"));
+    pick
 }
 
 /// The conversation, from the top, scrolling. The person's messages are on
@@ -1110,7 +1207,7 @@ mod tests {
         let ctx = egui::Context::default();
         crate::toolbar::install_fonts(&ctx);
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            for name in ["plus", "flash-solid", "microphone", "arrow-up", "xmark"] {
+            for name in ["plus", "flash-solid", "microphone", "arrow-up", "xmark", "nav-arrow-right"] {
                 toolbar::paint_icon(ui.painter(), Pos2::ZERO, name, 16.0, ICON);
             }
         });

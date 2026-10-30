@@ -193,6 +193,9 @@ pub enum HostMessage {
         input: Vec<CellPart>,
         endpoint: String,
         model: String,
+        /// The reasoning effort it ran at, if one was set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
         state: CellState,
         output: Vec<CellPart>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -666,6 +669,7 @@ mod tests {
             ],
             endpoint: Some("openrouter".into()),
             model: Some("stand-in/model".into()),
+            effort: Some("low".into()),
             output: vec![CellPart::Path {
                 path: "/tmp/out.png".into(),
                 media_type: "image/png".into(),
@@ -677,6 +681,7 @@ mod tests {
                 input: vec![CellPart::Text { text: "Describe this.".into() }],
                 endpoint: Some("openrouter".into()),
                 model: Some("stand-in/model".into()),
+                effort: Some("low".into()),
                 output: vec![CellPart::Path { path: "/tmp/out.png".into(), media_type: "image/png".into() }],
                 state: CellState::Done,
                 error: None,
@@ -691,6 +696,7 @@ mod tests {
             input: vec![CellPart::Text { text: "a rising line".into() }],
             endpoint: None,
             model: None,
+            effort: None,
             output: Vec::new(),
             state: CellState::Idle,
             error: None,
@@ -718,6 +724,7 @@ mod tests {
             input: path.input.clone(),
             endpoint: "openrouter".into(),
             model: "stand-in/model".into(),
+            effort: Some("high".into()),
             state: CellState::Failed,
             output: path.output.clone(),
             error: Some("The model failed.".into()),

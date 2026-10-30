@@ -17,7 +17,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 mod agent;
 mod openrouter;
 mod prompt;
-pub use openrouter::stream_prompt;
+pub use openrouter::{models, status, stream_prompt};
 #[cfg(test)]
 mod tests;
 
@@ -28,7 +28,7 @@ pub const MAX_CALLS: usize = 40;
 /// The note a stopped request ends with.
 pub const STOPPED: &str = "Stopped.";
 
-pub const NO_KEY: &str = "No OpenRouter key is set. Inpainter reads it from OPENROUTER_API_KEY, set in the environment or in a .env file in Inpainter's data folder, when it starts.";
+pub const NO_KEY: &str = "No key is set for the Discussion skill's endpoint. Add one in Settings, under Endpoints.";
 
 /// Shown when a run is asked for and the picker has no model.
 pub const NO_MODEL: &str = "No model is chosen.";
@@ -109,8 +109,10 @@ impl Attachment {
 pub struct Request {
     pub text: String,
     pub attachments: Vec<Attachment>,
-    /// An OpenRouter model id.
+    /// The model id, as the endpoint names it.
     pub model: String,
+    /// How hard the model thinks: `low`, `medium`, or `high`, or none.
+    pub effort: Option<String>,
     /// The selected tab: its application id and tab id.
     pub selected: Option<(String, String)>,
     /// Every running sub-application.
@@ -139,6 +141,48 @@ pub enum Command {
     /// Add a notice to the conversation, such as a file that could not be
     /// read. Shown and kept, never sent to the model.
     Note(String),
+    /// Where requests go from now on, and how the assistant speaks: the
+    /// Discussion skill's endpoint, its key, its kind, and its prompt. A
+    /// request already running keeps what it began with.
+    Configure(Endpoint),
+}
+
+/// How an endpoint takes a reasoning effort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reasoning {
+    /// OpenRouter: `reasoning: {effort}`.
+    OpenRouter,
+    /// An OpenAI-compatible server: `reasoning_effort`.
+    OpenAi,
+}
+
+/// The Discussion skill's endpoint and prompt, as the host sets them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Endpoint {
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub reasoning: Reasoning,
+    /// How to speak with the person, sent after Studio's own rules.
+    pub voice: String,
+    /// Why no request can go to this endpoint, as the host says it, such as
+    /// a key it lacks. A request is then answered with this note.
+    pub refusal: Option<String>,
+}
+
+/// The request body's fields for an effort on this kind of endpoint.
+pub fn effort_fields(reasoning: Reasoning, effort: Option<&str>) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::new();
+    if let Some(effort) = effort {
+        match reasoning {
+            Reasoning::OpenRouter => {
+                fields.insert("reasoning".into(), serde_json::json!({"effort": effort}));
+            }
+            Reasoning::OpenAi => {
+                fields.insert("reasoning_effort".into(), serde_json::json!(effort));
+            }
+        }
+    }
+    fields
 }
 
 /// What the assistant tells the host.

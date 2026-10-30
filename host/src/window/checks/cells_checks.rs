@@ -205,17 +205,19 @@ fn a_cell_fails_with_the_reason_and_stops_with_what_arrived() {
         text_reply("I could not run it."),
     ]);
     let mut window = project_window(apps(), &stand_in, &dir);
-    window.app.openrouter_key = None;
     window.app.chat.input = "Write about a dark shore.".into();
     let ctx = window.ctx.clone();
     window.app.chat_event(ChatEvent::Send, &ctx, &mut window.frame);
+    // The request keeps the key it began with; the cell it starts finds none.
+    let endpoint = window.app.settings.endpoints[0].id.clone();
+    window.app.keys.delete(&endpoint);
     window.until(|app| {
         app.chat.conversation.iter().any(|entry| {
             entry.cell.as_ref().is_some_and(|cell| cell.state == CellState::Failed)
         })
     });
     let failed = conversation_cell(&window.app);
-    assert_eq!(failed.error.as_deref(), Some(assistant::NO_KEY));
+    assert_eq!(failed.error.as_deref(), Some("No key is set for “OpenRouter”. Add one in Settings, under Endpoints."));
     assert!(failed.result_text().is_empty());
     window.until(|app| !app.chat.working);
 
@@ -228,7 +230,9 @@ fn a_cell_fails_with_the_reason_and_stops_with_what_arrived() {
         ),
         text_reply(full),
     ]);
-    window.app.openrouter_key = Some(String::from("stand-in"));
+    window.app.keys.set(&endpoint, "stand-in").unwrap();
+    // A frame passes, as for a person, and the assistant hears of the key.
+    window.step();
     // The model pauses after its first part, so Stop lands mid-answer.
     stand_in.hold();
     window.app.chat.input = "Write more.".into();
@@ -1109,5 +1113,74 @@ fn the_border_goes_on_a_click_away_and_the_bar_stays() {
     window.step();
     let added = book_cells(&window.app)[1].id.clone();
     assert_eq!(window.app.board.bordered.as_deref(), Some(added.as_str()), "a new active cell has no border");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Catches cells left on the old wiring: with the endpoint's address and
+/// key changed in Settings, a notebook cell reaches the new address with
+/// the new key, and the level's model and effort. Nothing comes from the
+/// environment.
+#[test]
+fn a_notebook_cell_runs_on_what_settings_say() {
+    let dir = scratch("book-settings");
+    let stand_in = StandIn::start(Vec::new());
+    let moved = StandIn::start(vec![text_reply(PIECE)]);
+    let mut window = project_window(apps(), &stand_in, &dir);
+    let mut endpoint = window.app.settings.endpoints[0].clone();
+    endpoint.address = moved.url.clone();
+    let Window { app, frame, .. } = &mut window;
+    app.apply_setting(
+        crate::settings_panel::SettingsChoice::SaveEndpoint {
+            id: Some(endpoint.id.clone()),
+            kind: endpoint.kind,
+            name: endpoint.name.clone(),
+            address: endpoint.address.clone(),
+            key: Some(String::from("new-key")),
+        },
+        frame,
+    );
+    window.select("mission-control");
+    show_workspace(&mut window);
+    let id = book_cells(&window.app)[0].id.clone();
+    type_prompt(&mut window, &id, "A keeper at the lamp.");
+    window.until(|app| book_cells(app).iter().any(|cell| cell.prompt() == "A keeper at the lamp."));
+    command(&mut window, "mission-control", "run");
+    window.until(|app| book_cells(app).iter().any(|cell| cell.result_text() == PIECE && cell.state == CellState::Done));
+    assert!(stand_in.requests().is_empty(), "the cell went to the old address");
+    let sent = moved.requests();
+    assert_eq!(sent[0]["model"], "stand-in/model");
+    assert_eq!(sent[0]["reasoning"]["effort"], "medium");
+    assert_eq!(moved.keys()[0].as_deref(), Some("Bearer new-key"));
+    assert_eq!(book_cells(&window.app)[0].endpoint.as_deref(), Some(endpoint.id.as_str()));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Catches a notebook cell whose chevron does nothing: the level chosen
+/// there is what its run sends, and the run's version records it.
+#[test]
+fn a_notebook_cells_chevron_chooses_its_level() {
+    let dir = scratch("book-chevron");
+    let stand_in = StandIn::start(vec![text_reply(PIECE)]);
+    let mut window = project_window(apps(), &stand_in, &dir);
+    window.select("mission-control");
+    show_workspace(&mut window);
+    let id = book_cells(&window.app)[0].id.clone();
+    type_prompt(&mut window, &id, "A keeper at the lamp.");
+    window.until(|app| book_cells(app).iter().any(|cell| cell.prompt() == "A keeper at the lamp."));
+    let mut sonnet = window.app.settings.levels.iter().find(|level| level.name == "Sonnet High").unwrap().clone();
+    sonnet.model = String::from("stand-in/other");
+    window.app.settings.update(|settings| {
+        if let Some(level) = settings.levels.iter_mut().find(|level| level.id == sonnet.id) {
+            *level = sonnet.clone();
+        }
+    });
+    window.app.choose_cell_level(&id, &sonnet.id);
+    command(&mut window, "mission-control", "run");
+    window.until(|app| book_cells(app).iter().any(|cell| cell.result_text() == PIECE && cell.state == CellState::Done));
+    assert_eq!(stand_in.requests()[0]["model"], "stand-in/other");
+    assert_eq!(stand_in.requests()[0]["reasoning"]["effort"], "high");
+    let ran = &book_cells(&window.app)[0];
+    assert_eq!((ran.model.as_deref(), ran.effort.as_deref()), (Some("stand-in/other"), Some("high")));
+    assert!(window.app.board.chosen.is_empty());
     let _ = std::fs::remove_dir_all(dir);
 }

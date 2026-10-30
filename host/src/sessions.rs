@@ -13,23 +13,23 @@ use eframe::egui::{self, Align2, Color32, Key, Pos2, Rect, Sense, UiBuilder, pos
 /// The panel's size, and its parts.
 const PANEL_W: f32 = 800.0;
 const PANEL_H: f32 = 560.0;
-const COLUMN_W: f32 = 236.0;
-const PAD: f32 = 16.0;
-const NAV_ROW: f32 = 36.0;
+pub(crate) const COLUMN_W: f32 = 236.0;
+pub(crate) const PAD: f32 = 16.0;
+pub(crate) const NAV_ROW: f32 = 36.0;
 /// The space between the left column's rows.
-const NAV_GAP: f32 = 2.0;
+pub(crate) const NAV_GAP: f32 = 2.0;
 const LIST_ROW: f32 = 56.0;
 const TILE: f32 = 32.0;
 /// Every button and field in the panel shares the left rows' height, and
 /// sets its text this far in from its edge, as the owner set on 2026-10-29.
-const CONTROL_H: f32 = NAV_ROW;
-const INSET: f32 = 12.0;
+pub(crate) const CONTROL_H: f32 = NAV_ROW;
+pub(crate) const INSET: f32 = 12.0;
 /// The dark button's fill.
-const DARK: Color32 = Color32::from_rgb(24, 24, 27);
+pub(crate) const DARK: Color32 = Color32::from_rgb(24, 24, 27);
 /// The faint dimming laid over everything behind the open panel, as the
 /// owner set on 2026-10-29.
-const OVERLAY: Color32 = Color32::from_black_alpha(20);
-const HINT: Color32 = Color32::from_rgb(156, 160, 166);
+pub(crate) const OVERLAY: Color32 = Color32::from_black_alpha(20);
+pub(crate) const HINT: Color32 = Color32::from_rgb(156, 160, 166);
 /// The mark for a project or session kept on this computer.
 const LOCAL: &str = "computer";
 
@@ -296,7 +296,7 @@ fn panel(ctx: &egui::Context, top: Pos2, pill: Rect, menu: &mut SessionMenu, eve
 
 /// One row of the left column: an icon, if any, and a label, on a plate
 /// when chosen.
-fn nav_row(ui: &mut egui::Ui, rect: Rect, icon: Option<&str>, label: &str, chosen: bool, id: &str) -> egui::Response {
+pub(crate) fn nav_row(ui: &mut egui::Ui, rect: Rect, icon: Option<&str>, label: &str, chosen: bool, id: &str) -> egui::Response {
     let response = ui.interact(rect, egui::Id::new(("session-nav", id)), Sense::click());
     if chosen || response.hovered() {
         ui.painter().rect_filled(rect, 8.0, if chosen { SELECTED } else { Color32::from_rgb(241, 242, 244) });
@@ -706,13 +706,13 @@ fn row_menu(
 
 /// A plain bordered button, `CONTROL_H` tall, its label `INSET` in from
 /// each side. Returns whether it was clicked.
-fn plain_button(ui: &mut egui::Ui, rect: Rect, label: &str, id: &str) -> bool {
+pub(crate) fn plain_button(ui: &mut egui::Ui, rect: Rect, label: &str, id: &str) -> bool {
     widgets::outlined(ui.painter(), rect, 8.0, Color32::WHITE, BORDER);
     ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, ts::body(), TEXT);
     ui.interact(rect, egui::Id::new(id), Sense::click()).clicked()
 }
 
-fn label_width(ui: &egui::Ui, label: &str) -> f32 {
+pub(crate) fn label_width(ui: &egui::Ui, label: &str) -> f32 {
     ui.painter().layout_no_wrap(label.to_string(), ts::body(), TEXT).size().x + 2.0 * INSET
 }
 
@@ -787,7 +787,7 @@ fn new_project(ui: &mut egui::Ui, right: Rect, menu: &mut SessionMenu, events: &
 }
 
 /// `/home/someone/Inpainter/Lighthouse` as `~/Inpainter/Lighthouse`.
-fn shorten_home(path: &str) -> String {
+pub(crate) fn shorten_home(path: &str) -> String {
     match std::env::var("HOME") {
         Ok(home) if !home.is_empty() && path.starts_with(&home) => format!("~{}", &path[home.len()..]),
         _ => path.to_string(),

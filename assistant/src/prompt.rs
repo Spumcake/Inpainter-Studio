@@ -16,8 +16,18 @@ An application with no open tabs offers its tools without a tab.
 - Read or look at the work before you change it, so you work from what is there now.
 - Keep what the person made. Change only what the request asks for.
 - Never say you did something you did not do. When a tool fails, say so.
-- When no tool can do what is asked, say so plainly, and change nothing.
-- Answer briefly: say what you did, or what you found.";
+- Ask before anything that costs money.
+- When no tool can do what is asked, say so plainly, and change nothing.";
+
+/// The system prompt with how the person wants to be spoken to, from the
+/// Discussion skill, after Studio's own rules.
+pub fn with_voice(system: String, voice: &str) -> String {
+    let voice = voice.trim();
+    if voice.is_empty() {
+        return system;
+    }
+    format!("{system}\n\n# How to speak with the person\n{voice}")
+}
 
 /// The note that begins each request.
 pub const STALE: &str = "The person may have changed the work since the last request, \

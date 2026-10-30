@@ -224,6 +224,29 @@ impl Probes {
         asked.poll()
     }
 
+    /// The image models a chat endpoint offers, from its image catalogue,
+    /// asking for them the first time.
+    pub(crate) fn image_models(&mut self, ctx: &egui::Context, endpoint: &EndpointSetting, key: Option<String>) -> Option<&Models> {
+        // OpenRouter's image catalogue; other endpoints have none in 0.9.
+        if endpoint.kind != EndpointKind::Openrouter {
+            return None;
+        }
+        let asked = self.models.entry(format!("{}#images", endpoint.id)).or_insert_with(|| {
+            let base = endpoint.address.trim_end_matches('/').to_string();
+            ask(ctx, move || assistant::image_models(&base, key.as_deref()))
+        });
+        asked.poll()
+    }
+
+    /// The model list a skill offers: image models for one that makes
+    /// pictures, chat models otherwise.
+    pub(crate) fn models_for(&mut self, ctx: &egui::Context, endpoint: &EndpointSetting, key: Option<String>, makes: crate::workspace::Makes) -> Option<&Models> {
+        match makes {
+            crate::workspace::Makes::Images => self.image_models(ctx, endpoint, key),
+            crate::workspace::Makes::Text => self.models(ctx, endpoint, key),
+        }
+    }
+
     /// The model lists already read, for naming a model on a card.
     pub(crate) fn known_models(&mut self) -> Vec<assistant::Model> {
         let mut known = Vec::new();
@@ -239,6 +262,7 @@ impl Probes {
     pub(crate) fn forget(&mut self, endpoint: &str) {
         self.statuses.remove(endpoint);
         self.models.remove(endpoint);
+        self.models.remove(&format!("{endpoint}#images"));
     }
 
     pub(crate) fn forget_statuses(&mut self) {

@@ -1184,3 +1184,90 @@ fn a_notebook_cells_chevron_chooses_its_level() {
     assert!(window.app.board.chosen.is_empty());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Catches an Image kind a notebook only lists: chosen from the kind
+/// dropdown, added, typed, and run, the cell asks the image skill for a
+/// picture, and its version records the picture, kept in the project.
+#[test]
+fn a_notebook_image_cell_makes_a_picture() {
+    let dir = scratch("book-image");
+    let stand_in = StandIn::start(Vec::new());
+    let mut window = project_window(apps(), &stand_in, &dir);
+    window.app.settings.add_image_skill();
+    window.select("mission-control");
+    show_workspace(&mut window);
+    command(&mut window, "mission-control", "kind_image");
+    command(&mut window, "mission-control", "add_cell");
+    window.until(|app| book_cells(app).iter().any(|cell| cell.kind == protocol::IMAGE_KIND));
+    let id = book_cells(&window.app).iter().find(|cell| cell.kind == protocol::IMAGE_KIND).unwrap().id.clone();
+    type_prompt(&mut window, &id, "A lighthouse in a storm.");
+    window.until(|app| book_cells(app).iter().any(|cell| cell.prompt() == "A lighthouse in a storm."));
+    command(&mut window, "mission-control", "run");
+    let made = id.clone();
+    window.until(move |app| book_cells(app).iter().any(|cell| cell.id == made && cell.state == CellState::Done && !cell.versions.is_empty()));
+    assert_eq!(stand_in.pictures()[0]["prompt"], "A lighthouse in a storm.");
+    assert!(stand_in.requests().is_empty(), "the Image cell went to a chat model");
+    let cell = book_cells(&window.app).into_iter().find(|cell| cell.id == id).unwrap();
+    let path = match &cell.versions[0].output[0] {
+        protocol::CellPart::Path { path, .. } => path.clone(),
+        other => panic!("the version holds no picture: {other:?}"),
+    };
+    assert!(path.starts_with("images/"));
+    assert!(window.app.project.as_ref().unwrap().folder.join(&path).is_file());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Catches an Image cell that loses its picture on the way into a notebook:
+/// dragged in from the conversation, it keeps its picture and versions, and
+/// its run there adds a new file beside the old one.
+#[test]
+fn a_dragged_image_cell_keeps_its_picture() {
+    let dir = scratch("drag-image");
+    let tool = protocol::tool_key(crate::route::HOST_ID, "skills", "image_generation");
+    let stand_in = StandIn::start(vec![call_reply(&tool, serde_json::json!({"prompt": "A keeper's lamp."})), text_reply("Done.")]);
+    let mut window = project_window(apps(), &stand_in, &dir);
+    window.app.settings.add_image_skill();
+    window.app.chat.input = "Make a picture of the lamp.".into();
+    let ctx = window.ctx.clone();
+    window.app.chat_event(ChatEvent::Send, &ctx, &mut window.frame);
+    window.until(|app| {
+        app.chat.conversation.iter().any(|entry| entry.cell.as_ref().is_some_and(|cell| cell.kind == protocol::IMAGE_KIND && cell.state == CellState::Done))
+            && !app.chat.working
+    });
+    let source = conversation_cell(&window.app);
+    let first = match &source.output[0] {
+        protocol::CellPart::Path { path, .. } => path.clone(),
+        other => panic!("no picture: {other:?}"),
+    };
+    window.select("mission-control");
+    show_workspace(&mut window);
+    let from = window.app.board.card_rect.expect("the conversation cell was not drawn");
+    let onto = window.app.board.drop_rect.expect("the book was not drawn");
+    let handle = Pos2::new(from.left() + 24.0, from.top() + 8.0);
+    window.events.push(egui::Event::PointerMoved(handle));
+    window.events.push(egui::Event::PointerButton { pos: handle, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    window.step();
+    window.events.push(egui::Event::PointerMoved(onto.center()));
+    window.step();
+    window.events.push(egui::Event::PointerButton { pos: onto.center(), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    window.step();
+    let copied_from = source.id.clone();
+    window.until(move |app| book_cells(app).iter().any(|cell| cell.from.as_deref() == Some(copied_from.as_str())));
+    let copied = book_cells(&window.app).into_iter().find(|cell| cell.from.is_some()).unwrap();
+    assert_eq!(copied.kind, protocol::IMAGE_KIND);
+    assert_eq!(copied.versions.len(), 1, "the versions did not come along");
+    assert!(matches!(&copied.output[0], protocol::CellPart::Path { path, .. } if *path == first));
+    let folder = window.app.project.as_ref().unwrap().folder.clone();
+    assert!(folder.join(&first).is_file());
+    window.app.note_cell_actions(vec![crate::cells::CardAction::Run(copied.id.clone())]);
+    let id = copied.id.clone();
+    window.until(move |app| book_cells(app).iter().any(|cell| cell.id == id && cell.versions.len() == 2));
+    let ran = book_cells(&window.app).into_iter().find(|cell| cell.id == copied.id).unwrap();
+    let second = match &ran.versions[1].output[0] {
+        protocol::CellPart::Path { path, .. } => path.clone(),
+        other => panic!("no picture: {other:?}"),
+    };
+    assert_ne!(first, second);
+    assert!(folder.join(&first).is_file() && folder.join(&second).is_file(), "a run in the notebook lost a picture");
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -25,12 +25,16 @@ pub(crate) enum CardAction {
     More(String, Rect),
     /// The card's chevron was clicked, at this place: choose its model.
     Models(String, Rect),
+    /// A filmstrip thumbnail was clicked: show that version.
+    ShowVersion(String, usize),
     /// A rendered Markdown cell was double-clicked: show its source.
     ShowSource(String),
 }
 
 pub(crate) enum Piece {
     Text(String),
+    /// A picture's PNG, from an Image cell's run.
+    Picture(Vec<u8>),
     End,
     Failed(String),
 }
@@ -49,6 +53,9 @@ pub(crate) struct Run {
     pub endpoint: String,
     pub model: String,
     pub effort: Option<String>,
+    /// The picture an Image cell's run made: its path, as the cell names
+    /// it, and its PNG, for the assistant to see.
+    pub picture: Option<(String, Vec<u8>)>,
     /// The prompt as it was when the run began: the version the run makes
     /// holds this, whatever is typed meanwhile.
     pub prompt: String,
@@ -124,7 +131,7 @@ impl Board {
 
 /// Starts a text run on `route`, or fails at once with the reason there is
 /// none. Its pieces arrive on the run's channel as they are read.
-pub(crate) fn start_run(route: Result<crate::endpoints::Route, String>, prompt: &str) -> Receiver<Piece> {
+pub(crate) fn start_run(route: Result<crate::endpoints::Route, String>, prompt: &str, picture: bool) -> Receiver<Piece> {
     let (tx, rx) = channel();
     let route = match route {
         Ok(route) => match route.blocked() {
@@ -141,10 +148,23 @@ pub(crate) fn start_run(route: Result<crate::endpoints::Route, String>, prompt: 
         }
     };
     let prompt = prompt.to_string();
-    let _ = std::thread::Builder::new()
-        .name(String::from("cell-run"))
-        .spawn(move || stream_into(route, prompt, tx));
+    let _ = std::thread::Builder::new().name(String::from("cell-run")).spawn(move || {
+        if picture {
+            picture_into(route, prompt, tx);
+        } else {
+            stream_into(route, prompt, tx);
+        }
+    });
     rx
+}
+
+/// An Image cell's run: one picture, then the end, or why it failed.
+fn picture_into(route: crate::endpoints::Route, prompt: String, tx: Sender<Piece>) {
+    let key = route.key.clone().unwrap_or_default();
+    let _ = match assistant::make_image(&route.base, &key, &route.model, &prompt) {
+        Ok(png) => tx.send(Piece::Picture(png)).and_then(|_| tx.send(Piece::End)),
+        Err(reason) => tx.send(Piece::Failed(reason)),
+    };
 }
 
 /// Each piece goes to the window as soon as it is read. When the window
@@ -172,6 +192,7 @@ fn stream_into(route: crate::endpoints::Route, prompt: String, tx: Sender<Piece>
 pub(crate) fn kind_label(kind: &str) -> &str {
     match kind {
         protocol::TEXT_KIND => "LLM",
+        protocol::IMAGE_KIND => "Image",
         protocol::MARKDOWN_KIND => "Markdown",
         other => other,
     }
@@ -180,7 +201,94 @@ pub(crate) fn kind_label(kind: &str) -> &str {
 /// Kinds this build can run: an LLM cell calls its model; a Markdown cell
 /// shows its source rendered, calling nothing.
 pub(crate) fn runs(kind: &str) -> bool {
-    kind == protocol::TEXT_KIND || kind == protocol::MARKDOWN_KIND
+    kind == protocol::TEXT_KIND || kind == protocol::MARKDOWN_KIND || kind == protocol::IMAGE_KIND
+}
+
+/// An Image cell's picture: the height it is drawn, and the filmstrip's.
+const PICTURE_H: f32 = 300.0;
+
+/// How tall a cell's picture is drawn: at most `PICTURE_H`, and less when
+/// the card's width limits it, so no room is left empty under it.
+fn picture_height(ctx: &egui::Context, path: &str, width: f32) -> f32 {
+    picture_texture(ctx, path).map_or(PICTURE_H, |texture| fit(texture.size_vec2(), width, PICTURE_H).y)
+}
+const FILM_H: f32 = 52.0;
+const THUMB_GAP: f32 = 8.0;
+/// The filmstrip's outline around the version shown.
+const SHOWN: Color32 = Color32::from_rgb(37, 99, 235);
+
+/// The picture a part names, if it is one.
+fn picture_path(parts: &[CellPart]) -> Option<&str> {
+    parts.iter().find_map(|part| match part {
+        CellPart::Path { path, media_type } if media_type.starts_with("image/") => Some(path.as_str()),
+        _ => None,
+    })
+}
+
+/// The picture a cell shows, when it has one and is not running or failed.
+fn shown_picture<'a>(cell: &'a Cell, running: bool) -> Option<&'a str> {
+    if running || cell.state == CellState::Failed {
+        return None;
+    }
+    picture_path(&cell.output)
+}
+
+/// The versions with a picture, by index, for the filmstrip, which shows
+/// from the first version on, as the outcome says.
+fn film(cell: &Cell) -> Option<Vec<(usize, &str)>> {
+    let pictures: Vec<(usize, &str)> = cell
+        .versions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, version)| picture_path(&version.output).map(|path| (index, path)))
+        .collect();
+    (!pictures.is_empty()).then_some(pictures)
+}
+
+/// Where pictures named by relative paths are: the project's folder, set
+/// by the window each frame.
+pub(crate) fn set_picture_root(ctx: &egui::Context, root: Option<std::path::PathBuf>) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("cell-picture-root"), root));
+}
+
+fn resolve(ctx: &egui::Context, path: &str) -> std::path::PathBuf {
+    let path = std::path::Path::new(path);
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    let root: Option<std::path::PathBuf> = ctx.data(|data| data.get_temp(egui::Id::new("cell-picture-root"))).flatten();
+    root.map_or_else(|| path.to_path_buf(), |root| root.join(path))
+}
+
+/// A picture as a texture, decoded once per file. None when it cannot be
+/// read, as when it was deleted.
+fn picture_texture(ctx: &egui::Context, path: &str) -> Option<egui::TextureHandle> {
+    type Cache = HashMap<std::path::PathBuf, Option<egui::TextureHandle>>;
+    let file = resolve(ctx, path);
+    let id = egui::Id::new("cell-pictures");
+    if let Some(Some(known)) = ctx.data(|data| data.get_temp::<Cache>(id).and_then(|cache| cache.get(&file).cloned())) {
+        return Some(known);
+    }
+    let texture = std::fs::read(&file)
+        .ok()
+        .and_then(|bytes| eframe::icon_data::from_png_bytes(&bytes).ok())
+        .map(|icon| {
+            let image = egui::ColorImage::from_rgba_unmultiplied([icon.width as usize, icon.height as usize], &icon.rgba);
+            ctx.load_texture(file.display().to_string(), image, egui::TextureOptions::LINEAR)
+        });
+    // Only a picture read is kept: one not there yet is read again later.
+    if let Some(texture) = &texture {
+        ctx.data_mut(|data| {
+            data.get_temp_mut_or_default::<Cache>(id).insert(file, Some(texture.clone()));
+        });
+    }
+    texture
+}
+
+/// `size` scaled to fit `height` high and `width` wide.
+fn fit(size: egui::Vec2, width: f32, height: f32) -> egui::Vec2 {
+    let scale = (height / size.y).min(width / size.x).min(f32::MAX);
+    size * scale
 }
 
 /// A Markdown cell that has run shows as rendered text, not a card.
@@ -204,6 +312,9 @@ const DISABLED: Color32 = Color32::from_rgb(170, 174, 180);
 struct Layout {
     input: f32,
     output: Option<crate::markdown::Laid>,
+    /// An Image cell's picture, and whether a filmstrip is below it.
+    picture: bool,
+    film: bool,
     total: f32,
 }
 
@@ -265,12 +376,30 @@ fn layout(ui: &egui::Ui, cell: &Cell, draft: &str, live: Option<&str>, running: 
     let markdown = cell.kind == protocol::MARKDOWN_KIND;
     let text = painter.layout_job(prompt_job(draft, inner_w - GUTTER - 12.0, markdown)).size().y;
     let input = text.max(ts::code_line() * MIN_LINES as f32) + 24.0;
-    let output = output_text(cell, live, running).map(|(text, color)| crate::markdown::lay_out(painter, &text, color, inner_w));
-    let below = output.as_ref().map_or(0.0, |output| output.height + 2.0 * OUTPUT_PAD);
+    let picture_h = shown_picture(cell, running).map(|path| picture_height(ui.ctx(), path, inner_w));
+    let picture = picture_h.is_some();
+    // The filmstrip stays while a picture is made, and after a run fails or
+    // is stopped, so earlier versions are always in reach.
+    let film = cell.kind == protocol::IMAGE_KIND && film(cell).is_some();
+    let output = if picture {
+        None
+    } else {
+        output_text(cell, live, running).map(|(text, color)| crate::markdown::lay_out(painter, &text, color, inner_w))
+    };
+    let shown = if picture {
+        2.0 * OUTPUT_PAD + picture_h.unwrap_or(PICTURE_H)
+    } else {
+        output.as_ref().map_or(0.0, |output| output.height + 2.0 * OUTPUT_PAD)
+    };
+    // The filmstrip sits at the card's foot, one output pad below what is
+    // shown above it.
+    let below = shown + if !film { 0.0 } else if shown > 0.0 { FILM_H + OUTPUT_PAD } else { FILM_H + 2.0 * OUTPUT_PAD };
     Layout {
         input,
         total: HEADER + input + below,
         output,
+        picture,
+        film,
     }
 }
 
@@ -279,6 +408,9 @@ fn layout(ui: &egui::Ui, cell: &Cell, draft: &str, live: Option<&str>, running: 
 fn output_text(cell: &Cell, live: Option<&str>, running: bool) -> Option<(String, Color32)> {
     if running {
         let text = live.unwrap_or("");
+        if cell.kind == protocol::IMAGE_KIND {
+            return Some((String::from("Making the picture…"), MUTED));
+        }
         if text.is_empty() {
             return Some((String::from("Writing…"), MUTED));
         }
@@ -344,7 +476,8 @@ pub(crate) fn paint_card(
     let mid = card.top() + HEADER / 2.0;
     let tile = Rect::from_min_size(pos2(card.left() + PAD, mid - TILE / 2.0), vec2(TILE, TILE));
     painter.rect_filled(tile, 6.0, TILE_FILL);
-    toolbar::paint_icon(&painter, tile.center(), "align-left", 16.0, TEXT);
+    let tile_icon = if cell.kind == protocol::IMAGE_KIND { "media-image" } else { "align-left" };
+    toolbar::paint_icon(&painter, tile.center(), tile_icon, 16.0, TEXT);
     let title = painter.text(
         pos2(tile.right() + 12.0, mid),
         Align2::LEFT_CENTER,
@@ -354,7 +487,9 @@ pub(crate) fn paint_card(
     );
     if let Some(model) = cell.model.as_deref().filter(|model| !model.is_empty()) {
         let model = model_name(ui.ctx(), model);
-        painter.text(
+        // The name stops short of the buttons, however narrow the card.
+        let buttons = run_button(card).left() - 10.0;
+        painter.with_clip_rect(Rect::from_min_max(pos2(title.right(), card.top()), pos2(buttons, card.top() + HEADER))).text(
             pos2(title.right() + 14.0, mid),
             Align2::LEFT_CENTER,
             model,
@@ -453,12 +588,82 @@ pub(crate) fn paint_card(
     }
 
     // Output: the result, on the card's white, below a hairline.
+    let has_output = plan.output.is_some();
     if let Some(output) = plan.output {
         let top = header_line + plan.input;
         painter.hline(card.left() + PAD..=card.right() - PAD, top, egui::Stroke::new(1.0, HAIRLINE));
         output.paint(&painter, pos2(card.left() + PAD, top + OUTPUT_PAD));
     }
+    // An Image cell's picture, centred, and under it the filmstrip of its
+    // versions, as the approved image-cell mockup shows.
+    if plan.picture
+        && let Some(path) = shown_picture(cell, running)
+    {
+        let top = header_line + plan.input;
+        painter.hline(card.left() + PAD..=card.right() - PAD, top, egui::Stroke::new(1.0, HAIRLINE));
+        let area = Rect::from_min_size(pos2(card.left() + PAD, top + OUTPUT_PAD), vec2(inner_w, picture_height(ui.ctx(), path, inner_w)));
+        match picture_texture(ui.ctx(), path) {
+            Some(texture) => {
+                let size = fit(texture.size_vec2(), area.width(), area.height());
+                let rect = Rect::from_center_size(pos2(area.center().x, area.top() + size.y / 2.0), size);
+                paint_rounded(&painter, rect, &texture, 8.0);
+            }
+            None => {
+                painter.text(area.center(), Align2::CENTER_CENTER, "The picture could not be read.", ts::small(), MUTED);
+            }
+        }
+    }
+    if plan.film
+        && let Some(film) = film(cell)
+    {
+        {
+            // Under the picture, or under the words of a run that is making
+            // one or failed.
+            if !plan.picture && !has_output {
+                let top = header_line + plan.input;
+                painter.hline(card.left() + PAD..=card.right() - PAD, top, egui::Stroke::new(1.0, HAIRLINE));
+            }
+            let shown = cell.current.unwrap_or(cell.versions.len().saturating_sub(1));
+            let thumbs: Vec<(usize, Option<egui::TextureHandle>)> =
+                film.iter().map(|(index, path)| (*index, picture_texture(ui.ctx(), path))).collect();
+            let width = |texture: &Option<egui::TextureHandle>| {
+                texture.as_ref().map_or(FILM_H, |texture| fit(texture.size_vec2(), f32::MAX, FILM_H).x)
+            };
+            let total: f32 = thumbs.iter().map(|(_, texture)| width(texture)).sum::<f32>() + THUMB_GAP * (thumbs.len() - 1) as f32;
+            let mut x = card.center().x - total / 2.0;
+            let y = card.bottom() - OUTPUT_PAD - FILM_H;
+            for (index, texture) in thumbs {
+                let rect = Rect::from_min_size(pos2(x, y), vec2(width(&texture), FILM_H));
+                x = rect.right() + THUMB_GAP;
+                match &texture {
+                    Some(texture) => paint_rounded(&painter, rect, texture, 5.0),
+                    None => {
+                        painter.rect_filled(rect, 5.0, TILE_FILL);
+                    }
+                }
+                if index == shown {
+                    widgets::outlined(&painter, rect.expand(3.0), 7.0, Color32::TRANSPARENT, SHOWN);
+                    widgets::outlined(&painter, rect.expand(2.0), 7.0, Color32::TRANSPARENT, SHOWN);
+                }
+                let thumb = ui
+                    .interact(rect, egui::Id::new(("cell-version", &cell.id, index)), Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(format!("Version {}", index + 1));
+                if thumb.clicked() && index != shown && !running {
+                    actions.push(CardAction::ShowVersion(cell.id.clone(), index));
+                }
+            }
+        }
+    }
     card
+}
+
+/// A picture in `rect`, its corners rounded by `radius`.
+fn paint_rounded(painter: &egui::Painter, rect: Rect, texture: &egui::TextureHandle, radius: f32) {
+    painter.add(
+        egui::epaint::RectShape::filled(rect, radius, Color32::WHITE)
+            .with_texture(texture.id(), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0))),
+    );
 }
 
 /// The names the model picker shows, by model id, set by the window each

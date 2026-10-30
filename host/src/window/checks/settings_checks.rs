@@ -51,7 +51,7 @@ fn settings_reach_the_assistants_requests() {
     let sent = stand_in.requests();
     let system = sent[0]["messages"][0]["content"].as_str().unwrap().to_string();
     assert!(system.ends_with("Answer as a lighthouse keeper."), "{system}");
-    assert!(system.contains("Ask before anything that costs money"), "a fixed rule was lost");
+    assert!(system.contains("Never say you did something you did not do"), "a fixed rule was lost");
     assert_eq!(sent[0]["reasoning"]["effort"], "medium", "the default level is Haiku Medium");
     assert_eq!(stand_in.keys()[0].as_deref(), Some("Bearer stand-in"));
 
@@ -102,6 +102,7 @@ fn a_skill_runs_as_a_cell_on_its_own_endpoint() {
         endpoint: Some(local_id.clone()),
         model: Some(String::from("llama3.2")),
         prompt: String::from("You write beat sheets."),
+        makes: crate::workspace::Makes::Text,
     }));
     window.ask("Make a beat sheet.");
     window.until(|app| {

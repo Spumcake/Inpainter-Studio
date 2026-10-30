@@ -8,7 +8,7 @@
 //! never knows a skill or a tool by name.
 
 use crate::window::Started;
-use crate::workspace::{DISCUSSION, Settings, SkillSetting};
+use crate::workspace::{DISCUSSION, Makes, Settings, SkillSetting};
 use assistant::{Command, TabInfo, Target};
 use protocol::{HostMessage, ToolResult};
 use serde_json::json;
@@ -69,11 +69,7 @@ const RUN_PROMPT: &str = "run_text_prompt";
 pub(crate) fn offered_skills(settings: &Settings) -> Vec<(String, SkillSetting)> {
     let mut offered: Vec<(String, SkillSetting)> = Vec::new();
     for skill in &settings.skills {
-        let chats = skill
-            .endpoint
-            .as_deref()
-            .and_then(|id| settings.endpoint(id))
-            .is_some_and(|endpoint| endpoint.kind.chats());
+        let chats = settings.skill_runs(skill);
         // A skill with no model yet, as New Skill makes it, is not offered.
         let model = skill.model.as_deref().is_some_and(|model| !model.trim().is_empty());
         if skill.id == DISCUSSION || !chats || !model {
@@ -124,24 +120,42 @@ fn your_skills(settings: &Settings) -> Option<protocol::Skill> {
     }
     let tools = offered
         .into_iter()
-        .map(|(name, skill)| protocol::Tool {
-            name,
-            description: if skill.description.trim().is_empty() { skill.name.clone() } else { format!("{}: {}", skill.name, skill.description) },
-            input: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "input": {"type": "string", "description": "What to ask the skill for."}
-                },
-                "required": ["input"],
-                "additionalProperties": false
-            }),
+        .map(|(name, skill)| {
+            let described = if skill.description.trim().is_empty() { skill.name.clone() } else { format!("{}: {}", skill.name, skill.description) };
+            // An image skill makes one picture from a prompt, shown as an
+            // Image cell; the assistant writes the whole description.
+            let (description, input) = match skill.makes {
+                Makes::Images => (
+                    format!("{described}. Makes one picture from the prompt and shows it as an Image cell in the conversation."),
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "prompt": {"type": "string", "description": "The picture, described in full."}
+                        },
+                        "required": ["prompt"],
+                        "additionalProperties": false
+                    }),
+                ),
+                Makes::Text => (
+                    described,
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "input": {"type": "string", "description": "What to ask the skill for."}
+                        },
+                        "required": ["input"],
+                        "additionalProperties": false
+                    }),
+                ),
+            };
+            protocol::Tool { name, description, input }
         })
         .collect();
     Some(protocol::Skill {
         id: SKILLS.into(),
         name: "Your skills".into(),
         description: "Skills the person made, each running its own prompt on its own endpoint.".into(),
-        instructions: "When the person asks for something one of these skills is described for, call it with what to ask. Its result shows as a cell in the conversation. After the tool returns, reply briefly.".into(),
+        instructions: "When the person asks for something one of these skills is described for, call it with what to ask. When they ask for a picture, call a skill that makes pictures with the picture described in full. Its result shows as a cell in the conversation. After the tool returns, reply briefly.".into(),
         tools,
     })
 }
@@ -300,6 +314,7 @@ mod tests {
             endpoint: Some(endpoint.clone()),
             model: model.map(String::from),
             prompt: String::new(),
+            makes: crate::workspace::Makes::Text,
         };
         settings.skills.push(skill("New Skill", None));
         settings.skills.push(skill("Story notes", Some("m")));

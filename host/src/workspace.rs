@@ -805,6 +805,10 @@ pub(crate) struct Settings {
     /// The level a new session starts on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_level: Option<String>,
+    /// 0.9's first start added the image skill, so one the person deleted
+    /// never comes back.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub image_skill_added: bool,
     /// Anything another Studio wrote, such as the model picked before 0.8,
     /// kept as it was.
     #[serde(flatten)]
@@ -880,7 +884,29 @@ pub(crate) struct SkillSetting {
     pub model: Option<String>,
     #[serde(default)]
     pub prompt: String,
+    /// What the skill makes: text, or pictures.
+    #[serde(default, skip_serializing_if = "Makes::is_text")]
+    pub makes: Makes,
 }
+
+/// What a skill makes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Makes {
+    #[default]
+    Text,
+    Images,
+}
+
+impl Makes {
+    fn is_text(&self) -> bool {
+        *self == Makes::Text
+    }
+}
+
+/// The image model 0.9's image skill starts on, as the owner set on
+/// 2026-10-30.
+pub(crate) const IMAGE_MODEL: &str = "openai/gpt-image-2.5-sunburst";
 
 /// How hard a level thinks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1041,6 +1067,7 @@ impl Settings {
             endpoint: Some(id.clone()),
             model: None,
             prompt: DEFAULT_VOICE.to_string(),
+            makes: Makes::Text,
         };
         self.update(move |settings| {
             if !settings.endpoints.is_empty() {
@@ -1053,6 +1080,55 @@ impl Settings {
             settings.default_level = Some(default);
         });
         Some(id)
+    }
+
+    /// 0.9's first start: an "Image generation" skill on the OpenRouter
+    /// endpoint, once. Returns whether it was added.
+    pub(crate) fn add_image_skill(&mut self) -> bool {
+        if self.image_skill_added {
+            return false;
+        }
+        let Some(endpoint) = self
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.kind == EndpointKind::Openrouter)
+            .map(|endpoint| endpoint.id.clone())
+        else {
+            return false;
+        };
+        let skill = SkillSetting {
+            id: protocol::cell_id(),
+            name: "Image generation".to_string(),
+            description: "Makes a picture from a description".to_string(),
+            endpoint: Some(endpoint),
+            model: Some(IMAGE_MODEL.to_string()),
+            prompt: String::new(),
+            makes: Makes::Images,
+        };
+        self.update(move |settings| {
+            if settings.image_skill_added {
+                return;
+            }
+            settings.skills.push(skill);
+            settings.image_skill_added = true;
+        });
+        true
+    }
+
+    /// Whether a skill can run: a skill that makes pictures runs only on
+    /// OpenRouter in 0.9, whose image API Studio speaks; one that makes
+    /// text runs on any chat endpoint.
+    pub(crate) fn skill_runs(&self, skill: &SkillSetting) -> bool {
+        let endpoint = skill.endpoint.as_deref().and_then(|id| self.endpoint(id));
+        match skill.makes {
+            Makes::Images => endpoint.is_some_and(|endpoint| endpoint.kind == EndpointKind::Openrouter),
+            Makes::Text => endpoint.is_some_and(|endpoint| endpoint.kind.chats()),
+        }
+    }
+
+    /// The first image skill that can run, which a new Image cell runs on.
+    pub(crate) fn image_skill(&self) -> Option<&SkillSetting> {
+        self.skills.iter().find(|skill| skill.makes == Makes::Images && self.skill_runs(skill))
     }
 
     pub(crate) fn choose_chat_width(&mut self, width: f32) {
@@ -1581,6 +1657,26 @@ mod tests {
         assert_eq!(settings.level_or_default(Some("gone")).map(|l| l.name.as_str()), Some("Haiku Medium"));
         assert_eq!(settings.first_start("https://other/v1"), None);
         assert_eq!(Settings::load(Some(folder.join("settings.json"))).endpoints.len(), 1);
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    /// Catches an image skill that comes back after the person deletes it,
+    /// or one offered where Studio cannot make pictures.
+    #[test]
+    fn the_image_skill_is_added_once_and_runs_on_openrouter() {
+        let folder = scratch("image-skill");
+        let mut settings = Settings::load(Some(folder.join("settings.json")));
+        settings.first_start("https://stand-in/v1");
+        assert!(settings.add_image_skill());
+        let skill = settings.image_skill().cloned().expect("an image skill");
+        assert_eq!((skill.model.as_deref(), skill.makes), (Some(IMAGE_MODEL), Makes::Images));
+        settings.update(|settings| settings.skills.retain(|known| known.makes != Makes::Images));
+        assert!(!settings.add_image_skill(), "a deleted image skill came back");
+        assert!(Settings::load(Some(folder.join("settings.json"))).image_skill().is_none());
+        let mut local = skill.clone();
+        settings.endpoints.push(EndpointSetting { id: "local".into(), name: "Ollama".into(), kind: EndpointKind::Openai, address: "http://local/v1".into() });
+        local.endpoint = Some("local".into());
+        assert!(!settings.skill_runs(&local), "an image skill runs where Studio cannot make pictures");
         std::fs::remove_dir_all(&folder).unwrap();
     }
 

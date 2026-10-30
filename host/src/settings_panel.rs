@@ -10,7 +10,7 @@ use crate::sessions::{self, COLUMN_W, CONTROL_H, DARK, HINT, INSET, NAV_GAP, NAV
 use crate::toolbar;
 use crate::typescale as ts;
 use crate::widgets::{self, BORDER, MUTED, SELECTED, TEXT};
-use crate::workspace::{DISCUSSION, Effort, EndpointKind, EndpointSetting, Level, Settings, SkillSetting};
+use crate::workspace::{DISCUSSION, Effort, EndpointKind, EndpointSetting, Level, Makes, Settings, SkillSetting};
 use eframe::egui::{self, Align2, Color32, Key, Pos2, Rect, Sense, UiBuilder, pos2, vec2};
 
 /// Wider and taller than the session menu, as the views show.
@@ -158,25 +158,27 @@ pub(crate) struct Unlisted {
 /// Finds what is unlisted. `listed` gives an endpoint's model ids, or none
 /// while its list is unknown, as when it is not running; nothing is warned
 /// about then.
-pub(crate) fn unlisted(settings: &Settings, listed: &mut dyn FnMut(&EndpointSetting) -> Option<Vec<String>>) -> Unlisted {
-    let mut missing = |endpoint: Option<&EndpointSetting>, model: &str| {
+pub(crate) fn unlisted(settings: &Settings, listed: &mut dyn FnMut(&EndpointSetting, Makes) -> Option<Vec<String>>) -> Unlisted {
+    let mut missing = |endpoint: Option<&EndpointSetting>, model: &str, makes: Makes| {
         let Some(endpoint) = endpoint.filter(|endpoint| endpoint.kind.chats()) else {
             return false;
         };
-        !model.trim().is_empty() && listed(endpoint).is_some_and(|ids| !ids.iter().any(|id| id == model))
+        !model.trim().is_empty() && listed(endpoint, makes).is_some_and(|ids| !ids.iter().any(|id| id == model))
     };
     let discussion = settings.discussion_endpoint();
     let levels = settings
         .levels
         .iter()
-        .filter(|level| missing(discussion.or_else(|| settings.endpoint(&level.endpoint)), &level.model))
+        .filter(|level| missing(discussion.or_else(|| settings.endpoint(&level.endpoint)), &level.model, Makes::Text))
         .map(|level| level.id.clone())
         .collect();
     let skills = settings
         .skills
         .iter()
         .filter(|skill| skill.id != DISCUSSION)
-        .filter(|skill| missing(skill.endpoint.as_deref().and_then(|id| settings.endpoint(id)), skill.model.as_deref().unwrap_or_default()))
+        .filter(|skill| {
+            missing(skill.endpoint.as_deref().and_then(|id| settings.endpoint(id)), skill.model.as_deref().unwrap_or_default(), skill.makes)
+        })
         .map(|skill| skill.id.clone())
         .collect();
     Unlisted { levels, skills }
@@ -361,9 +363,9 @@ pub(crate) fn show(ctx: &egui::Context, top: Pos2, panel: &mut SettingsPanel, en
     }
     {
         let Env { settings, probes, keys, .. } = env;
-        panel.unlisted = unlisted(settings, &mut |endpoint| {
+        panel.unlisted = unlisted(settings, &mut |endpoint, makes| {
             let key = keys.get(&endpoint.id);
-            match probes.models(ctx, endpoint, key) {
+            match probes.models_for(ctx, endpoint, key, makes) {
                 Some(Ok(list)) => Some(list.iter().map(|model| model.id.clone()).collect()),
                 _ => None,
             }
@@ -981,6 +983,7 @@ fn skills(ui: &mut egui::Ui, panel: &mut SettingsPanel, env: &mut Env, choices: 
             endpoint: env.settings.discussion().and_then(|skill| skill.endpoint.clone()),
             model: None,
             prompt: String::new(),
+            makes: crate::workspace::Makes::Text,
         };
         choices.push(SettingsChoice::SaveSkill(skill.clone()));
         panel.open_skill(&skill);
@@ -1111,7 +1114,7 @@ fn skill_page(ui: &mut egui::Ui, panel: &mut SettingsPanel, env: &mut Env, id: &
     } else {
         header(ui, panel, &skill.name, "Runs its prompt on its own endpoint when the assistant calls it.", None);
     }
-    let rows = card(ui, if built_in { 1 } else { 4 });
+    let rows = card(ui, if built_in { 1 } else { 5 });
     let mut index = 0;
     if !built_in {
         let name_rect = control(rows[0], CONTROL_W, 0.0);
@@ -1131,20 +1134,34 @@ fn skill_page(ui: &mut egui::Ui, panel: &mut SettingsPanel, env: &mut Env, id: &
         skill.endpoint = Some(ids[picked].clone());
     }
     if !built_in {
-        let model_rect = control(rows[3], CONTROL_W, 0.0);
+        // What the skill makes: text, or a picture as an Image cell.
+        let makes_rect = control(rows[3], CONTROL_W, 0.0);
+        row_text(ui, rows[3], rows[3].left() + PAD, makes_rect.left() - 8.0, "Makes", "Text, or a picture shown as an Image cell");
+        let kinds = [Makes::Text, Makes::Images];
+        let labels: Vec<String> = ["Text", "Pictures"].iter().map(|label| label.to_string()).collect();
+        let chosen = kinds.iter().position(|kind| *kind == skill.makes);
+        let shown = chosen.map_or("Text", |index| labels[index].as_str()).to_string();
+        if let Some(picked) = select(ui, makes_rect, &format!("skill-makes-{id}"), &shown, &labels, chosen) {
+            skill.makes = kinds[picked];
+        }
+        let model_rect = control(rows[4], CONTROL_W, 0.0);
         let endpoint = skill.endpoint.as_deref().and_then(|id| settings.endpoint(id)).cloned();
         let line = match &endpoint {
-            Some(endpoint) if !endpoint.kind.chats() => "Image skills run from a later version",
+            Some(endpoint) if !endpoint.kind.chats() => "ComfyUI skills run from a later version",
+            Some(endpoint) if skill.makes == Makes::Images && endpoint.kind != EndpointKind::Openrouter => {
+                "Pictures are made only through OpenRouter for now"
+            }
+            _ if skill.makes == Makes::Images => "From the endpoint's image models",
             _ => "From the endpoint's models",
         };
         let name = endpoint.as_ref().map_or("the endpoint", |endpoint| endpoint.name.as_str());
         let missing = panel.unlisted.skills.contains(&skill.id).then_some(name);
-        model_row(ui, rows[3], model_rect.left() - 8.0, line, missing);
+        model_row(ui, rows[4], model_rect.left() - 8.0, line, missing);
         let known = env.probes.known_models();
         let models = match &endpoint {
             Some(endpoint) => {
                 let key = env.keys.get(&endpoint.id);
-                env.probes.models(ui.ctx(), endpoint, key).cloned()
+                env.probes.models_for(ui.ctx(), endpoint, key, skill.makes).cloned()
             }
             None => None,
         };
@@ -1352,8 +1369,9 @@ mod tests {
             endpoint: Some("local".into()),
             model: Some("anthropic/claude-haiku-5.5".into()),
             prompt: String::new(),
+            makes: crate::workspace::Makes::Text,
         });
-        let mut ollama = |endpoint: &EndpointSetting| (endpoint.id == "local").then(|| vec![String::from("llama3.2")]);
+        let mut ollama = |endpoint: &EndpointSetting, _: Makes| (endpoint.id == "local").then(|| vec![String::from("llama3.2")]);
         let found = unlisted(&settings, &mut ollama);
         assert_eq!(found.levels.len(), 5, "every level on a Claude model should warn");
         assert_eq!(found.skills, ["story"]);
@@ -1363,7 +1381,18 @@ mod tests {
         assert_eq!(found.levels.len(), 4);
         assert!(!found.levels.contains(&settings.levels[0].id));
         assert!(found.skills.is_empty());
-        assert_eq!(unlisted(&settings, &mut |_| None), Unlisted::default());
+        assert_eq!(unlisted(&settings, &mut |_, _| None), Unlisted::default());
+
+        // An image skill is checked against image models, not chat models.
+        settings.add_image_skill();
+        let image = settings.image_skill().unwrap().id.clone();
+        let mut catalogues = |endpoint: &EndpointSetting, makes: Makes| match makes {
+            Makes::Images => Some(vec![String::from(crate::workspace::IMAGE_MODEL)]),
+            Makes::Text => (endpoint.id == "local").then(|| vec![String::from("llama3.2")]),
+        };
+        assert!(!unlisted(&settings, &mut catalogues).skills.contains(&image), "a listed image model was warned about");
+        let mut lacking = |_: &EndpointSetting, makes: Makes| (makes == Makes::Images).then(Vec::new);
+        assert!(unlisted(&settings, &mut lacking).skills.contains(&image), "an unlisted image model was not warned about");
     }
 
     /// Catches an icon name the Iconoir pack does not have, which would

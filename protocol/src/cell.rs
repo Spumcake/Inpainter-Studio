@@ -73,6 +73,8 @@ pub struct CellVersion {
 
 /// The kind of a cell that sends its prompt to a language model.
 pub const TEXT_KIND: &str = "text";
+/// The kind of a cell that makes a picture from its prompt.
+pub const IMAGE_KIND: &str = "image";
 /// The kind of a cell of Markdown, which runs by showing its source as rich
 /// text, calls nothing, and has no versions.
 pub const MARKDOWN_KIND: &str = "markdown";

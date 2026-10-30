@@ -24,7 +24,10 @@ impl HostWindow {
             .ok()
             .filter(|address| !address.trim().is_empty())
             .unwrap_or_else(|| OPENROUTER.to_string());
-        let Some(endpoint) = self.settings.first_start(&address) else {
+        let made = self.settings.first_start(&address);
+        // 0.9's first start: the skill that makes pictures, once.
+        self.settings.add_image_skill();
+        let Some(endpoint) = made else {
             return;
         };
         if let Some(key) = std::env::var("OPENROUTER_API_KEY").ok().filter(|key| !key.trim().is_empty())
@@ -111,6 +114,17 @@ impl HostWindow {
         {
             let key = self.keys.get(&endpoint.id);
             self.probes.models(&self.ctx, &endpoint, key);
+        }
+        // The image skill's models too, so an Image cell names its model.
+        if self.native_dialogs
+            && let Some(endpoint) = self
+                .settings
+                .image_skill()
+                .and_then(|skill| skill.endpoint.clone())
+                .and_then(|id| self.settings.endpoint(&id).cloned())
+        {
+            let key = self.keys.get(&endpoint.id);
+            self.probes.image_models(&self.ctx, &endpoint, key);
         }
         self.chat.levels = self
             .settings
@@ -392,6 +406,68 @@ impl HostWindow {
         });
         if pressed_outside || ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.model_menu = None;
+        }
+    }
+
+    /// Where a cell's run goes. An Image cell goes back to the endpoint and
+    /// model it recorded, or, new, to the first image skill; any other cell
+    /// as `recorded_route` says.
+    pub(super) fn cell_route(&mut self, cell: &protocol::Cell) -> Result<Route, String> {
+        if cell.kind != protocol::IMAGE_KIND {
+            return self.recorded_route(cell);
+        }
+        let recorded = cell.endpoint.as_deref().and_then(|id| self.settings.endpoint(id)).cloned();
+        if let (Some(endpoint), Some(model)) = (recorded, cell.model.as_deref().filter(|model| !model.trim().is_empty())) {
+            let key = self.keys.get(&endpoint.id);
+            return Ok(Route::new(&endpoint, key, model, None));
+        }
+        let skill = self
+            .settings
+            .image_skill()
+            .cloned()
+            .ok_or_else(|| String::from("No skill makes pictures. Add one in Settings, under Skills."))?;
+        let keys = &mut self.keys;
+        endpoints::skill_route(&self.settings, &skill, |id| keys.get(id))
+    }
+
+    /// Keeps a run's picture in the project's `images` folder, one file per
+    /// run, and names it relative to the project. With no project, as in a
+    /// frame test with none, it goes to a scratch folder.
+    pub(super) fn keep_picture(&mut self, index: usize, png: Vec<u8>) {
+        let Some(id) = self.board.runs.get(index).map(|run| run.id.clone()) else {
+            return;
+        };
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |time| time.as_millis());
+        let name = format!("{id}-{stamp}.png");
+        let (folder, named) = match &self.project {
+            Some(project) => (project.folder.join("images"), format!("images/{name}")),
+            None => {
+                let folder = std::env::temp_dir().join("inpainter-pictures");
+                (folder.clone(), folder.join(&name).display().to_string())
+            }
+        };
+        match std::fs::create_dir_all(&folder).and_then(|_| std::fs::write(folder.join(&name), &png)) {
+            Ok(()) => self.board.runs[index].picture = Some((named, png)),
+            // The run ends here, failed; the end that follows finds it gone.
+            Err(error) => self.finish_run(index, protocol::CellState::Failed, Some(format!("The picture could not be kept: {error}."))),
+        }
+    }
+
+    /// Shows one of a cell's versions, from its filmstrip.
+    pub(super) fn show_version(&mut self, id: &str, index: usize) {
+        if let Some(cell) = self
+            .chat
+            .conversation
+            .iter_mut()
+            .find_map(|entry| entry.cell.as_mut().filter(|cell| cell.id == id))
+        {
+            if cell.show_version(index) {
+                self.board.drafts.insert(id.to_string(), cell.prompt());
+            }
+            return;
+        }
+        if let Some((app, tab)) = self.cell_home(id) {
+            self.send(app, protocol::HostMessage::SetVersion { tab, cell: id.to_string(), index });
         }
     }
 }

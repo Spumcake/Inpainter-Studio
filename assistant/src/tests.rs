@@ -606,7 +606,7 @@ fn the_endpoint_effort_and_voice_reach_the_model() {
     let chat = stand_in.chats()[0].clone();
     assert_eq!(chat["reasoning"]["effort"], "high");
     let system = chat["messages"][0]["content"].as_str().unwrap();
-    assert!(system.contains("Ask before anything that costs money"));
+    assert!(!system.contains("costs money"), "Studio asks nothing before spending, as the owner set on 2026-10-30");
     assert!(system.ends_with("Answer as a lighthouse keeper."), "{system}");
     assert_eq!(stand_in.keys.lock().unwrap()[0].as_deref(), Some("Bearer router-key"));
 

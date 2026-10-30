@@ -93,6 +93,7 @@ fn quill_program(dir: &Path) -> PathBuf {
 
 mod cells_checks;
 mod settings_checks;
+mod image_checks;
 
 /// A folder of the check's own, which it removes when done.
 fn scratch(name: &str) -> PathBuf {
@@ -104,6 +105,9 @@ fn scratch(name: &str) -> PathBuf {
 
 /// A scripted OpenRouter: every chat request is recorded, and answered with
 /// the next scripted reply.
+/// The picture the stand-in makes: a 6 by 4 PNG.
+const STAND_IN_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAYAAAAECAIAAAAiZtkUAAAAHklEQVR4nGMU0ThxKSCBAQkwPqvQYEAFTAwYAIsQAAvOBBOk9STxAAAAAElFTkSuQmCC";
+
 struct StandIn {
     url: String,
     requests: Arc<Mutex<Vec<Value>>>,
@@ -111,6 +115,9 @@ struct StandIn {
     keys: Arc<Mutex<Vec<Option<String>>>>,
     /// What a model list is answered with.
     models: Arc<Mutex<Value>>,
+    /// Each picture asked for, by its request's body. Each is answered with
+    /// `STAND_IN_PNG`.
+    pictures: Arc<Mutex<Vec<Value>>>,
     replies: Arc<Mutex<std::collections::VecDeque<Value>>>,
     /// While held, a streamed text reply sends its first part, flushes, and
     /// waits for `release` before it sends the rest, as a slow model does.
@@ -132,6 +139,8 @@ impl StandIn {
         let seen_keys = keys.clone();
         let models = Arc::new(Mutex::new(json!({"data": []})));
         let listed = models.clone();
+        let pictures = Arc::new(Mutex::new(Vec::new()));
+        let pictured = pictures.clone();
         let replies = Arc::new(Mutex::new(replies.into_iter().collect::<std::collections::VecDeque<_>>()));
         let script = replies.clone();
         let gate = Arc::new((Mutex::new(Gate::default()), std::sync::Condvar::new()));
@@ -161,6 +170,24 @@ impl StandIn {
                 }
                 let mut body = vec![0; length];
                 reader.read_exact(&mut body).unwrap();
+                // OpenRouter's image API: the picture as base64, and its
+                // catalogue of image models.
+                let path = request_line.split_whitespace().nth(1).unwrap_or_default().to_string();
+                if path.ends_with("/images") || path.ends_with("/images/models") {
+                    let reply = if path.ends_with("/images") {
+                        pictured.lock().unwrap().push(serde_json::from_slice::<Value>(&body).unwrap());
+                        json!({"data": [{"b64_json": STAND_IN_PNG}]})
+                    } else {
+                        json!({"data": [{"id": crate::workspace::IMAGE_MODEL, "name": "OpenAI: GPT Image 2.5"}]})
+                    };
+                    let text = reply.to_string();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{text}",
+                        text.len()
+                    );
+                    continue;
+                }
                 let reply = if request_line.starts_with("GET") {
                     listed.lock().unwrap().clone()
                 } else {
@@ -204,6 +231,7 @@ impl StandIn {
             requests,
             keys,
             models,
+            pictures,
             replies,
             gate,
         }
@@ -212,6 +240,11 @@ impl StandIn {
     /// The `Authorization` header of each request, in order.
     fn keys(&self) -> Vec<Option<String>> {
         self.keys.lock().unwrap().clone()
+    }
+
+    /// Every picture asked for, by its request's body.
+    fn pictures(&self) -> Vec<Value> {
+        self.pictures.lock().unwrap().clone()
     }
 
     /// A model list asked for is answered with `list`.
@@ -290,6 +323,8 @@ struct Window {
     events: Vec<egui::Event>,
     /// The texts the last frame painted, with where each was drawn.
     texts: Vec<(String, Rect)>,
+    /// Where the last frame painted pictures, larger than the logo.
+    pictures: Vec<Rect>,
 }
 
 impl Window {
@@ -309,6 +344,7 @@ impl Window {
             frame: eframe::Frame::_new_kittest(),
             close_next: false,
         texts: Vec::new(),
+        pictures: Vec::new(),
             events: Vec::new(),
         };
         // Every application here declares skills just after its greeting.
@@ -343,6 +379,14 @@ impl Window {
             .iter()
             .filter_map(|clipped| match &clipped.shape {
                 egui::Shape::Text(text) => Some((text.galley.text().to_string(), text.visual_bounding_rect())),
+                _ => None,
+            })
+            .collect();
+        self.pictures = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Rect(rect) if rect.brush.is_some() && rect.rect.width() > 30.0 => Some(rect.rect),
                 _ => None,
             })
             .collect();
@@ -679,6 +723,7 @@ fn project_window(specs: Vec<super::AppSpec>, stand_in: &StandIn, data: &Path) -
         frame: eframe::Frame::_new_kittest(),
         close_next: false,
         texts: Vec::new(),
+        pictures: Vec::new(),
         events: Vec::new(),
     };
     window.until(|app| {

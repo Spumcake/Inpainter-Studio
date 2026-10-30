@@ -17,7 +17,13 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 mod agent;
 mod openrouter;
 mod prompt;
-pub use openrouter::{models, status, stream_prompt};
+pub use openrouter::{image_models, make_image, models, status, stream_prompt};
+
+/// A picture's bytes as the standard base64 a tool result carries.
+pub fn picture_base64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
 #[cfg(test)]
 mod tests;
 

@@ -637,6 +637,7 @@ impl eframe::App for HostWindow {
             .map(|model| (model.id.clone(), chat::short_name(&model.name).to_string()))
             .collect();
         crate::cells::set_model_names(&ctx, &names);
+        crate::cells::set_picture_root(&ctx, self.project.as_ref().map(|project| project.folder.clone()));
         self.show_levels(&known);
         self.configure_assistant();
         let mut pending = false;
@@ -1005,20 +1006,25 @@ impl HostWindow {
     /// skills, runs as a cell in the conversation.
     fn begin_host_cell(&mut self, call: String, tool: &str, input: serde_json::Value) {
         let text = |key: &str| input.get(key).and_then(|value| value.as_str()).unwrap_or("").to_string();
-        let (prompt, run_on) = match route::skill_for_tool(&self.settings, tool) {
+        let (prompt, run_on, picture) = match route::skill_for_tool(&self.settings, tool) {
             Some(skill) => {
-                let asked = text("input");
+                // An image skill's tool is asked with the picture's prompt.
+                let picture = skill.makes == workspace::Makes::Images;
+                let asked = text(if picture { "prompt" } else { "input" });
                 let prompt = if skill.prompt.trim().is_empty() {
                     asked
                 } else {
                     format!("{}\n\n{asked}", skill.prompt.trim_end())
                 };
                 let keys = &mut self.keys;
-                (prompt, crate::endpoints::skill_route(&self.settings, &skill, |id| keys.get(id)))
+                (prompt, crate::endpoints::skill_route(&self.settings, &skill, |id| keys.get(id)), picture)
             }
-            None => (text("prompt"), self.level_route()),
+            None => (text("prompt"), self.level_route(), false),
         };
         let mut cell = protocol::Cell::text(protocol::cell_id(), &prompt);
+        if picture {
+            cell.kind = protocol::IMAGE_KIND.to_string();
+        }
         if let Ok(route) = &run_on {
             cell.endpoint = Some(route.endpoint.clone());
             cell.model = Some(route.model.clone());
@@ -1030,7 +1036,7 @@ impl HostWindow {
             entry.cell = Some(cell.clone());
         }
         self.board.drafts.insert(cell.id.clone(), prompt.clone());
-        self.launch_run(crate::cells::Place::Conversation, cell.id, Some(call), run_on, prompt);
+        self.launch_run(crate::cells::Place::Conversation, cell.id, Some(call), run_on, prompt, picture);
     }
 
     fn note_cell_actions(&mut self, actions: Vec<crate::cells::CardAction>) {
@@ -1054,6 +1060,7 @@ impl HostWindow {
                     }
                 }
                 crate::cells::CardAction::ShowSource(id) => self.show_source(&id),
+                crate::cells::CardAction::ShowVersion(id, index) => self.show_version(&id, index),
                 crate::cells::CardAction::Models(id, at) => {
                     let open = self.model_menu.as_ref().is_some_and(|(open, _)| *open == id);
                     self.model_menu = if open { None } else { Some((id, at)) };
@@ -1091,8 +1098,9 @@ impl HostWindow {
         });
         if let Some(cell) = recorded {
             self.edit_prompt(id, vec![protocol::CellPart::Text { text: prompt.clone() }]);
-            let run_on = self.recorded_route(&cell);
-            self.launch_run(crate::cells::Place::Conversation, id.to_string(), None, run_on, prompt);
+            let run_on = self.cell_route(&cell);
+            let picture = cell.kind == protocol::IMAGE_KIND;
+            self.launch_run(crate::cells::Place::Conversation, id.to_string(), None, run_on, prompt, picture);
             return;
         }
         let Some((app, tab)) = self.cell_home(id) else {
@@ -1143,13 +1151,14 @@ impl HostWindow {
         call: Option<String>,
         run_on: Result<crate::endpoints::Route, String>,
         prompt: String,
+        picture: bool,
     ) {
         self.board.runs.retain(|run| run.id != id);
         let (endpoint, model, effort) = match &run_on {
             Ok(route) => (route.endpoint.clone(), route.model.clone(), route.effort.map(|effort| effort.word().to_string())),
             Err(_) => (String::new(), String::new(), None),
         };
-        let rx = crate::cells::start_run(run_on, &prompt);
+        let rx = crate::cells::start_run(run_on, &prompt, picture);
         self.board.runs.push(crate::cells::Run {
             place,
             id,
@@ -1157,6 +1166,7 @@ impl HostWindow {
             endpoint,
             model,
             effort,
+            picture: None,
             prompt,
             text: String::new(),
             rx,
@@ -1213,7 +1223,7 @@ impl HostWindow {
             cell.model = Some(model);
             cell.effort = effort;
         }
-        let run_on = self.recorded_route(&cell);
+        let run_on = self.cell_route(&cell);
         let prompt = self.board.drafts.get(id).cloned().unwrap_or_else(|| cell.prompt());
         if prompt.trim().is_empty() {
             return;
@@ -1256,6 +1266,7 @@ impl HostWindow {
             None,
             run_on,
             prompt,
+            cell.kind == protocol::IMAGE_KIND,
         );
     }
 
@@ -1287,6 +1298,7 @@ impl HostWindow {
         };
         match piece {
             crate::cells::Piece::Text(_) => self.mirror_live(index),
+            crate::cells::Piece::Picture(png) => self.keep_picture(index, png),
             crate::cells::Piece::End => self.finish_run(index, protocol::CellState::Done, None),
             crate::cells::Piece::Failed(reason) => {
                 self.finish_run(index, protocol::CellState::Failed, Some(reason))
@@ -1322,6 +1334,7 @@ impl HostWindow {
         let model = run.model.clone();
         let endpoint = run.endpoint.clone();
         let effort = run.effort.clone();
+        let picture = run.picture.clone();
         let ran = vec![protocol::CellPart::Text { text: run.prompt.clone() }];
         let call = run.call.clone();
         let place = match &run.place {
@@ -1331,33 +1344,48 @@ impl HostWindow {
         self.board.runs.remove(index);
         // The run's result records the model a chevron chose.
         self.board.chosen.remove(&id);
-        let output = vec![protocol::CellPart::Text { text: text.clone() }];
+        // An Image cell's output is its picture, named relative to the project.
+        let output = match &picture {
+            Some((path, _)) => vec![protocol::CellPart::Path { path: path.clone(), media_type: String::from("image/png") }],
+            None => vec![protocol::CellPart::Text { text: text.clone() }],
+        };
         match place {
             None => {
                 if let Some(cell) = self.chat.conversation.iter_mut().find_map(|entry| {
                     entry.cell.as_mut().filter(|cell| cell.id == id)
                 }) {
-                    cell.output = output.clone();
-                    cell.state = state;
-                    cell.error = error.clone();
-                    if !endpoint.is_empty() {
-                        cell.endpoint = Some(endpoint.clone());
-                        cell.model = Some(model.clone());
-                        cell.effort = effort.clone();
-                    }
+                    // A conversation cell keeps every run as a version, as a
+                    // notebook's cell does, for the Image cell's filmstrip.
+                    cell.versions.push(protocol::CellVersion {
+                        id: protocol::cell_id(),
+                        input: ran.clone(),
+                        endpoint: (!endpoint.is_empty()).then(|| endpoint.clone()).or_else(|| cell.endpoint.clone()),
+                        model: (!endpoint.is_empty()).then(|| model.clone()).or_else(|| cell.model.clone()),
+                        effort: if endpoint.is_empty() { cell.effort.clone() } else { effort.clone() },
+                        output: output.clone(),
+                        state,
+                        error: error.clone(),
+                        time: workspace::now_seconds(),
+                    });
+                    cell.current = Some(cell.versions.len() - 1);
+                    cell.agree();
                 }
                 if let Some(call) = call {
                     let ok = state != protocol::CellState::Failed;
-                    let output = if let Some(reason) = &error {
-                        serde_json::json!({ "error": reason })
+                    let (output, images) = if let Some(reason) = &error {
+                        (serde_json::json!({ "error": reason }), Vec::new())
+                    } else if let Some((_, png)) = &picture {
+                        // The assistant sees the picture it asked for, as the
+                        // owner set on 2026-10-30.
+                        (serde_json::json!("Made the picture."), vec![assistant::picture_base64(png)])
                     } else {
-                        serde_json::json!(text)
+                        (serde_json::json!(text), Vec::new())
                     };
                     self.assistant.send(Command::Result(protocol::ToolResult {
                         call,
                         ok,
                         output,
-                        images: Vec::new(),
+                        images,
                     }));
                 }
             }

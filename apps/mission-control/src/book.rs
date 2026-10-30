@@ -12,7 +12,7 @@
 
 use protocol::{
     Action, AppMessage, Ask, AskButton, Cell, CellPart, CellState, CellVersion, Chord,
-    ContentsKind, FileFilter, FileKind, HostMessage, Keys, MARKDOWN_KIND, MenuEntry, TEXT_KIND,
+    ContentsKind, FileFilter, FileKind, HostMessage, IMAGE_KIND, Keys, MARKDOWN_KIND, MenuEntry, TEXT_KIND,
     TabEntry, Tabs, ToolItem, ToolResult, Toolbar,
 };
 use serde::{Deserialize, Serialize};
@@ -348,6 +348,12 @@ impl Session {
                 self.adding = String::from(MARKDOWN_KIND);
                 out.extend(self.declared());
             }
+            // An Image cell makes a picture from its prompt, as the owner
+            // set on 2026-10-30.
+            "kind_image" => {
+                self.adding = String::from(IMAGE_KIND);
+                out.extend(self.declared());
+            }
             "cut" => {
                 self.copy_active();
                 self.delete_cell(out);
@@ -681,7 +687,8 @@ impl Session {
         let Some(cell) = book.cells.iter().find(|cell| cell.id == id) else {
             return;
         };
-        let runs = cell.kind == MARKDOWN_KIND || (cell.kind == TEXT_KIND && !cell.prompt().trim().is_empty());
+        let runs = cell.kind == MARKDOWN_KIND
+            || ((cell.kind == TEXT_KIND || cell.kind == IMAGE_KIND) && !cell.prompt().trim().is_empty());
         if !runs {
             return;
         }
@@ -1180,7 +1187,7 @@ fn toolbar(adding: &str) -> Toolbar {
                 icon: String::new(),
                 label: kind_label(adding).into(),
                 enabled: true,
-                rows: vec![row("LLM", "kind_text"), row("Markdown", "kind_markdown")],
+                rows: vec![row("LLM", "kind_text"), row("Markdown", "kind_markdown"), row("Image", "kind_image")],
             },
         ],
         trailing: Vec::new(),
@@ -1188,7 +1195,11 @@ fn toolbar(adding: &str) -> Toolbar {
 }
 
 fn kind_label(kind: &str) -> &'static str {
-    if kind == MARKDOWN_KIND { "Markdown" } else { "LLM" }
+    match kind {
+        MARKDOWN_KIND => "Markdown",
+        IMAGE_KIND => "Image",
+        _ => "LLM",
+    }
 }
 
 /// The menu. In a project every change is written by itself, so Save and

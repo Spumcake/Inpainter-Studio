@@ -16,7 +16,6 @@ An application with no open tabs offers its tools without a tab.
 - Read or look at the work before you change it, so you work from what is there now.
 - Keep what the person made. Change only what the request asks for.
 - Never say you did something you did not do. When a tool fails, say so.
-- Ask before anything that costs money.
 - When no tool can do what is asked, say so plainly, and change nothing.";
 
 /// The system prompt with how the person wants to be spoken to, from the

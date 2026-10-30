@@ -422,6 +422,59 @@ fn failure(status: u16, text: &str) -> String {
     format!("The endpoint answered {status}: {detail}.")
 }
 
+/// How long one picture may take to make.
+const IMAGE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// One picture from a prompt: `POST {base}/images`, always at high quality,
+/// as PNG. Returns the PNG's bytes, or a sentence saying why not.
+pub fn make_image(base_url: &str, key: &str, model: &str, prompt: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    let url = format!("{}/images", base_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "model": model,
+        "prompt": prompt,
+        "n": 1,
+        "quality": "high",
+        "output_format": "png",
+    });
+    let mut request = agent(IMAGE_TIMEOUT).post(&url);
+    if !key.is_empty() {
+        request = request.header("Authorization", &format!("Bearer {key}"));
+    }
+    let response = request
+        .header("HTTP-Referer", "https://github.com/Spumcake/Inpainter")
+        .header("X-Title", "Inpainter")
+        .header("Content-Type", "application/json")
+        .send(body.to_string());
+    let reply = read(response)?;
+    let data = reply
+        .pointer("/data/0/b64_json")
+        .and_then(Value::as_str)
+        .ok_or_else(|| String::from("The endpoint's reply held no picture."))?;
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(data.trim())
+        .map_err(|_| String::from("The endpoint's picture could not be read."))?;
+    if !png.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err(String::from("The endpoint's picture was not a PNG."));
+    }
+    Ok(png)
+}
+
+/// The image models an endpoint offers: `GET {base}/images/models`.
+pub fn image_models(base_url: &str, key: Option<&str>) -> Result<Vec<Model>, String> {
+    let url = format!("{}/images/models", base_url.trim_end_matches('/'));
+    let mut request = agent(MODELS_TIMEOUT).get(&url);
+    if let Some(key) = key.filter(|key| !key.is_empty()) {
+        request = request.header("Authorization", &format!("Bearer {key}"));
+    }
+    let page = read(request.call())?;
+    let data = page
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| String::from("The endpoint's image models could not be read."))?;
+    Ok(data.iter().filter_map(any_model).collect())
+}
+
 /// The body of a reply as JSON, or a sentence saying why not.
 fn read(response: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<Value, String> {
     let text = read_text(response)?;

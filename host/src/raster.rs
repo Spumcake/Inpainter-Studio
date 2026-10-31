@@ -3,7 +3,9 @@
 //! picture, its selection's marching edge, the crop box, and the active
 //! layer's box, previews a paint drag while it is drawn, and sends each
 //! finished gesture in picture pixels. It knows no editor: what a gesture
-//! does is the sub-application's, and the next `raster` view shows it.
+//! does is the sub-application's, and the next `raster` view shows it. A
+//! view with a filmstrip gives the strip the bottom of the area, and the
+//! picture the rest.
 
 use crate::process::RasterDisplay;
 use crate::tablet::Tablet;
@@ -13,7 +15,7 @@ use eframe::egui::{
     self, Color32, CursorIcon, Event, Key, MouseWheelUnit, PointerButton, Pos2, Rect,
     Sense, pos2, vec2,
 };
-use protocol::{RasterGesture, RasterTool, RasterView};
+use protocol::{RasterGesture, RasterPatch, RasterTool, RasterView};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -26,8 +28,6 @@ const CHECK_DARK: Color32 = Color32::from_rgb(224, 226, 230);
 const CHECK: f32 = 8.0;
 /// The move tool's box and handles, in the mockup's blue.
 const BOUNDS: Color32 = Color32::from_rgb(37, 99, 235);
-/// The eraser's preview: a light, see-through trail.
-const ERASE_TRAIL: Color32 = Color32::from_rgba_premultiplied(150, 152, 156, 150);
 /// What lies outside the crop box is dimmed this much, as crop.png shows.
 const CROP_DIM: Color32 = Color32::from_black_alpha(110);
 
@@ -47,31 +47,33 @@ const GRAB: f32 = 8.0;
 /// A sent gesture's preview ends with the next view, or after this long
 /// when none comes, as when a locked layer refuses it.
 const HELD_FOR: Duration = Duration::from_secs(3);
+/// A change of pen pressure that keeps a sample however near the last.
+const PRESSURE_STEP: f64 = 0.02;
 /// The marching edge's dash, in points, and how often it moves.
 const DASH: f32 = 4.0;
 const MARCH: Duration = Duration::from_millis(120);
 
 /// What the pointer finished this frame. A paint drag is its own case: the
-/// window names it as the protocol does.
+/// window names it as the protocol does. The filmstrip sends declared
+/// actions.
 pub(crate) enum Out {
     Gesture(RasterGesture),
     Painted(Vec<[f64; 3]>),
-}
-
-/// How a paint drag is previewed: its colour, or none for the eraser.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Look {
-    rgb: Option<[u8; 3]>,
-    size: f64,
-    opacity: f64,
-    pressure: bool,
+    /// The newest points of a paint drag still open, after `from` sent.
+    PaintPart { from: usize, points: Vec<[f64; 3]> },
+    /// A paint drag let go with Escape.
+    PaintLetGo,
+    Action(protocol::Action),
 }
 
 /// What a drag shows while it is open, and after it is sent until the
 /// sub-application answers.
 #[derive(Clone, Debug, PartialEq)]
 enum Live {
-    Paint { points: Vec<[f64; 3]>, look: Look },
+    /// A paint drag: its points, and how many were sent while it was drawn.
+    /// The sub-application paints them as they come; the host draws no
+    /// trail of its own, so what is seen while dragging is what is laid.
+    Paint { points: Vec<[f64; 3]>, sent: usize },
     Rect { from: [f64; 2], to: [f64; 2] },
     Lasso { points: Vec<[f64; 2]> },
     Move { from: [f64; 2], to: [f64; 2] },
@@ -112,9 +114,10 @@ pub(crate) struct Pointer {
     /// The open paint drag takes its samples from the tablet.
     pen: bool,
     held: Vec<Held>,
-    /// Where the tab was last drawn.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Where the picture was last drawn: the tab's area above its
+    /// filmstrip, when it has one.
     pub(crate) shown: Rect,
+    film: crate::film::Strip,
 }
 
 impl Default for Pointer {
@@ -125,6 +128,7 @@ impl Default for Pointer {
             pen: false,
             held: Vec::new(),
             shown: Rect::NOTHING,
+            film: crate::film::Strip::default(),
         }
     }
 }
@@ -135,8 +139,9 @@ impl Pointer {
         *self = Self::default();
     }
 
-    /// Draws the tab in `rect` and handles its pointer. Finished gestures go
-    /// to `out`. Returns whether the camera moved.
+    /// Draws the tab in `rect` and handles its pointer, with its filmstrip
+    /// along the bottom when the view has one. Finished gestures and the
+    /// strip's actions go to `out`. Returns whether the camera moved.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn show(
         &mut self,
@@ -148,6 +153,7 @@ impl Pointer {
         dismissing: bool,
         out: &mut Vec<Out>,
     ) -> bool {
+        let (rect, strip) = crate::film::split(rect, display.view.film.as_ref());
         self.shown = rect;
         let viewport = [f64::from(rect.width()), f64::from(rect.height())];
         let mut moved = false;
@@ -181,6 +187,11 @@ impl Pointer {
         let tool = display.view.tool.clone();
 
         if self.drag.is_some() && ui.input(|input| input.key_pressed(Key::Escape)) {
+            if let Some(Drag { live: Live::Paint { sent, .. }, .. }) = &self.drag
+                && *sent > 0
+            {
+                out.push(Out::PaintLetGo);
+            }
             self.drag = None;
             self.pen = false;
         }
@@ -198,6 +209,7 @@ impl Pointer {
                     }
                 } else if !locked && let Some(pos) = pos {
                     self.press(ui, display, rect, tablet, pos, out);
+                    self.send_part(out);
                 }
             }
         }
@@ -214,6 +226,7 @@ impl Pointer {
             }
         } else if self.drag.is_some() {
             self.update(ui, display, rect, tablet);
+            self.send_part(out);
             if released(PointerButton::Primary) || !down(PointerButton::Primary) {
                 self.finish(display, out);
             }
@@ -224,6 +237,11 @@ impl Pointer {
         let cursor = self.cursor(ui, display, rect, &tool, space, alt, locked);
         response.on_hover_cursor(cursor);
         self.paint(ui, display, rect);
+        if let (Some(film), Some(strip)) = (&display.view.film, strip) {
+            let mut actions = Vec::new();
+            self.film.show(ui, film, strip, locked, dismissing, &mut actions);
+            out.extend(actions.into_iter().map(Out::Action));
+        }
         moved
     }
 
@@ -242,14 +260,7 @@ impl Pointer {
         };
         let at = picture_at(&camera, rect, pos);
         let live = match &display.view.tool {
-            RasterTool::Brush { rgb, size, opacity, pressure, .. } => Live::Paint {
-                points: Vec::new(),
-                look: Look { rgb: Some(*rgb), size: *size, opacity: *opacity, pressure: *pressure },
-            },
-            RasterTool::Erase { size, opacity, pressure, .. } => Live::Paint {
-                points: Vec::new(),
-                look: Look { rgb: None, size: *size, opacity: *opacity, pressure: *pressure },
-            },
+            RasterTool::Brush { .. } | RasterTool::Erase { .. } => Live::Paint { points: Vec::new(), sent: 0 },
             RasterTool::Marquee => Live::Rect { from: at, to: at },
             RasterTool::Lasso => Live::Lasso { points: vec![at] },
             RasterTool::Move => Live::Move { from: at, to: at },
@@ -280,7 +291,7 @@ impl Pointer {
         self.drag = Some(Drag { live, press: at, crop: None, moved: false });
         if paints {
             self.pen = tablet.input().down();
-            self.sample(ui, &camera, rect, tablet);
+            self.sample(ui, &camera, rect, tablet, spacing(&display.view.tool));
         }
     }
 
@@ -296,7 +307,7 @@ impl Pointer {
         let size = [f64::from(display.view.width), f64::from(display.view.height)];
         let paints = matches!(self.drag.as_ref().map(|drag| &drag.live), Some(Live::Paint { .. }));
         if paints {
-            self.sample(ui, &camera, rect, tablet);
+            self.sample(ui, &camera, rect, tablet, spacing(&display.view.tool));
             return;
         }
         let Some(drag) = self.drag.as_mut() else {
@@ -322,8 +333,11 @@ impl Pointer {
     }
 
     /// Adds this frame's pointer or pen samples to the open paint drag, in
-    /// picture pixels, with the pen's pressure or 1 with a mouse.
-    fn sample(&mut self, ui: &egui::Ui, camera: &Camera, rect: Rect, tablet: &Tablet) {
+    /// picture pixels, with the pen's pressure or 1 with a mouse. A sample
+    /// nearer the last than `spacing`, at much the same pressure, is left
+    /// out: the paint moves less than that from where it would be, and a
+    /// large brush is not painted over itself for every pixel moved.
+    fn sample(&mut self, ui: &egui::Ui, camera: &Camera, rect: Rect, tablet: &Tablet, spacing: f64) {
         let Some(Drag { live: Live::Paint { points, .. }, .. }) = self.drag.as_mut() else {
             return;
         };
@@ -354,9 +368,23 @@ impl Pointer {
         for (pos, pressure) in samples {
             let at = picture_at(camera, rect, pos);
             let point = [at[0], at[1], pressure];
-            if points.last().is_none_or(|last| last[0] != point[0] || last[1] != point[1]) {
+            let apart = |last: &[f64; 3]| {
+                (point[0] - last[0]).hypot(point[1] - last[1]) >= spacing || (point[2] - last[2]).abs() > PRESSURE_STEP
+            };
+            if points.last().is_none_or(apart) {
                 points.push(point);
             }
+        }
+    }
+
+    /// The paint drag's points not sent yet go to the sub-application, which
+    /// paints them at once.
+    fn send_part(&mut self, out: &mut Vec<Out>) {
+        if let Some(Drag { live: Live::Paint { points, sent }, .. }) = self.drag.as_mut()
+            && points.len() > *sent
+        {
+            out.push(Out::PaintPart { from: *sent, points: points[*sent..].to_vec() });
+            *sent = points.len();
         }
     }
 
@@ -367,7 +395,11 @@ impl Pointer {
             return;
         };
         let gesture = match &drag.live {
-            Live::Paint { points, .. } if !points.is_empty() => Out::Painted(points.clone()),
+            // The paint is on the picture already: nothing is held.
+            Live::Paint { points, .. } if !points.is_empty() => {
+                out.push(Out::Painted(points.clone()));
+                return;
+            }
             Live::Rect { from, to } => Out::Gesture(RasterGesture::Rect { from: *from, to: *to }),
             Live::Lasso { points } if points.len() >= 3 => {
                 Out::Gesture(RasterGesture::Lasso { points: points.clone() })
@@ -448,7 +480,7 @@ impl Pointer {
         let picture = picture_rect(&camera, rect, view);
         // The picture, then a border around it, as the owner set on
         // 2026-10-30, so a white picture stands apart from the grey.
-        match raw_picture(ui.ctx(), &view.picture, view.width, view.height, view.revision) {
+        match raw_picture(ui.ctx(), &view.picture, view.width, view.height, view.revision, view.patch) {
             Some((texture, opaque)) => {
                 if !opaque {
                     checker(ui.ctx(), &painter, picture);
@@ -465,7 +497,7 @@ impl Pointer {
         let mut marching = false;
         for live in lives {
             match live {
-                Live::Paint { points, look } => paint_trail(&painter, &camera, rect, points, look),
+                Live::Paint { .. } => {}
                 Live::Rect { from, to } => {
                     let corners = [*from, [to[0], from[1]], *to, [from[0], to[1]]];
                     let points: Vec<Pos2> = corners.iter().map(|point| screen_at(&camera, rect, *point)).collect();
@@ -508,6 +540,15 @@ impl Pointer {
             widgets::ring(&painter, pos, radius, 1.0, Color32::from_black_alpha(160));
             widgets::ring(&painter, pos, radius + 1.0, 1.0, Color32::from_white_alpha(200));
         }
+    }
+}
+
+/// How far apart, in picture pixels, a paint drag's samples are kept: a
+/// twenty-fifth of the brush, from half a pixel to eight.
+fn spacing(tool: &RasterTool) -> f64 {
+    match tool {
+        RasterTool::Brush { size, .. } | RasterTool::Erase { size, .. } => (size / 25.0).clamp(0.5, 8.0),
+        _ => 0.5,
     }
 }
 
@@ -817,38 +858,6 @@ fn marching_edge(ui: &egui::Ui, painter: &egui::Painter, points: &[Pos2], closed
 
 /// A paint drag as it is drawn, in the tool's colour, size, and opacity,
 /// or as a light trail for the eraser.
-fn paint_trail(painter: &egui::Painter, camera: &Camera, rect: Rect, points: &[[f64; 3]], look: &Look) {
-    if points.is_empty() {
-        return;
-    }
-    let color = match look.rgb {
-        Some([r, g, b]) => Color32::from_rgba_unmultiplied(r, g, b, (look.opacity.clamp(0.0, 1.0) * 255.0).round() as u8),
-        None => ERASE_TRAIL,
-    };
-    let width = |pressure: f64| {
-        let scale = if look.pressure { pressure } else { 1.0 };
-        ((look.size * scale * camera.zoom) as f32).max(1.0)
-    };
-    let screen: Vec<Pos2> = points.iter().map(|point| screen_at(camera, rect, [point[0], point[1]])).collect();
-    if color.a() == 255 {
-        // An opaque trail is dabs joined by bars, so pressure shows.
-        for (index, point) in points.iter().enumerate() {
-            widgets::disc(painter, screen[index], width(point[2]) / 2.0, color);
-            if index > 0 {
-                let w = (width(point[2]) + width(points[index - 1][2])) / 2.0;
-                painter.line_segment([screen[index - 1], screen[index]], (w, color));
-            }
-        }
-    } else if screen.len() == 1 {
-        widgets::disc(painter, screen[0], width(points[0][2]) / 2.0, color);
-    } else {
-        // A see-through trail is one path, so its overlaps do not darken
-        // where the finished drag would not.
-        let mean = points.iter().map(|point| width(point[2])).sum::<f32>() / points.len() as f32;
-        painter.line(screen, (mean, color));
-    }
-}
-
 // Pictures read from raw RGBA files.
 
 #[derive(Clone)]
@@ -866,22 +875,36 @@ struct Loaded {
 const FORGET_AFTER: u64 = 600;
 
 /// A file of raw RGBA, `width × height × 4` bytes with straight alpha, as a
-/// texture, read again when `revision` changes. A file of any other length
-/// is not whole yet: the last texture is kept and the file is tried again on
-/// a later frame. Returns the texture and whether every pixel is opaque.
+/// texture, read again when `revision` changes: only the rows of `patch`
+/// when the texture holds the revision it starts from. A file of any other
+/// length is not whole yet: the last texture is kept and the file is tried
+/// again on a later frame. Returns the texture and whether every pixel is
+/// opaque.
 pub(crate) fn raw_picture(
     ctx: &egui::Context,
     path: &str,
     width: u32,
     height: u32,
     revision: u64,
+    patch: Option<RasterPatch>,
 ) -> Option<(egui::TextureId, bool)> {
     let id = egui::Id::new("raster-pictures");
     let pass = ctx.cumulative_pass_nr();
     let known: Option<Loaded> = ctx.data(|data| data.get_temp::<HashMap<String, Loaded>>(id).and_then(|cache| cache.get(path).cloned()));
     let current = known.as_ref().is_some_and(|known| known.revision == revision && known.size == [width, height]);
+    let patched = match (&known, patch) {
+        (Some(known), Some(patch)) if !current && known.revision == patch.since && known.size == [width, height] => {
+            read_patch(ctx, path, width, height, patch.rect).map(|(at, image, opaque)| {
+                known.texture.clone().set_partial(at, image, picture_options());
+                Loaded { revision, opaque: known.opaque && opaque, ..known.clone() }
+            })
+        }
+        _ => None,
+    };
     let loaded = if current {
         known
+    } else if patched.is_some() {
+        patched
     } else {
         match read_raw(ctx, path, width, height) {
             Some((image, opaque)) => Some(Loaded {
@@ -915,6 +938,35 @@ fn picture_options() -> egui::TextureOptions {
         wrap_mode: egui::TextureWrapMode::ClampToEdge,
         mipmap_mode: Some(egui::TextureFilter::Linear),
     }
+}
+
+/// Reads the rows of `rect` from a whole raw RGBA file, with where they go
+/// in the texture and whether they are opaque. None when the file is not
+/// whole, or the texture was shrunk to fit the graphics card.
+fn read_patch(ctx: &egui::Context, path: &str, width: u32, height: u32, rect: [u32; 4]) -> Option<([usize; 2], egui::ColorImage, bool)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let (width, height) = (width as usize, height as usize);
+    if width.max(height) > ctx.input(|input| input.max_texture_side) {
+        return None;
+    }
+    let x = (rect[0] as usize).min(width);
+    let y = (rect[1] as usize).min(height);
+    let w = (rect[2] as usize).min(width - x);
+    let h = (rect[3] as usize).min(height - y);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() != (width * height * 4) as u64 {
+        return None;
+    }
+    let mut bytes = vec![0u8; w * h * 4];
+    for (row, line) in bytes.chunks_exact_mut(w * 4).enumerate() {
+        file.seek(SeekFrom::Start((((y + row) * width + x) * 4) as u64)).ok()?;
+        file.read_exact(line).ok()?;
+    }
+    let opaque = bytes.chunks_exact(4).all(|pixel| pixel[3] == 255);
+    Some(([x, y], egui::ColorImage::from_rgba_unmultiplied([w, h], &bytes), opaque))
 }
 
 /// Reads a whole raw RGBA file, shrunk by whole steps when it is larger than

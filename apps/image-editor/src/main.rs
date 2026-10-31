@@ -1,11 +1,13 @@
-//! The Image Editor: one layered image per tab. The host draws the picture
-//! and owns the camera and the pointer; this process owns every pixel,
-//! layer, selection, step of history, and file.
+//! The Image Editor: a gallery of layered pictures per tab. The host draws
+//! the picture shown and the filmstrip, and owns the camera and the
+//! pointer; this process owns every pixel, layer, selection, step of
+//! history, and file.
 
 mod assist;
 mod declare;
 mod doc;
 mod files;
+mod gallery;
 mod paint;
 mod picture;
 mod session;
@@ -40,15 +42,31 @@ fn main() {
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        if line.contains("\"type\":\"shutdown\"") {
-            break;
+        // Every line already waiting is read before the picture of a stroke
+        // being drawn is sent, so painting never falls behind the pen.
+        let mut waiting = vec![line];
+        while let Ok(line) = incoming.try_recv() {
+            waiting.push(line);
         }
-        let replies = respond(&mut session, &line);
+        let mut stop = false;
         let mut out = std::io::stdout().lock();
-        for reply in replies {
-            let _ = out.write_all(reply.as_bytes());
+        for line in waiting {
+            if line.contains("\"type\":\"shutdown\"") {
+                stop = true;
+                break;
+            }
+            for reply in respond(&mut session, &line) {
+                let _ = out.write_all(reply.as_bytes());
+            }
+        }
+        for message in session.take_live() {
+            let _ = out.write_all(protocol::encode_app_message(&message).as_bytes());
         }
         let _ = out.flush();
+        drop(out);
+        if stop {
+            break;
+        }
     }
     // The host is gone: whatever a project has not written yet is written.
     session.write_all();

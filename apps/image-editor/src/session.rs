@@ -1,5 +1,6 @@
-//! The Image Editor's tabs, one layered image each, and everything the host
-//! sends them: commands, gestures, panel edits, files, and the project.
+//! The Image Editor's tabs, each a gallery of layered pictures, and
+//! everything the host sends them: commands, gestures, panel edits, the
+//! filmstrip's clicks, files, and the project.
 //!
 //! Inside a project, which the host names with `project`, every image is
 //! written into the project's folder by itself, a second after it changes,
@@ -9,7 +10,8 @@
 
 use crate::declare;
 use crate::doc::{Doc, Setting};
-use crate::files::{self, PngCache};
+use crate::files;
+use crate::gallery::{Frame, Gallery};
 use crate::paint::{Brush, Combine, Mask};
 use crate::picture::{Blend, Picture, Pixels};
 use protocol::{
@@ -17,7 +19,6 @@ use protocol::{
     PropValue, RasterGesture, RasterTool, RasterView, Thumbnail,
 };
 use serde_json::Value;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -32,6 +33,9 @@ pub const UNTITLED: &str = "Untitled Asset";
 pub const NEW_SIZE: [u32; 2] = [1920, 1080];
 /// The largest a layer's thumbnail is, in pixels.
 const THUMB_SIZE: [u32; 2] = [56, 40];
+/// The largest a filmstrip thumbnail is, in pixels: 44 tall, as the gallery
+/// views draw them, and no wider than four times that.
+const FILM_SIZE: [u32; 2] = [176, 44];
 /// The space kept around a picture when it is fitted to the window.
 const FIT_MARGIN: f64 = 40.0;
 
@@ -121,29 +125,52 @@ impl Default for Tools {
     }
 }
 
+/// One tab: a gallery of pictures, kept in one file.
 pub struct Image {
     pub id: String,
     pub label: String,
     pub path: Option<PathBuf>,
-    pub doc: Doc,
+    pub gallery: Gallery,
     pub dirty: bool,
+    /// The filmstrip, not the picture, has the keyboard: Undo and Redo act
+    /// on the strip's history until the picture is used again.
+    pub strip_focus: bool,
     /// Inside a project: when its change was first seen unwritten, and its
     /// last failed write, why and when.
     unwritten_since: Option<Instant>,
     write_failed: Option<(String, Instant)>,
-    /// The crop box while the crop tool is chosen: `[x, y, width, height]`.
-    pub crop: Option<[f64; 4]>,
-    /// The camera as the host last reported it, or as this sent it.
-    pub camera: Option<DocumentCamera>,
-    /// A camera to send with the next picture: the image is new or opened.
+    /// A camera to send with the next picture: the picture is new, opened,
+    /// or newly shown.
     send_camera: bool,
-    /// The host has reported moving this image's camera.
-    host_camera: bool,
-    /// The composite revision last written to the picture file.
-    written: Option<u64>,
-    /// Each layer's thumbnail, and the bytes written for it.
-    pub thumbs: HashMap<u64, (Vec<u8>, Thumbnail)>,
-    pngs: PngCache,
+}
+
+impl Image {
+    /// The picture shown.
+    pub fn frame(&self) -> &Frame {
+        self.gallery.frame()
+    }
+
+    pub fn frame_mut(&mut self) -> &mut Frame {
+        self.gallery.frame_mut()
+    }
+
+    /// The shown picture's document.
+    pub fn doc(&self) -> &Doc {
+        &self.gallery.frame().doc
+    }
+
+    pub fn doc_mut(&mut self) -> &mut Doc {
+        &mut self.gallery.frame_mut().doc
+    }
+
+    /// Whether Undo, as the keyboard has it now, has something to undo.
+    pub fn can_undo(&self) -> bool {
+        if self.strip_focus { self.gallery.can_undo() } else { self.doc().can_undo() }
+    }
+
+    pub fn can_redo(&self) -> bool {
+        if self.strip_focus { self.gallery.can_redo() } else { self.doc().can_redo() }
+    }
 }
 
 /// What a file dialog's answer is for.
@@ -151,6 +178,8 @@ pub struct Image {
 enum Purpose {
     Open,
     OpenLayer,
+    /// The filmstrip's "Open PNG or JPEG…": a new picture in this tab.
+    OpenPicture { tab: String },
     Export { jpeg: bool },
     Save { tab: String, then_quit: bool },
 }
@@ -167,10 +196,12 @@ pub struct Session {
     viewport: [f64; 2],
     file: Option<(String, Purpose)>,
     next_file: u64,
-    /// Every revision this process sends starts above this, so a picture of
-    /// an earlier run is never taken for a current one.
-    seed: u64,
-    next_thumb: u64,
+    /// Every picture file and thumbnail written gets the next revision. It
+    /// starts from the time the program started, so a picture of an earlier
+    /// run is never taken for a current one.
+    next_revision: u64,
+    /// Points of a stroke were painted and the picture is not sent yet.
+    live_due: bool,
     /// Tab ids still to ask about while quitting, after the one asked.
     quit_rest: Vec<String>,
     quitting: bool,
@@ -182,7 +213,7 @@ impl Session {
     /// Launched: one new image, already declared.
     pub fn launch() -> Self {
         let mut session = Self::empty();
-        session.push_image(Doc::new(Picture::blank(NEW_SIZE[0], NEW_SIZE[1])), None, None);
+        session.push_image(new_gallery(), None, None);
         session
     }
 
@@ -207,8 +238,8 @@ impl Session {
             viewport: [1200.0, 800.0],
             file: None,
             next_file: 1,
-            seed,
-            next_thumb: seed,
+            next_revision: seed,
+            live_due: false,
             quit_rest: Vec::new(),
             quitting: false,
             closing: false,
@@ -233,6 +264,20 @@ impl Session {
     /// One message from the host, and every reply.
     pub fn handle(&mut self, message: HostMessage) -> Vec<AppMessage> {
         let mut out = Vec::new();
+        // A stroke being drawn lasts only while its points come: anything
+        // else but the camera takes it off the picture first.
+        let drawing = matches!(
+            &message,
+            HostMessage::RasterGesture { gesture: RasterGesture::StrokePart { .. } | RasterGesture::Stroke { .. }, .. }
+                | HostMessage::Camera { .. }
+        );
+        if !drawing {
+            for image in &mut self.images {
+                for frame in &mut image.gallery.frames {
+                    frame.doc.end_live();
+                }
+            }
+        }
         match message {
             HostMessage::Shutdown => return Vec::new(),
             HostMessage::Ping => return vec![AppMessage::Pong],
@@ -257,8 +302,11 @@ impl Session {
                 self.project = Some(folder);
                 // Every picture is written again where the host now looks.
                 for image in &mut self.images {
-                    image.written = None;
-                    image.thumbs.clear();
+                    for frame in &mut image.gallery.frames {
+                        frame.written = None;
+                        frame.thumbs.clear();
+                        frame.film = None;
+                    }
                 }
                 out.extend(self.emit());
             }
@@ -275,17 +323,34 @@ impl Session {
                 if let Some(tab) = &tab {
                     self.activate(tab);
                 }
+                if !keeps_focus(&id) {
+                    self.picture_focus();
+                }
                 self.command(&id, tab.as_deref(), arg.unwrap_or(Value::Null), &mut out);
+            }
+            // The newest points of a stroke: painted at once, and the
+            // picture sent when the lines waiting have all been read.
+            HostMessage::RasterGesture { tab, gesture: RasterGesture::StrokePart { from, points } } => {
+                self.activate(&tab);
+                self.picture_focus();
+                if let Some(brush) = self.brush()
+                    && let Some(image) = self.images.get_mut(self.active)
+                {
+                    image.doc_mut().paint_live(from, &points, &brush);
+                    self.live_due = true;
+                }
             }
             HostMessage::RasterGesture { tab, gesture } => {
                 self.activate(&tab);
+                self.picture_focus();
                 self.gesture(gesture);
                 out.extend(self.emit());
             }
             HostMessage::Camera { tab, origin, zoom } => {
                 if let Some(image) = self.images.iter_mut().find(|image| image.id == tab) {
-                    image.camera = Some(DocumentCamera { origin, zoom });
-                    image.host_camera = true;
+                    let frame = image.frame_mut();
+                    frame.camera = Some(DocumentCamera { origin, zoom });
+                    frame.host_camera = true;
                     // The zoom menu shows the new percent.
                     out.push(AppMessage::Toolbar(declare::toolbar(self)));
                 }
@@ -296,7 +361,7 @@ impl Session {
                     // A picture fitted before the window's size was known is
                     // fitted again, unless the host has moved its camera.
                     for image in &mut self.images {
-                        if !image.host_camera {
+                        if !image.frame().host_camera {
                             image.send_camera = true;
                         }
                     }
@@ -309,6 +374,7 @@ impl Session {
                 }
             }
             HostMessage::Property { prop, value, preview } => {
+                self.picture_focus();
                 self.property(&prop, &value, preview);
                 out.extend(self.emit());
             }
@@ -383,28 +449,31 @@ impl Session {
         self.images.get(self.active)
     }
 
-    fn push_image(&mut self, doc: Doc, path: Option<PathBuf>, label: Option<String>) -> usize {
+    /// The picture, not the filmstrip, has the keyboard again.
+    fn picture_focus(&mut self) {
+        if let Some(image) = self.images.get_mut(self.active) {
+            image.strip_focus = false;
+        }
+    }
+
+    fn push_image(&mut self, mut gallery: Gallery, path: Option<PathBuf>, label: Option<String>) -> usize {
         let id = self.next_tab.to_string();
         self.next_tab += 1;
         let label = label
             .or_else(|| path.as_deref().map(file_title))
             .unwrap_or_else(|| String::from(UNTITLED));
-        let camera = fit(doc.picture.width, doc.picture.height, self.viewport);
+        let frame = gallery.frame_mut();
+        frame.camera = Some(fit(frame.doc.picture.width, frame.doc.picture.height, self.viewport));
         self.images.push(Image {
             id,
             label,
             path,
-            doc,
+            gallery,
             dirty: false,
+            strip_focus: false,
             unwritten_since: None,
             write_failed: None,
-            crop: None,
-            camera: Some(camera),
             send_camera: true,
-            host_camera: false,
-            written: None,
-            thumbs: HashMap::new(),
-            pngs: PngCache::default(),
         });
         self.active = self.images.len() - 1;
         if self.tools.tool == ToolKind::Crop {
@@ -422,14 +491,43 @@ impl Session {
         out.extend(self.emit());
     }
 
-    /// Runs `change` on the active image's document, and marks the image
+    /// Runs `change` on the shown picture's document, and marks the image
     /// changed when it was.
     fn change<T>(&mut self, change: impl FnOnce(&mut Doc) -> T) -> Option<T> {
         let image = self.images.get_mut(self.active)?;
-        let before = image.doc.edits;
-        let result = change(&mut image.doc);
-        if image.doc.edits != before {
+        let before = image.doc().edits;
+        let result = change(image.doc_mut());
+        if image.doc().edits != before {
             image.dirty = true;
+        }
+        Some(result)
+    }
+
+    /// Runs `change` on the active tab's gallery: the strip shows what it
+    /// changed, and its new picture gets its camera.
+    fn film<T>(&mut self, change: impl FnOnce(&mut Gallery) -> T) -> Option<T> {
+        let index = self.active;
+        let result = self.film_of(index, change);
+        if self.tools.tool == ToolKind::Crop && self.images.get(index).is_some_and(|image| image.frame().crop.is_none()) {
+            self.start_crop();
+        }
+        result
+    }
+
+    fn film_of<T>(&mut self, index: usize, change: impl FnOnce(&mut Gallery) -> T) -> Option<T> {
+        let in_project = self.project.is_some();
+        let image = self.images.get_mut(index)?;
+        // A held slider on the picture shown becomes its step first.
+        image.doc_mut().finish_edit();
+        let (edits, shown) = (image.gallery.edits, image.frame().uid);
+        let result = change(&mut image.gallery);
+        // Which picture is shown is kept too, but only a project's file is
+        // written for it by itself: outside one, it asks nothing on close.
+        if image.gallery.edits != edits || (in_project && image.frame().uid != shown) {
+            image.dirty = true;
+        }
+        if image.frame().uid != shown {
+            image.send_camera = true;
         }
         Some(result)
     }
@@ -439,7 +537,7 @@ impl Session {
         let node = arg.get("node").and_then(Value::as_u64);
         match id {
             "new_image" => {
-                self.push_image(Doc::new(Picture::blank(NEW_SIZE[0], NEW_SIZE[1])), None, None);
+                self.push_image(new_gallery(), None, None);
                 self.declare_new(out);
                 return;
             }
@@ -456,7 +554,8 @@ impl Session {
                 let Some(image) = self.active_image() else {
                     return;
                 };
-                let name = format!("{}.{}", image.label, if jpeg { "jpg" } else { "png" });
+                // The picture shown is exported, under its own name.
+                let name = format!("{}.{}", image.frame().name, if jpeg { "jpg" } else { "png" });
                 let filter = if jpeg {
                     FileFilter { name: "JPEG".into(), extensions: vec!["jpg".into(), "jpeg".into()] }
                 } else {
@@ -485,14 +584,81 @@ impl Session {
                 }
                 return;
             }
+            // While the strip has the keyboard, Undo and Redo act on its
+            // own history; otherwise on the picture shown, and only it.
+            "undo" | "redo" if self.active_image().is_some_and(|image| image.strip_focus) => {
+                self.film(if id == "undo" { Gallery::undo } else { Gallery::redo });
+            }
             "undo" | "redo" => {
-                let size = self.active_image().map(|image| (image.doc.picture.width, image.doc.picture.height));
+                let size = self.active_image().map(|image| (image.doc().picture.width, image.doc().picture.height));
                 self.change(if id == "undo" { Doc::undo } else { Doc::redo });
                 // A crop undone or redone: the box starts again from the
                 // whole picture.
-                let now = self.active_image().map(|image| (image.doc.picture.width, image.doc.picture.height));
+                let now = self.active_image().map(|image| (image.doc().picture.width, image.doc().picture.height));
                 if self.tools.tool == ToolKind::Crop && size != now {
                     self.start_crop();
+                }
+            }
+            // A press on the filmstrip: it has the keyboard.
+            "film_focus" => {
+                if let Some(image) = self.images.get_mut(self.active) {
+                    image.strip_focus = true;
+                }
+            }
+            // Choosing a picture shows it with the keyboard: Undo is its
+            // own, as the person who clicks a thumbnail and presses Undo
+            // expects. The +, a thumbnail's menu, and a drag leave the
+            // keyboard with the strip.
+            "film_select" => {
+                if let Some(index) = number("value") {
+                    self.film(|gallery| gallery.select(index.max(0.0) as usize));
+                }
+                self.picture_focus();
+            }
+            "film_reorder" => {
+                if let (Some(from), Some(to)) = (number("from"), number("to")) {
+                    self.film(|gallery| gallery.move_to(from.max(0.0) as usize, to.max(0.0) as usize));
+                }
+            }
+            "film_new" => {
+                self.film(|gallery| gallery.add(UNTITLED, new_doc(), None));
+            }
+            "film_open" => {
+                let Some(image) = self.active_image() else {
+                    return;
+                };
+                let purpose = Purpose::OpenPicture { tab: image.id.clone() };
+                self.ask_file(FileKind::Open, None, purpose, image_filter(false), out);
+                return;
+            }
+            "film_duplicate" => {
+                if let Some(index) = number("picture") {
+                    self.film(|gallery| gallery.duplicate(index.max(0.0) as usize));
+                }
+            }
+            "film_delete" => {
+                if let Some(index) = number("picture") {
+                    self.film(|gallery| gallery.remove(index.max(0.0) as usize));
+                }
+            }
+            // The thumbnail's Rename row: the name typed in place comes as
+            // `value`. A host that cannot take a name sends none; the person
+            // is told how a picture is renamed instead.
+            "film_rename" => {
+                let Some(index) = number("picture") else {
+                    return;
+                };
+                match arg.get("value").and_then(Value::as_str) {
+                    Some(name) => {
+                        let name = name.to_string();
+                        if let Some(Err(reason)) = self.film(|gallery| gallery.rename(index.max(0.0) as usize, &name)) {
+                            out.push(notice("The picture could not be renamed", &reason));
+                        }
+                    }
+                    None => {
+                        out.push(notice("Rename a picture", "Ask the assistant to rename this picture, and give it the new name."));
+                        return;
+                    }
                 }
             }
             "close_tab" => {
@@ -560,7 +726,7 @@ impl Session {
             "crop_ratio" => {
                 if let Some(index) = number("value") {
                     self.tools.ratio = (index.max(0.0) as usize).min(declare::RATIOS.len() - 1);
-                    if let Some(rect) = self.active_image().and_then(|image| image.crop) {
+                    if let Some(rect) = self.active_image().and_then(|image| image.frame().crop) {
                         self.set_crop(rect);
                     }
                 }
@@ -623,7 +789,7 @@ impl Session {
                 self.change(Doc::group_active);
             }
             "delete_layer" => {
-                let target = node.or_else(|| self.active_image().and_then(|image| image.doc.active));
+                let target = node.or_else(|| self.active_image().and_then(|image| image.doc().active));
                 if let Some(target) = target {
                     self.change(|doc| doc.delete(target, None));
                 }
@@ -650,14 +816,15 @@ impl Session {
         if tool == ToolKind::Crop {
             self.start_crop();
         } else if let Some(image) = self.images.get_mut(self.active) {
-            image.crop = None;
+            image.frame_mut().crop = None;
         }
     }
 
     /// The crop tool starts with the whole picture's box, ready to drag.
     fn start_crop(&mut self) {
         if let Some(image) = self.images.get_mut(self.active) {
-            image.crop = Some([0.0, 0.0, f64::from(image.doc.picture.width), f64::from(image.doc.picture.height)]);
+            let frame = image.frame_mut();
+            frame.crop = Some([0.0, 0.0, f64::from(frame.doc.picture.width), f64::from(frame.doc.picture.height)]);
         }
     }
 
@@ -667,6 +834,7 @@ impl Session {
         let Some(image) = self.images.get_mut(self.active) else {
             return;
         };
+        let image = image.frame_mut();
         if rect.iter().any(|value| !value.is_finite()) {
             return;
         }
@@ -701,34 +869,52 @@ impl Session {
     }
 
     fn apply_crop(&mut self) {
-        let Some(rect) = self.active_image().and_then(|image| image.crop) else {
+        let Some(rect) = self.active_image().and_then(|image| image.frame().crop) else {
             return;
         };
         self.change(|doc| doc.crop(rect));
         self.start_crop();
     }
 
+    /// The brush or eraser chosen, as the toolbar sets it.
+    fn brush(&self) -> Option<Brush> {
+        let tools = &self.tools;
+        let (settings, erase) = match tools.tool {
+            ToolKind::Brush => (tools.brush, false),
+            ToolKind::Eraser => (tools.eraser, true),
+            _ => return None,
+        };
+        Some(Brush {
+            rgb: tools.rgb,
+            size: f64::from(settings.size),
+            hardness: f64::from(settings.hardness) / 100.0,
+            opacity: f64::from(settings.opacity) / 100.0,
+            pressure: settings.pressure,
+            erase,
+        })
+    }
+
+    /// The picture with the stroke being drawn, once the points waiting
+    /// have all been painted: only the picture, as nothing else changed.
+    pub fn take_live(&mut self) -> Vec<AppMessage> {
+        if !std::mem::take(&mut self.live_due) {
+            return Vec::new();
+        }
+        self.raster_view(self.active).map(AppMessage::Raster).into_iter().collect()
+    }
+
     fn gesture(&mut self, gesture: RasterGesture) {
         let tools = self.tools.clone();
         match gesture {
             RasterGesture::Stroke { points } => {
-                let (settings, erase) = match tools.tool {
-                    ToolKind::Brush => (tools.brush, false),
-                    ToolKind::Eraser => (tools.eraser, true),
-                    _ => return,
+                let Some(brush) = self.brush() else {
+                    return;
                 };
-                let brush = Brush {
-                    rgb: tools.rgb,
-                    size: f64::from(settings.size),
-                    hardness: f64::from(settings.hardness) / 100.0,
-                    opacity: f64::from(settings.opacity) / 100.0,
-                    pressure: settings.pressure,
-                    erase,
-                };
-                // A stroke on a locked or hidden layer changes nothing; the
-                // host's preview goes when the picture comes back.
+                // A stroke on a locked or hidden layer changes nothing.
                 self.change(|doc| doc.stroke(&points, &brush));
             }
+            // Taken off already, as every message but a stroke's does.
+            RasterGesture::StrokeCancel | RasterGesture::StrokePart { .. } => {}
             RasterGesture::Rect { from, to } => {
                 self.change(|doc| {
                     let shape = Mask::rect(doc.picture.width, doc.picture.height, from, to);
@@ -749,7 +935,7 @@ impl Session {
                 }
             }
             RasterGesture::Pick { at } => {
-                if let Some(rgba) = self.images.get_mut(self.active).and_then(|image| image.doc.pick(at)) {
+                if let Some(rgba) = self.images.get_mut(self.active).and_then(|image| image.doc_mut().pick(at)) {
                     self.tools.rgb = [rgba[0], rgba[1], rgba[2]];
                 }
             }
@@ -827,12 +1013,26 @@ impl Session {
                 }
                 Err(reason) => out.push(notice("This picture could not be opened", &reason)),
             },
+            Purpose::OpenPicture { tab } => match files::import(&path) {
+                Ok(pixels) => {
+                    let Some(index) = self.image_index(&tab) else {
+                        return;
+                    };
+                    self.active = index;
+                    let title = file_title(&path);
+                    let doc = Doc::new(Picture::from_pixels(&title, pixels));
+                    self.film(|gallery| gallery.add(&title, doc, None));
+                    out.extend(self.emit());
+                }
+                Err(reason) => out.push(notice("This picture could not be opened", &reason)),
+            },
             Purpose::Export { jpeg } => {
                 let Some(image) = self.images.get_mut(self.active) else {
                     return;
                 };
-                let (width, height) = (image.doc.picture.width, image.doc.picture.height);
-                let pixels = image.doc.composite();
+                let doc = image.doc_mut();
+                let (width, height) = (doc.picture.width, doc.picture.height);
+                let pixels = doc.composite();
                 let encoded = if jpeg {
                     files::encode_jpeg(width, height, pixels)
                 } else {
@@ -854,7 +1054,7 @@ impl Session {
     /// as a new image of one layer. No path makes a new image.
     fn open_path(&mut self, path: Option<PathBuf>, out: &mut Vec<AppMessage>) {
         let Some(path) = path else {
-            self.push_image(Doc::new(Picture::blank(NEW_SIZE[0], NEW_SIZE[1])), None, None);
+            self.push_image(new_gallery(), None, None);
             self.declare_new(out);
             return;
         };
@@ -866,11 +1066,18 @@ impl Session {
         if files::is_ipx(&path) {
             match files::read_ipx(&path) {
                 Ok(read) => {
-                    let mut doc = Doc::new(read.picture);
-                    if read.active.is_some() {
-                        doc.active = read.active;
-                    }
-                    self.push_image(doc, Some(path), None);
+                    let pictures = read
+                        .pictures
+                        .into_iter()
+                        .map(|read| {
+                            let mut doc = Doc::new(read.picture);
+                            if read.active.is_some() {
+                                doc.active = read.active;
+                            }
+                            (read.name, doc)
+                        })
+                        .collect();
+                    self.push_image(Gallery::new(pictures, read.shown), Some(path), None);
                     self.declare_new(out);
                 }
                 Err(reason) => out.push(notice("This image could not be opened", &reason)),
@@ -880,7 +1087,8 @@ impl Session {
         match files::import(&path) {
             Ok(pixels) => {
                 let title = file_title(&path);
-                let index = self.push_image(Doc::new(Picture::from_pixels(&title, pixels)), None, Some(title));
+                let gallery = Gallery::one(&title, Doc::new(Picture::from_pixels(&title, pixels)));
+                let index = self.push_image(gallery, None, Some(title));
                 // It is new work, so it is kept in the project as an image.
                 self.images[index].dirty = true;
                 self.declare_new(out);
@@ -931,8 +1139,7 @@ impl Session {
                 None => return Err("No free file name.".into()),
             },
         };
-        image.doc.finish_edit();
-        match files::write_ipx(&path, &image.doc.picture, image.doc.active, &mut image.pngs) {
+        match write_gallery(&path, &mut image.gallery) {
             Ok(()) => {
                 image.label = file_title(&path);
                 image.path = Some(path.clone());
@@ -953,8 +1160,7 @@ impl Session {
         let Some(image) = self.images.get_mut(index) else {
             return;
         };
-        image.doc.finish_edit();
-        if let Err(reason) = files::write_ipx(path, &image.doc.picture, image.doc.active, &mut image.pngs) {
+        if let Err(reason) = write_gallery(path, &mut image.gallery) {
             out.push(notice("This image could not be saved", &reason));
             if then_quit || self.quitting {
                 self.cancel_quit(out);
@@ -998,12 +1204,16 @@ impl Session {
     /// any new tab is.
     fn remove_image(&mut self, index: usize, out: &mut Vec<AppMessage>) {
         let image = self.images.remove(index);
-        let _ = std::fs::remove_file(self.cache.join(format!("{}.rgba", image.id)));
-        for layer in image.thumbs.keys() {
-            let _ = std::fs::remove_file(self.cache.join(format!("{}-{layer}.rgba", image.id)));
+        // Its picture, and every thumbnail of its pictures and their layers.
+        let own = format!("{}-", image.id);
+        for entry in std::fs::read_dir(&self.cache).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&own) {
+                let _ = std::fs::remove_file(entry.path());
+            }
         }
         if self.images.is_empty() {
-            self.push_image(Doc::new(Picture::blank(NEW_SIZE[0], NEW_SIZE[1])), None, None);
+            self.push_image(new_gallery(), None, None);
             self.declare_new(out);
             return;
         }
@@ -1080,6 +1290,7 @@ impl Session {
 
     /// The active image's picture and every declaration.
     pub fn emit(&mut self) -> Vec<AppMessage> {
+        self.live_due = false;
         let mut out = self.raster_only();
         out.extend(self.declared());
         out
@@ -1091,59 +1302,86 @@ impl Session {
         if index >= self.images.len() {
             return Vec::new();
         }
+        self.write_film(index);
         let view = self.raster_view(index);
         self.write_thumbnails(index);
         view.map(AppMessage::Raster).into_iter().collect()
     }
 
     fn raster_view(&mut self, index: usize) -> Option<RasterView> {
-        let seed = self.seed;
         let tool = self.raster_tool();
         let move_tool = self.tools.tool == ToolKind::Move;
         let crop_tool = self.tools.tool == ToolKind::Crop;
         let cache = self.cache.clone();
         let viewport = self.viewport;
+        let mut next = self.next_revision;
         let image = self.images.get_mut(index)?;
-        image.doc.refresh();
-        let picture = cache.join(format!("{}.rgba", image.id));
-        if image.written != Some(image.doc.revision) {
-            let (width, height) = (image.doc.picture.width, image.doc.picture.height);
-            let _ = files::write_atomic(&picture, image.doc.composite());
-            debug_assert_eq!(image.doc.composite().len(), width as usize * height as usize * 4);
-            image.written = Some(image.doc.revision);
-        }
-        let camera = if std::mem::take(&mut image.send_camera) {
-            let camera = fit(image.doc.picture.width, image.doc.picture.height, viewport);
-            image.camera = Some(camera.clone());
+        let film = declare::film(image);
+        let send_camera = std::mem::take(&mut image.send_camera);
+        let image_id = image.id.clone();
+        let frame = image.frame_mut();
+        // Each picture has its own file, written again only when it
+        // changed, so the host keeps every picture it has shown and a
+        // picture shown again needs no reading. A change says which part
+        // of the picture it touched, so the host reads only that.
+        let picture = cache.join(format!("{image_id}-{}.rgba", frame.uid));
+        frame.doc.refresh();
+        let changed = frame.doc.take_changed();
+        let mut patch = None;
+        let revision = match frame.written {
+            Some((made, told)) if made == frame.doc.revision => told,
+            earlier => {
+                let _ = files::write_atomic(&picture, frame.doc.composite());
+                next += 1;
+                if let (Some((_, since)), Some(rect)) = (earlier, changed) {
+                    let rect = [rect.x.max(0) as u32, rect.y.max(0) as u32, rect.w.max(0) as u32, rect.h.max(0) as u32];
+                    patch = Some(protocol::RasterPatch { since, rect });
+                }
+                frame.written = Some((frame.doc.revision, next));
+                next
+            }
+        };
+        self.next_revision = next;
+        let (width, height) = (frame.doc.picture.width, frame.doc.picture.height);
+        // A new picture is fitted; one shown again goes back where the host
+        // last had it.
+        let camera = if send_camera {
+            let camera = match (&frame.camera, frame.host_camera) {
+                (Some(camera), true) => camera.clone(),
+                _ => fit(width, height, viewport),
+            };
+            frame.camera = Some(camera.clone());
             Some(camera)
         } else {
             None
         };
         if crop_tool {
-            // A tab chosen, or a crop undone, since the box was set: the box
-            // starts again from the whole picture.
-            let (width, height) = (f64::from(image.doc.picture.width), f64::from(image.doc.picture.height));
-            let fits = image.crop.is_some_and(|rect| rect[0] + rect[2] <= width && rect[1] + rect[3] <= height);
+            // A tab or picture chosen, or a crop undone, since the box was
+            // set: the box starts again from the whole picture.
+            let (width, height) = (f64::from(width), f64::from(height));
+            let fits = frame.crop.is_some_and(|rect| rect[0] + rect[2] <= width && rect[1] + rect[3] <= height);
             if !fits {
-                image.crop = Some([0.0, 0.0, width, height]);
+                frame.crop = Some([0.0, 0.0, width, height]);
             }
         }
         let bounds = if move_tool {
-            image.doc.active.and_then(|active| image.doc.picture.node_rect(active))
+            frame.doc.active.and_then(|active| frame.doc.picture.node_rect(active))
         } else {
             None
         };
         Some(RasterView {
-            tab: image.id.clone(),
-            width: image.doc.picture.width,
-            height: image.doc.picture.height,
+            tab: image_id,
+            width,
+            height,
             picture: picture.display().to_string(),
-            revision: seed + image.doc.revision,
+            revision,
+            patch,
             tool,
-            selection: image.doc.outlines(),
-            crop: if crop_tool { image.crop } else { None },
+            selection: frame.doc.outlines(),
+            crop: if crop_tool { frame.crop } else { None },
             bounds: bounds.map(|rect| [f64::from(rect.x), f64::from(rect.y), f64::from(rect.w), f64::from(rect.h)]),
             camera,
+            film: Some(film),
         })
     }
 
@@ -1177,31 +1415,68 @@ impl Session {
     /// changed.
     fn write_thumbnails(&mut self, index: usize) {
         let cache = self.cache.clone();
-        let mut next = self.next_thumb;
+        let mut next = self.next_revision;
         let Some(image) = self.images.get_mut(index) else {
             return;
         };
-        let picture = &image.doc.picture;
+        let tab = image.id.clone();
+        let frame = image.frame_mut();
+        let picture = &frame.doc.picture;
         let (width, height) = thumb_size(picture.width, picture.height);
         let layers = picture.all_layers();
-        image.thumbs.retain(|id, _| layers.contains(id));
+        frame.thumbs.retain(|id, _| layers.contains(id));
         for id in layers {
             let (Some(node), Some(pixels)) = (picture.find(id), picture.pixels.get(&id)) else {
                 continue;
             };
             let bytes = thumbnail(picture.width, picture.height, node.offset, pixels, width, height);
-            if image.thumbs.get(&id).is_some_and(|(kept, _)| *kept == bytes) {
+            if frame.thumbs.get(&id).is_some_and(|(kept, _)| *kept == bytes) {
                 continue;
             }
-            let path = cache.join(format!("{}-{id}.rgba", image.id));
+            // Layer ids repeat between pictures, so the picture is named too.
+            let path = cache.join(format!("{tab}-{}-{id}.rgba", frame.uid));
             if files::write_atomic(&path, &bytes).is_err() {
                 continue;
             }
             next += 1;
             let thumb = Thumbnail { path: path.display().to_string(), width, height, revision: next };
-            image.thumbs.insert(id, (bytes, thumb));
+            frame.thumbs.insert(id, (bytes, thumb));
         }
-        self.next_thumb = next;
+        self.next_revision = next;
+    }
+
+    /// Each picture's filmstrip thumbnail, its composite drawn small,
+    /// written when that picture changed.
+    fn write_film(&mut self, index: usize) {
+        let cache = self.cache.clone();
+        let mut next = self.next_revision;
+        let Some(image) = self.images.get_mut(index) else {
+            return;
+        };
+        for frame in &mut image.gallery.frames {
+            frame.doc.refresh();
+            let revision = frame.doc.revision;
+            if frame.film.as_ref().is_some_and(|(made, _, _)| *made == revision) {
+                continue;
+            }
+            let (width, height) = (frame.doc.picture.width, frame.doc.picture.height);
+            let (to_w, to_h) = film_size(width, height);
+            let bytes = files::resample(width, height, frame.doc.composite(), to_w, to_h);
+            if let Some((made, kept, _)) = &mut frame.film
+                && *kept == bytes
+            {
+                *made = revision;
+                continue;
+            }
+            let path = cache.join(format!("{}-film-{}.rgba", image.id, frame.uid));
+            // A thumbnail that could not be written is tried again with the
+            // next change; the strip keeps its place meanwhile.
+            let written = files::write_atomic(&path, &bytes).is_ok();
+            next += 1;
+            let thumb = Thumbnail { path: path.display().to_string(), width: to_w, height: to_h, revision: next };
+            frame.film = Some(if written { (revision, bytes, thumb) } else { (u64::MAX, Vec::new(), thumb) });
+        }
+        self.next_revision = next;
     }
 
     /// The toolbar, menu, keys, panel, and tab list.
@@ -1226,14 +1501,20 @@ impl Session {
             return vec![crate::assist::result(call, Err(format!("There is no image in tab {tab}.")))];
         };
         let name = protocol::split_tool_key(tool).map_or(tool, |(_, _, name)| name);
+        let in_project = self.project.is_some();
         let image = &mut self.images[index];
-        let before = image.doc.edits;
-        let (outcome, look) = crate::assist::run(&mut image.doc, name, &input, group);
-        if image.doc.edits != before {
+        let (edits, shown, doc_edits) = (image.gallery.edits, image.frame().uid, image.doc().edits);
+        let (outcome, look) = crate::assist::run(&mut image.gallery, name, &input, group);
+        let shown_changed = image.frame().uid != shown;
+        let changed = image.gallery.edits != edits || (!shown_changed && image.doc().edits != doc_edits);
+        if changed || (in_project && shown_changed) {
             image.dirty = true;
         }
+        if shown_changed {
+            image.send_camera = true;
+        }
         let mut out = Vec::new();
-        if image.doc.edits != before {
+        if changed || shown_changed {
             // The tab the call changed shows its picture, whichever tab is
             // selected; the declarations stay the selected tab's.
             let active = self.active;
@@ -1279,9 +1560,58 @@ pub fn fit(width: u32, height: u32, viewport: [f64; 2]) -> DocumentCamera {
 
 /// A thumbnail's size: the picture's shape fitted into 56 × 40.
 pub fn thumb_size(width: u32, height: u32) -> (u32, u32) {
+    fit_into(width, height, THUMB_SIZE)
+}
+
+/// A filmstrip thumbnail's size: 44 tall at the picture's shape, unless it
+/// is more than four times as wide as tall.
+pub fn film_size(width: u32, height: u32) -> (u32, u32) {
+    fit_into(width, height, FILM_SIZE)
+}
+
+fn fit_into(width: u32, height: u32, most: [u32; 2]) -> (u32, u32) {
     let (w, h) = (f64::from(width.max(1)), f64::from(height.max(1)));
-    let scale = (f64::from(THUMB_SIZE[0]) / w).min(f64::from(THUMB_SIZE[1]) / h);
+    let scale = (f64::from(most[0]) / w).min(f64::from(most[1]) / h);
     (((w * scale).round() as u32).max(1), ((h * scale).round() as u32).max(1))
+}
+
+/// A new picture: white, 1920 × 1080.
+pub fn new_doc() -> Doc {
+    Doc::new(Picture::blank(NEW_SIZE[0], NEW_SIZE[1]))
+}
+
+/// A new tab's gallery: one new picture.
+fn new_gallery() -> Gallery {
+    Gallery::one(UNTITLED, new_doc())
+}
+
+/// Writes a tab's gallery to its file, each held slider finished first.
+fn write_gallery(path: &Path, gallery: &mut Gallery) -> Result<(), String> {
+    let shown = gallery.shown;
+    let mut pictures = Vec::new();
+    for frame in &mut gallery.frames {
+        frame.doc.finish_edit();
+        pictures.push(files::Writing {
+            name: &frame.name,
+            picture: &frame.doc.picture,
+            active: frame.doc.active,
+            cache: &mut frame.pngs,
+        });
+    }
+    files::write_ipx(path, pictures, shown)
+}
+
+/// The commands that leave the keyboard with the filmstrip once it has it:
+/// its own, Undo and Redo, and those about the tab rather than its picture.
+/// Every other command, as every gesture and panel edit, is the picture's.
+fn keeps_focus(id: &str) -> bool {
+    id.starts_with("film_")
+        || id.starts_with("canvas.")
+        || matches!(
+            id,
+            "undo" | "redo" | "select_tab" | "close_tab" | "new_image" | "open" | "save" | "save_as" | "export_png"
+                | "export_jpeg" | "toggle_panel"
+        )
 }
 
 /// One layer drawn small in the picture's frame, clear where it does not
@@ -1378,7 +1708,7 @@ pub fn file_title(path: &Path) -> String {
 
 /// `name`, then the names after it: "Untitled Asset" gives "Untitled Asset",
 /// "Untitled Asset 2", and on; "Beach 3" gives "Beach 3", "Beach 4".
-fn free_names(name: &str) -> impl Iterator<Item = String> {
+pub fn free_names(name: &str) -> impl Iterator<Item = String> {
     let (stem, first) = match name.rsplit_once(' ') {
         Some((stem, number)) if !stem.is_empty() => match number.parse::<u32>() {
             Ok(number) => (stem.to_string(), Some(number)),
@@ -1435,8 +1765,8 @@ mod tests {
 
     fn at(session: &mut Session, x: usize, y: usize) -> [u8; 4] {
         let image = &mut session.images[session.active];
-        let width = image.doc.picture.width as usize;
-        let composite = image.doc.composite();
+        let width = image.doc().picture.width as usize;
+        let composite = image.doc_mut().composite();
         let at = (y * width + x) * 4;
         [composite[at], composite[at + 1], composite[at + 2], composite[at + 3]]
     }
@@ -1466,7 +1796,7 @@ mod tests {
         assert_eq!(at(&mut session, 200, 200), [200, 30, 40, 255]);
         assert_eq!(at(&mut session, 60, 200), [255, 255, 255, 255], "painted outside the lasso");
         command(&mut session, "deselect", json!({}));
-        assert!(session.images[0].doc.selection.is_none());
+        assert!(session.images[0].doc().selection.is_none());
 
         command(&mut session, "tool", json!({ "tool": "eraser" }));
         stroke(&mut session, [500.0, 500.0], [520.0, 500.0]);
@@ -1502,28 +1832,28 @@ mod tests {
     fn the_layers_page_works_through_the_protocol() {
         let mut session = Session::launch();
         let _ = session.greeting();
-        let background = session.images[0].doc.active.unwrap();
+        let background = session.images[0].doc().active.unwrap();
         let property = |session: &mut Session, prop: &str, value: PropValue, preview: bool| {
             session.handle(HostMessage::Property { prop: json!(prop), value: serde_json::to_value(value).unwrap(), preview })
         };
         property(&mut session, "blend", PropValue::Index(1), false);
-        assert_eq!(session.images[0].doc.picture.nodes[0].blend, Blend::Multiply);
+        assert_eq!(session.images[0].doc().picture.nodes[0].blend, Blend::Multiply);
         for value in [0.8, 0.6, 0.4] {
             property(&mut session, "opacity", PropValue::Number(value), true);
         }
         command(&mut session, "finish_edit", json!({}));
-        assert_eq!(session.images[0].doc.picture.nodes[0].opacity, 0.4);
+        assert_eq!(session.images[0].doc().picture.nodes[0].opacity, 0.4);
         command(&mut session, "undo", json!({}));
-        assert_eq!(session.images[0].doc.picture.nodes[0].opacity, 1.0, "the held slider was more than one step");
-        assert_eq!(session.images[0].doc.picture.nodes[0].blend, Blend::Multiply);
+        assert_eq!(session.images[0].doc().picture.nodes[0].opacity, 1.0, "the held slider was more than one step");
+        assert_eq!(session.images[0].doc().picture.nodes[0].blend, Blend::Multiply);
         property(&mut session, "locks", PropValue::Index(1), false);
-        assert!(session.images[0].doc.picture.nodes[0].locks.pixels);
+        assert!(session.images[0].doc().picture.nodes[0].locks.pixels);
         command(&mut session, "tool", json!({ "tool": "brush" }));
         stroke(&mut session, [10.0, 10.0], [40.0, 10.0]);
         assert_eq!(at(&mut session, 20, 10), [255, 255, 255, 255], "a pixel-locked layer took paint");
 
         command(&mut session, "add_layer", json!({}));
-        let added = session.images[0].doc.active.unwrap();
+        let added = session.images[0].doc().active.unwrap();
         command(&mut session, "layer_rename", json!({ "node": added, "value": "Ink" }));
         command(&mut session, "layer_visible", json!({ "node": added }));
         command(&mut session, "reorder", json!({ "node": added, "value": 1 }));
@@ -1548,10 +1878,10 @@ mod tests {
         );
         assert!(rows[0].thumbnail.is_some() && rows[2].thumbnail.is_some());
         command(&mut session, "delete_layer", json!({}));
-        assert!(session.images[0].doc.picture.find(added).is_none());
-        assert!(session.images[0].doc.picture.find(background).is_some());
+        assert!(session.images[0].doc().picture.find(added).is_none());
+        assert!(session.images[0].doc().picture.find(background).is_some());
         command(&mut session, "undo", json!({}));
-        assert!(session.images[0].doc.picture.find(added).is_some());
+        assert!(session.images[0].doc().picture.find(added).is_some());
     }
 
     /// Catches the assistant's call answered without its picture or before
@@ -1600,7 +1930,7 @@ mod tests {
         let replies = session.handle(HostMessage::Keep { tab: "1".into() });
         let expected = folder.join("Untitled Asset.ipx").display().to_string();
         assert!(replies.iter().any(|reply| matches!(reply, AppMessage::Kept { path: Some(path), error: None, .. } if *path == expected)));
-        assert_eq!(files::read_ipx(Path::new(&expected)).unwrap().picture.nodes.len(), 2);
+        assert_eq!(files::read_ipx(Path::new(&expected)).unwrap().pictures[0].picture.nodes.len(), 2);
 
         let outside = std::env::temp_dir().join(format!("image-editor-outside-{}.ipx", std::process::id()));
         std::fs::copy(&expected, &outside).unwrap();
@@ -1647,7 +1977,7 @@ mod tests {
         let _ = session.greeting();
         let messages = command(&mut session, "tool", json!({ "tool": "brush" }));
         assert!(strong_labels(&options(&messages)).is_empty(), "a reason shown for a layer that takes paint");
-        let background = session.images[0].doc.active.unwrap();
+        let background = session.images[0].doc().active.unwrap();
         let messages = command(&mut session, "layer_lock", json!({ "node": background }));
         let row = options(&messages);
         assert_eq!(strong_labels(&row), ["Background is locked."]);
@@ -1657,7 +1987,7 @@ mod tests {
         let messages = command(&mut session, "tool", json!({ "tool": "move" }));
         assert_eq!(strong_labels(&options(&messages)), ["Background is locked."]);
         command(&mut session, "add_group", json!({}));
-        let group = session.images[0].doc.picture.nodes[0].id;
+        let group = session.images[0].doc().picture.nodes[0].id;
         let messages = command(&mut session, "layer_click", json!({ "node": group }));
         assert_eq!(strong_labels(&options(&messages)), ["Background is locked."], "moving a group with a locked layer gave no reason");
         let messages = command(&mut session, "tool", json!({ "tool": "eraser" }));
@@ -1670,18 +2000,18 @@ mod tests {
     fn a_reorder_with_a_parent_moves_a_layer_into_and_out_of_a_group() {
         let mut session = Session::launch();
         let _ = session.greeting();
-        let background = session.images[0].doc.active.unwrap();
+        let background = session.images[0].doc().active.unwrap();
         command(&mut session, "add_layer", json!({}));
-        let top = session.images[0].doc.active.unwrap();
+        let top = session.images[0].doc().active.unwrap();
         command(&mut session, "add_group", json!({}));
-        let group = session.images[0].doc.picture.place(top).unwrap().parent.unwrap();
+        let group = session.images[0].doc().picture.place(top).unwrap().parent.unwrap();
         command(&mut session, "reorder", json!({ "node": background, "value": 0, "parent": group }));
-        assert_eq!(session.images[0].doc.picture.place(background).unwrap().parent, Some(group));
+        assert_eq!(session.images[0].doc().picture.place(background).unwrap().parent, Some(group));
         command(&mut session, "reorder", json!({ "node": background, "value": 1, "parent": null }));
-        let place = session.images[0].doc.picture.place(background).unwrap();
+        let place = session.images[0].doc().picture.place(background).unwrap();
         assert_eq!((place.parent, place.index), (None, 0), "the layer did not come out under the group");
         command(&mut session, "reorder", json!({ "node": background, "value": 0 }));
-        let place = session.images[0].doc.picture.place(background).unwrap();
+        let place = session.images[0].doc().picture.place(background).unwrap();
         assert_eq!((place.parent, place.index), (None, 1), "a reorder without a parent left the siblings");
     }
 
@@ -1704,5 +2034,299 @@ mod tests {
         // The right edge: the width leads, as before.
         let view = last_raster(&gesture(&mut session, RasterGesture::Crop { rect: [100.0, 0.0, 500.0, 650.0] }));
         assert_eq!(view.crop, Some([100.0, 0.0, 500.0, 500.0]));
+    }
+
+    /// The action a declared control carries, sent as the host sends it.
+    fn run(session: &mut Session, action: &protocol::Action) -> Vec<AppMessage> {
+        command(session, &action.id, action.arg.clone().unwrap_or(Value::Null))
+    }
+
+    fn film_of(messages: &[AppMessage]) -> protocol::Film {
+        last_raster(messages).film.expect("the raster view has no filmstrip")
+    }
+
+    fn layer_count(messages: &[AppMessage]) -> usize {
+        messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                AppMessage::Properties(properties) => properties.layers.as_ref().map(|layers| layers.rows.len()),
+                _ => None,
+            })
+            .expect("no Layers page was sent")
+    }
+
+    fn undo_enabled(messages: &[AppMessage]) -> bool {
+        messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                AppMessage::Menu { rows } => rows.iter().find(|row| row.label == "Undo").map(|row| row.enabled),
+                _ => None,
+            })
+            .expect("no menu was sent")
+    }
+
+    /// A click on a thumbnail, as the host sends it: `focus`, then `select`.
+    fn click(session: &mut Session, film: &protocol::Film, index: usize) -> Vec<AppMessage> {
+        run(session, &film.focus);
+        run(session, &film.select.with_value(json!(index)))
+    }
+
+    /// Catches a filmstrip that drifts from the views or the pictures: every
+    /// picture as an item with its name, the shown one, a thumbnail file of
+    /// width × height × 4 bytes made from that picture's own composite, the
+    /// menu's three rows with Delete off for the last picture, and the +
+    /// tile's two rows.
+    #[test]
+    fn the_raster_view_carries_the_filmstrip() {
+        let mut session = Session::launch();
+        let film = film_of(&session.greeting());
+        assert_eq!(film.items.len(), 1);
+        assert_eq!(film.items[0].name, "Untitled Asset");
+        let menu: Vec<(&str, bool)> = film.items[0].menu.iter().map(|row| (row.label.as_str(), row.enabled)).collect();
+        assert_eq!(menu, [("Duplicate", true), ("Rename", true), ("Delete", false)], "the last picture can be deleted");
+        assert!(film.items[0].menu[1].rename, "Rename does not rename in place");
+        let add: Vec<&str> = film.add.iter().map(|row| row.label.as_str()).collect();
+        assert_eq!(add, ["New picture", "Open PNG or JPEG…"]);
+
+        // Paint the first picture red, then add two more.
+        command(&mut session, "set_color", json!({ "value": [220, 0, 0] }));
+        command(&mut session, "tool", json!({ "tool": "brush" }));
+        command(&mut session, "set_brush", json!({ "tool": "brush", "setting": "size", "value": 1000 }));
+        for y in (0..1080).step_by(200) {
+            stroke(&mut session, [0.0, f64::from(y)], [1920.0, f64::from(y)]);
+        }
+        run(&mut session, &film.add[0].action.clone().unwrap());
+        let film = film_of(&run(&mut session, &film.add[0].action.clone().unwrap()));
+        let names: Vec<&str> = film.items.iter().map(|item| item.name.as_str()).collect();
+        assert_eq!(names, ["Untitled Asset", "Untitled Asset 2", "Untitled Asset 3"]);
+        assert_eq!(film.shown, 2, "the added picture is not shown");
+        assert!(film.items.iter().all(|item| item.menu[2].enabled), "Delete is off with three pictures");
+        let mut paths = std::collections::HashSet::new();
+        for item in &film.items {
+            let thumb = &item.thumbnail;
+            assert_eq!((thumb.width, thumb.height), (78, 44));
+            let bytes = std::fs::read(&thumb.path).expect("a thumbnail that is not there");
+            assert_eq!(bytes.len(), 78 * 44 * 4);
+            assert!(paths.insert(thumb.path.clone()), "two pictures share a thumbnail");
+        }
+        let red = std::fs::read(&film.items[0].thumbnail.path).unwrap();
+        assert_eq!(&red[..4], [220, 0, 0, 255], "the first thumbnail is not its picture");
+        let white = std::fs::read(&film.items[1].thumbnail.path).unwrap();
+        assert!(white.chunks(4).all(|pixel| pixel == [255, 255, 255, 255]));
+    }
+
+    /// Catches a thumbnail click that changes nothing, or changes the
+    /// picture without its layers: the shown picture's file, size, and
+    /// Layers page follow the click.
+    #[test]
+    fn a_click_on_a_thumbnail_shows_that_picture_and_its_layers() {
+        let mut session = Session::launch();
+        let film = film_of(&session.greeting());
+        command(&mut session, "add_layer", json!({}));
+        command(&mut session, "add_layer", json!({}));
+        let messages = run(&mut session, &film.add[0].action.clone().unwrap());
+        assert_eq!(layer_count(&messages), 1);
+        let second = last_raster(&messages);
+        let messages = click(&mut session, &film_of(&messages), 0);
+        let first = last_raster(&messages);
+        assert_eq!(first.film.as_ref().unwrap().shown, 0);
+        assert_eq!(layer_count(&messages), 3, "the Layers page is still the other picture's");
+        assert_ne!(first.picture, second.picture, "two pictures share one file, so the host reads each again");
+        assert!(first.camera.is_some(), "the picture shown came without its camera");
+        // A picture shown again is the file and revision the host already
+        // holds, so switching reads nothing.
+        let messages = click(&mut session, &film_of(&messages), 1);
+        assert_eq!(layer_count(&messages), 1);
+        let again = last_raster(&messages);
+        assert_eq!((again.picture.as_str(), again.revision), (second.picture.as_str(), second.revision), "a picture shown again was sent again");
+        assert_eq!(session.images[0].gallery.shown, 1);
+    }
+
+    /// Catches one picture's Undo reaching another: each picture keeps its
+    /// own history, and Undo with the picture's keyboard acts only on the
+    /// picture shown.
+    #[test]
+    fn each_picture_undoes_on_its_own() {
+        let mut session = Session::launch();
+        let film = film_of(&session.greeting());
+        command(&mut session, "tool", json!({ "tool": "brush" }));
+        stroke(&mut session, [10.0, 10.0], [100.0, 10.0]);
+        let messages = run(&mut session, &film.add[0].action.clone().unwrap());
+        assert!(!undo_enabled(&messages), "a new picture offers another's undo");
+        stroke(&mut session, [10.0, 10.0], [100.0, 10.0]);
+        stroke(&mut session, [10.0, 50.0], [100.0, 50.0]);
+        // A click on a thumbnail, as the host sends it (a press, then the
+        // choice), gives Undo to the picture it shows, never the strip.
+        let film = film_of(&messages);
+        click(&mut session, &film, 0);
+        let messages = command(&mut session, "undo", json!({}));
+        assert_eq!(session.images[0].gallery.frames.len(), 2, "Undo after a thumbnail click undid the strip");
+        assert_eq!(at(&mut session, 50, 10), [255, 255, 255, 255], "the first picture's stroke was not undone");
+        assert!(!undo_enabled(&messages));
+        click(&mut session, &film, 1);
+        command(&mut session, "undo", json!({}));
+        assert_eq!(session.images[0].gallery.frames.len(), 2, "Undo after a thumbnail click undid the strip");
+        assert_eq!(at(&mut session, 50, 50), [255, 255, 255, 255], "the second picture's last stroke was not undone");
+        click(&mut session, &film, 0);
+        let second = &mut session.images[0].gallery.frames[1].doc;
+        let painted = |doc: &mut Doc, y: usize| doc.composite()[(y * 1920 + 50) * 4];
+        assert_eq!(painted(second, 10), 0, "an undo on the first picture reached the second");
+        assert_eq!(painted(second, 50), 255);
+        assert_eq!(session.images[0].gallery.frames.len(), 2, "an undo on the picture undid the strip");
+    }
+
+    /// Catches the strip's Undo missing a change, acting with the picture's
+    /// keyboard, or keeping the keyboard after the picture is used: after a
+    /// press on the strip, Undo reverses add, duplicate, delete, rename, and
+    /// reorder, and the picture shown follows; a gesture gives Undo back to
+    /// the picture.
+    #[test]
+    fn the_strips_undo_reverses_its_changes() {
+        let mut session = Session::launch();
+        let film = film_of(&session.greeting());
+        let names = |session: &Session| -> Vec<String> {
+            session.images[0].gallery.frames.iter().map(|frame| frame.name.clone()).collect()
+        };
+        run(&mut session, &film.focus);
+        let messages = run(&mut session, &film.add[0].action.clone().unwrap());
+        let film = film_of(&messages);
+        run(&mut session, &film.focus);
+        let film = film_of(&run(&mut session, &film.items[1].menu[0].action.clone().unwrap()));
+        let rename = film.items[0].menu[1].action.clone().unwrap().with_value(json!("Beach"));
+        let film = film_of(&run(&mut session, &rename));
+        // A drag of the first thumbnail to the end, as the host sends it.
+        let film = film_of(&command(&mut session, &film.reorder.id, json!({ "from": 0, "to": 2 })));
+        assert_eq!(names(&session), ["Untitled Asset 2", "Untitled Asset 2 copy", "Beach"]);
+        let messages = run(&mut session, &film.items[1].menu[2].action.clone().unwrap());
+        assert_eq!(names(&session), ["Untitled Asset 2", "Beach"]);
+        assert!(undo_enabled(&messages));
+        assert!(session.images[0].dirty);
+
+        // The strip's Undo, step by step, with the shown picture following.
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            command(&mut session, "undo", json!({}));
+            let gallery = &session.images[0].gallery;
+            seen.push((names(&session).join(", "), gallery.frame().name.clone()));
+        }
+        let want = [
+            ("Untitled Asset 2, Untitled Asset 2 copy, Beach", "Untitled Asset 2 copy"),
+            ("Beach, Untitled Asset 2, Untitled Asset 2 copy", "Beach"),
+            ("Untitled Asset, Untitled Asset 2, Untitled Asset 2 copy", "Untitled Asset"),
+            ("Untitled Asset, Untitled Asset 2", "Untitled Asset 2"),
+            ("Untitled Asset", "Untitled Asset"),
+        ];
+        let want: Vec<(String, String)> = want.iter().map(|(all, shown)| (all.to_string(), shown.to_string())).collect();
+        assert_eq!(seen, want);
+        let messages = command(&mut session, "undo", json!({}));
+        assert!(!undo_enabled(&messages), "the strip's Undo offers the picture's history");
+        command(&mut session, "redo", json!({}));
+        assert_eq!(session.images[0].gallery.frames.len(), 2);
+
+        // A stroke gives the keyboard back: Undo takes the stroke, not the
+        // strip's step. The brush is already chosen, so only the stroke
+        // reaches the picture.
+        assert_eq!(session.tools.tool, ToolKind::Brush);
+        stroke(&mut session, [10.0, 10.0], [100.0, 10.0]);
+        command(&mut session, "undo", json!({}));
+        assert_eq!(session.images[0].gallery.frames.len(), 2, "Undo after a stroke undid the strip");
+        assert_eq!(at(&mut session, 50, 10), [255, 255, 255, 255]);
+        // So do a Layers page command and a panel edit.
+        command(&mut session, "film_focus", json!({}));
+        command(&mut session, "add_layer", json!({}));
+        command(&mut session, "undo", json!({}));
+        assert_eq!(session.images[0].gallery.frames.len(), 2, "Undo after a layer command undid the strip");
+        assert_eq!(session.images[0].doc().picture.nodes.len(), 1);
+        command(&mut session, "film_focus", json!({}));
+        session.handle(HostMessage::Property { prop: json!("opacity"), value: serde_json::to_value(PropValue::Number(0.5)).unwrap(), preview: false });
+        command(&mut session, "undo", json!({}));
+        assert_eq!(session.images[0].gallery.frames.len(), 2, "Undo after a panel edit undid the strip");
+        assert_eq!(session.images[0].doc().picture.nodes[0].opacity, 1.0);
+    }
+
+    /// Catches the last picture deleted through its menu or a stale click.
+    #[test]
+    fn the_last_picture_is_not_deleted() {
+        let mut session = Session::launch();
+        let _ = session.greeting();
+        command(&mut session, "film_focus", json!({}));
+        let messages = command(&mut session, "film_delete", json!({ "picture": 0 }));
+        assert_eq!(session.images[0].gallery.frames.len(), 1);
+        assert!(!undo_enabled(&messages), "a refused delete became a step");
+        assert!(!film_of(&messages).items[0].menu[2].enabled);
+    }
+
+    /// Catches a gallery that is not kept whole in its one file: three
+    /// pictures, each with its own layers and name, and the one shown, are
+    /// written into the project and open again as they were.
+    #[test]
+    fn a_gallery_is_kept_in_its_file() {
+        let folder = std::env::temp_dir().join(format!("image-editor-gallery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        let folder = folder.canonicalize().unwrap();
+        let mut session = Session::launch();
+        let _ = session.greeting();
+        session.handle(HostMessage::Project { folder: folder.display().to_string() });
+        command(&mut session, "film_new", json!({}));
+        command(&mut session, "add_layer", json!({}));
+        command(&mut session, "film_duplicate", json!({ "picture": 1 }));
+        command(&mut session, "add_layer", json!({}));
+        command(&mut session, "film_rename", json!({ "picture": 0, "value": "Sky" }));
+        command(&mut session, "film_select", json!({ "value": 1 }));
+        let replies = session.handle(HostMessage::Keep { tab: "1".into() });
+        let path = folder.join("Untitled Asset.ipx");
+        assert!(replies.iter().any(|reply| matches!(reply, AppMessage::Kept { path: Some(_), error: None, .. })));
+
+        let mut again = Session::restored();
+        again.handle(HostMessage::Project { folder: folder.display().to_string() });
+        let messages = again.handle(HostMessage::Open { path: Some(path.display().to_string()) });
+        let film = film_of(&messages);
+        let names: Vec<&str> = film.items.iter().map(|item| item.name.as_str()).collect();
+        assert_eq!(names, ["Sky", "Untitled Asset 2", "Untitled Asset 2 copy"]);
+        assert_eq!(film.shown, 1);
+        assert_eq!(layer_count(&messages), 2);
+        let layers: Vec<usize> = again.images[0].gallery.frames.iter().map(|frame| frame.doc.picture.nodes.len()).collect();
+        assert_eq!(layers, [1, 2, 3]);
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    /// Catches an assistant gallery call that the tab does not show, or that
+    /// is not one step of the strip's history.
+    #[test]
+    fn the_assistants_gallery_calls_show_and_undo_one_by_one() {
+        let mut session = Session::launch();
+        let _ = session.greeting();
+        let invoke = |session: &mut Session, tool: &str, input: Value| {
+            session.handle(HostMessage::Invoke {
+                call: "c".into(),
+                tab: "1".into(),
+                tool: protocol::tool_key("image-editor", "image", tool),
+                input,
+                group: "r1".into(),
+            })
+        };
+        let messages = invoke(&mut session, "add_picture", json!({ "name": "Moon" }));
+        let AppMessage::ToolResult(result) = messages.last().unwrap() else { panic!("no result last") };
+        assert!(result.ok, "{:?}", result.output);
+        assert_eq!(film_of(&messages).items[1].name, "Moon", "the strip does not show the added picture");
+        invoke(&mut session, "duplicate_picture", json!({ "picture": 1 }));
+        invoke(&mut session, "rename_picture", json!({ "picture": 0, "name": "Sun" }));
+        invoke(&mut session, "move_picture", json!({ "picture": 0, "to": 2 }));
+        invoke(&mut session, "remove_picture", json!({ "picture": 1 }));
+        let messages = invoke(&mut session, "show_picture", json!({ "picture": 0 }));
+        assert_eq!(film_of(&messages).shown, 0);
+        let messages = invoke(&mut session, "list_pictures", json!({}));
+        let AppMessage::ToolResult(result) = messages.last().unwrap() else { panic!("no result last") };
+        assert_eq!(result.output["pictures"].as_array().unwrap().len(), 2);
+        command(&mut session, "film_focus", json!({}));
+        let mut lengths = Vec::new();
+        while session.images[0].gallery.can_undo() {
+            command(&mut session, "undo", json!({}));
+            lengths.push(session.images[0].gallery.frames.len());
+        }
+        assert_eq!(lengths, [3, 3, 3, 2, 1], "the five calls are not five steps");
     }
 }

@@ -239,3 +239,80 @@ fn open_and_export_go_through_the_file_dialog() {
     drop(program);
     let _ = std::fs::remove_dir_all(folder);
 }
+
+/// Catches a + tile that adds nothing the host can show, or a stroke on an
+/// added picture that reaches another: through protocol lines alone, the
+/// + row's action adds a white picture shown on the strip and the canvas,
+/// a stroke paints only it, a click on the first thumbnail shows the
+/// first picture, still white, again, and the + tile's open row adds a PNG
+/// as a picture of its own.
+#[test]
+fn a_picture_added_from_the_strip_is_painted_alone() {
+    let mut program = Program::start(false);
+    let first = program.raster(0);
+    let film = first.film.clone().expect("no filmstrip");
+    assert_eq!(film.items.len(), 1);
+    let first_thumb = std::fs::read(&film.items[0].thumbnail.path).expect("the first thumbnail");
+
+    let send = |program: &mut Program, action: &protocol::Action| {
+        program.command(&action.id, action.arg.clone().unwrap_or(serde_json::Value::Null));
+    };
+    send(&mut program, &film.focus);
+    send(&mut program, film.add[0].action.as_ref().expect("the + row has no action"));
+    let added = program.wait(|message| match message {
+        AppMessage::Raster(view) if view.film.as_ref().is_some_and(|film| film.items.len() == 2) => Some(view.clone()),
+        _ => None,
+    });
+    let strip = added.film.clone().unwrap();
+    assert_eq!(strip.shown, 1, "the added picture is not the one shown");
+    assert_eq!(strip.items[1].name, "Untitled Asset 2");
+    assert_eq!((added.width, added.height), (1920, 1080));
+
+    program.command("tool", json!({ "tool": "brush" }));
+    program.send(HostMessage::RasterGesture {
+        tab: "1".into(),
+        gesture: RasterGesture::Stroke { points: vec![[400.0, 300.0, 1.0], [600.0, 300.0, 1.0]] },
+    });
+    let painted = program.raster(added.revision);
+    assert_eq!(pixel(Path::new(&painted.picture), 1920, 500, 300), [0, 0, 0, 255], "the stroke missed the added picture");
+    let strip = painted.film.clone().unwrap();
+    assert_eq!(std::fs::read(&strip.items[0].thumbnail.path).unwrap(), first_thumb, "the stroke reached the first picture");
+    let dark = std::fs::read(&strip.items[1].thumbnail.path).unwrap();
+    assert!(dark.chunks(4).any(|pixel| pixel[0] < 128), "the added picture's thumbnail does not show the stroke");
+
+    send(&mut program, &strip.focus);
+    send(&mut program, &strip.select.with_value(json!(0)));
+    // The first picture comes back as the file and revision first sent,
+    // which the host still holds.
+    let shown = program.wait(|message| match message {
+        AppMessage::Raster(view) if view.film.as_ref().is_some_and(|film| film.shown == 0) => Some(view.clone()),
+        _ => None,
+    });
+    assert_eq!((shown.picture.as_str(), shown.revision), (first.picture.as_str(), first.revision));
+    assert_eq!(pixel(Path::new(&shown.picture), 1920, 500, 300), [255, 255, 255, 255], "the first picture was painted");
+
+    // The + tile's second row opens a PNG through the host's file dialog
+    // as a third picture, shown, and named after its file.
+    let folder = scratch("film-open");
+    let source = folder.join("Sunset.png");
+    image::RgbaImage::from_pixel(40, 30, image::Rgba([200, 90, 30, 255])).save(&source).unwrap();
+    let strip = shown.film.clone().unwrap();
+    send(&mut program, &strip.focus);
+    send(&mut program, strip.add[1].action.as_ref().expect("the + tile's open row has no action"));
+    let asked = program.wait(|message| match message {
+        AppMessage::File { id, kind: protocol::FileKind::Open, .. } => Some(id.clone()),
+        _ => None,
+    });
+    program.send(HostMessage::FileResult { id: asked, path: Some(source.display().to_string()) });
+    let opened = program.wait(|message| match message {
+        AppMessage::Raster(view) if view.film.as_ref().is_some_and(|film| film.items.len() == 3) => Some(view.clone()),
+        _ => None,
+    });
+    let strip = opened.film.unwrap();
+    assert_eq!(strip.shown, 2, "the opened picture is not the one shown");
+    assert_eq!(strip.items[2].name, "Sunset");
+    assert_eq!((opened.width, opened.height), (40, 30));
+    assert_eq!(pixel(Path::new(&opened.picture), 40, 5, 5), [200, 90, 30, 255]);
+    drop(program);
+    let _ = std::fs::remove_dir_all(folder);
+}

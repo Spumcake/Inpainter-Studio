@@ -9,6 +9,7 @@ mod doc;
 mod grid;
 mod icons;
 mod endpoints;
+mod film;
 mod keys;
 mod markdown;
 mod outliner;

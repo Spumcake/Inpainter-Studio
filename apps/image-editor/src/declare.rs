@@ -1,13 +1,13 @@
 //! What the Image Editor declares for the host to draw: the toolbar and its
 //! settings row, as the approved views show them, the Layers page, the
-//! menu, the keys, and the tab list.
+//! filmstrip, the menu, the keys, and the tab list.
 
 use crate::paint::Combine;
 use crate::picture::{Blend, Node};
-use crate::session::{Session, ToolKind};
+use crate::session::{Image, Session, ToolKind};
 use protocol::{
-    Action, Binding, Chord, ChoicePreview, FlagIcons, HeadingAction, IconToggle, Keys, LayerRow, Layers, MenuEntry,
-    PanelPage, PropValue, Properties, Row, RowKind, Section, TabEntry, Tabs, ToolItem, Toolbar,
+    Action, Binding, Chord, ChoicePreview, Film, FilmItem, FlagIcons, HeadingAction, IconToggle, Keys, LayerRow, Layers,
+    MenuEntry, PanelPage, PropValue, Properties, Row, RowKind, Section, TabEntry, Tabs, Thumbnail, ToolItem, Toolbar,
 };
 use serde_json::json;
 
@@ -77,8 +77,9 @@ fn row(label: &str, action: Action) -> MenuEntry {
 /// settings in the row under it.
 pub fn toolbar(session: &Session) -> Toolbar {
     let image = session.active_image();
-    let can_undo = image.is_some_and(|image| image.doc.can_undo());
-    let can_redo = image.is_some_and(|image| image.doc.can_redo());
+    // While the strip has the keyboard, these are its history's.
+    let can_undo = image.is_some_and(Image::can_undo);
+    let can_redo = image.is_some_and(Image::can_redo);
     let mut export = button("floppy-disk", "Export as PNG", Action::new("export_png"), image.is_some(), false);
     if let ToolItem::Button { menu, .. } = &mut export {
         *menu = vec![row("Export PNG", Action::new("export_png")), row("Export JPEG", Action::new("export_jpeg"))];
@@ -101,7 +102,7 @@ pub fn toolbar(session: &Session) -> Toolbar {
             session.tools.tool == tool,
         ));
     }
-    let zoom = image.and_then(|image| image.camera.as_ref()).map_or(1.0, |camera| camera.zoom);
+    let zoom = image.and_then(|image| image.frame().camera.as_ref()).map_or(1.0, |camera| camera.zoom);
     let trailing = vec![
         ToolItem::Separator,
         ToolItem::Menu {
@@ -148,7 +149,7 @@ fn settings_row(session: &Session) -> (Vec<ToolItem>, Vec<ToolItem>) {
     // Why the chosen tool cannot change the active layer, after its
     // settings; the gesture is still refused.
     let reason = |erase: bool, moving: bool| {
-        let doc = &session.active_image()?.doc;
+        let doc = session.active_image()?.doc();
         if moving { doc.move_refusal() } else { doc.paint_refusal(erase) }
             .map(|text| ToolItem::Label { text, strong: true })
     };
@@ -200,9 +201,9 @@ fn settings_row(session: &Session) -> (Vec<ToolItem>, Vec<ToolItem>) {
         ToolKind::Crop => {
             let image = session.active_image();
             let size = image
-                .map(|image| match image.crop {
+                .map(|image| match image.frame().crop {
                     Some(rect) => (rect[2].round() as u32, rect[3].round() as u32),
-                    None => (image.doc.picture.width, image.doc.picture.height),
+                    None => (image.doc().picture.width, image.doc().picture.height),
                 })
                 .unwrap_or((0, 0));
             (
@@ -250,10 +251,10 @@ pub fn menu(session: &Session) -> Vec<MenuEntry> {
     rows.push(row("Export JPEG…", Action::new("export_jpeg")));
     let mut undo = row("Undo", Action::new("undo"));
     undo.divider = true;
-    undo.enabled = session.active_image().is_some_and(|image| image.doc.can_undo());
+    undo.enabled = session.active_image().is_some_and(Image::can_undo);
     rows.push(undo);
     let mut redo = row("Redo", Action::new("redo"));
-    redo.enabled = session.active_image().is_some_and(|image| image.doc.can_redo());
+    redo.enabled = session.active_image().is_some_and(Image::can_redo);
     rows.push(redo);
     let mut deselect = row("Deselect", Action::new("deselect"));
     deselect.divider = true;
@@ -294,8 +295,9 @@ pub fn keys() -> Keys {
 /// list of layers.
 pub fn properties(session: &Session) -> Option<Properties> {
     let image = session.active_image()?;
-    let picture = &image.doc.picture;
-    let active = image.doc.active.and_then(|id| picture.find(id));
+    let doc = image.doc();
+    let picture = &doc.picture;
+    let active = doc.active.and_then(|id| picture.find(id));
     let mut sections = Vec::new();
     if let Some(node) = active {
         let mut rows = vec![
@@ -366,7 +368,7 @@ pub fn properties(session: &Session) -> Option<Properties> {
                 HeadingAction {
                     icon: "trash".into(),
                     tip: "Delete layer".into(),
-                    enabled: image.doc.active.is_some() && picture.nodes.iter().map(|node| picture.ids_within(node.id).len()).sum::<usize>() > 1,
+                    enabled: doc.active.is_some() && picture.nodes.iter().map(|node| picture.ids_within(node.id).len()).sum::<usize>() > 1,
                     action: Action::new("delete_layer"),
                 },
             ],
@@ -408,7 +410,7 @@ fn layer_rows(session: &Session, node: &Node, parent: Option<u64>, depth: u32, r
         icon: if node.is_group() { "folder".into() } else { "media-image".into() },
         name: node.name.clone(),
         group: node.is_group(),
-        selected: image.doc.active == Some(id),
+        selected: image.doc().active == Some(id),
         visible: node.visible,
         locked: node.locks.all,
         renamable: true,
@@ -418,12 +420,54 @@ fn layer_rows(session: &Session, node: &Node, parent: Option<u64>, depth: u32, r
         toggle_locked: Action::with_arg("layer_lock", target),
         menu,
         colors: Vec::new(),
-        thumbnail: image.thumbs.get(&id).map(|(_, thumb)| thumb.clone()),
+        thumbnail: image.frame().thumbs.get(&id).map(|(_, thumb)| thumb.clone()),
     });
     if let Some(children) = &node.children {
         for child in children.iter().rev() {
             layer_rows(session, child, Some(id), depth + 1, rows);
         }
+    }
+}
+
+/// The filmstrip, as gallery.png, picture-menu.png, and add-menu.png show
+/// it: every picture's thumbnail with its menu, the shown one, and the +
+/// tile's rows.
+pub fn film(image: &Image) -> Film {
+    let count = image.gallery.frames.len();
+    let items = image
+        .gallery
+        .frames
+        .iter()
+        .enumerate()
+        .map(|(index, frame)| {
+            let target = json!({ "picture": index });
+            // The host renames in place, as a layer's Rename row does, and
+            // sends the name typed as the row's action with `value`.
+            let mut rename = row("Rename", Action::with_arg("film_rename", target.clone()));
+            rename.rename = true;
+            let mut delete = row("Delete", Action::with_arg("film_delete", target.clone()));
+            delete.divider = true;
+            // The gallery keeps at least one picture.
+            delete.enabled = count > 1;
+            FilmItem {
+                name: frame.name.clone(),
+                thumbnail: frame.film.as_ref().map(|(_, _, thumb)| thumb.clone()).unwrap_or(Thumbnail {
+                    path: String::new(),
+                    width: 1,
+                    height: 1,
+                    revision: 0,
+                }),
+                menu: vec![row("Duplicate", Action::with_arg("film_duplicate", target)), rename, delete],
+            }
+        })
+        .collect();
+    Film {
+        items,
+        shown: image.gallery.shown,
+        select: Action::new("film_select"),
+        reorder: Action::new("film_reorder"),
+        add: vec![row("New picture", Action::new("film_new")), row("Open PNG or JPEG…", Action::new("film_open"))],
+        focus: Action::new("film_focus"),
     }
 }
 

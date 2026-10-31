@@ -7,9 +7,9 @@ use super::{StandIn, Window, scratch, start};
 use crate::window::Started;
 use eframe::egui::{self, Color32, Pos2, Rect, pos2};
 use protocol::{
-    Action, AppMessage, ChoicePreview, DocumentCamera, FlagIcons, HeadingAction, IconToggle, LayerRow, Layers,
-    PanelPage, PropValue, Properties, RasterTool, RasterView, Row, RowKind, Section, TabEntry, Tabs, Thumbnail,
-    ToolItem, Toolbar,
+    Action, AppMessage, ChoicePreview, DocumentCamera, Film, FilmItem, FlagIcons, HeadingAction, IconToggle,
+    LayerRow, Layers, MenuEntry, PanelPage, PropValue, Properties, RasterTool, RasterView, Row, RowKind, Section,
+    TabEntry, Tabs, Thumbnail, ToolItem, Toolbar,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -53,11 +53,13 @@ fn view(dir: &Path, tool: RasterTool) -> RasterView {
         height: H,
         picture: dir.join("picture.rgba").display().to_string(),
         revision: 1,
+        patch: None,
         tool,
         selection: vec![vec![[10.0, 0.0], [30.0, 0.0], [30.0, 20.0], [10.0, 20.0]]],
         crop: Some([0.0, 0.0, 20.0, 10.0]),
         bounds: Some([0.0, 0.0, 40.0, 20.0]),
         camera: Some(DocumentCamera { origin: ORIGIN, zoom: ZOOM }),
+        film: None,
     }
 }
 
@@ -229,9 +231,68 @@ fn easel(name: &str) -> (Window, PathBuf, StandIn) {
 
 /// The stand-in with these rows in its Layers list.
 fn easel_with(name: &str, rows: impl FnOnce(&Path) -> Vec<LayerRow>) -> (Window, PathBuf, StandIn) {
+    easel_of(name, rows, false)
+}
+
+/// The film's pictures: their names and their thumbnails' sizes, a wide one,
+/// a tall one, and a square one.
+const PICTURES: [(&str, u32, u32); 3] = [("Harbor", 32, 18), ("Tower", 18, 32), ("Tile", 20, 20)];
+
+/// A gallery of the three, the second shown, whose rows and tiles send
+/// actions only this stand-in declares. Its view leaves the camera to the
+/// host, so the host frames the picture above the strip.
+fn film(dir: &Path) -> Film {
+    let row = |label: &str, id: &str, arg: Option<Value>| MenuEntry {
+        label: label.to_string(),
+        icon: None,
+        enabled: true,
+        divider: false,
+        action: Some(Action { id: id.to_string(), arg }),
+        submenu: Vec::new(),
+        rename: false,
+    };
+    Film {
+        items: PICTURES
+            .iter()
+            .enumerate()
+            .map(|(index, (name, width, height))| FilmItem {
+                name: name.to_string(),
+                thumbnail: Thumbnail { path: dir.join(format!("film{index}.rgba")).display().to_string(), width: *width, height: *height, revision: 1 },
+                menu: vec![
+                    row("Duplicate", "copy_item", Some(json!({ "item": index }))),
+                    row("Rename", "rename_item", Some(json!({ "item": index }))),
+                    row("Delete", "remove_item", Some(json!({ "item": index }))),
+                ],
+            })
+            .collect(),
+        shown: 1,
+        select: Action::new("show_item"),
+        reorder: Action::with_arg("order_items", json!({ "strip": true })),
+        add: vec![row("New picture", "new_item", None), row("Open PNG or JPEG…", "open_item", None)],
+        focus: Action::new("strip_focus"),
+    }
+}
+
+/// The stand-in with a filmstrip of three pictures.
+fn filmed(name: &str) -> (Window, PathBuf, StandIn) {
+    easel_of(name, |dir| vec![layer_row(dir, 1, None, 0, "Background", false)], true)
+}
+
+fn easel_of(name: &str, rows: impl FnOnce(&Path) -> Vec<LayerRow>, filmed: bool) -> (Window, PathBuf, StandIn) {
     let dir = scratch(&format!("raster-{name}"));
     std::fs::write(dir.join("picture.rgba"), picture_bytes()).unwrap();
     std::fs::write(dir.join("thumb.rgba"), picture_bytes()).unwrap();
+    for (index, (_, width, height)) in PICTURES.iter().enumerate() {
+        std::fs::write(dir.join(format!("film{index}.rgba")), vec![200; (width * height * 4) as usize]).unwrap();
+    }
+    let declared = |dir: &Path, tool: RasterTool| {
+        let mut view = view(dir, tool);
+        if filmed {
+            view.film = Some(film(dir));
+            view.camera = None;
+        }
+        view
+    };
     let greeting = [
         String::from("{\"type\":\"hello\",\"protocol\":1}\n"),
         String::from("{\"type\":\"tab\",\"id\":\"r1\",\"label\":\"Picture\"}\n"),
@@ -246,7 +307,7 @@ fn easel_with(name: &str, rows: impl FnOnce(&Path) -> Vec<LayerRow>) -> (Window,
             new_tab_tip: String::new(),
         })),
         line(AppMessage::Properties(properties(rows(&dir)))),
-        line(AppMessage::Raster(view(&dir, brush()))),
+        line(AppMessage::Raster(declared(&dir, brush()))),
         line(AppMessage::Toolbar(toolbar("brush"))),
     ];
     std::fs::write(dir.join("greeting.jsonl"), greeting.concat()).unwrap();
@@ -261,7 +322,7 @@ fn easel_with(name: &str, rows: impl FnOnce(&Path) -> Vec<LayerRow>) -> (Window,
         ("hand", RasterTool::Hand, "brush"),
         ("zoom", RasterTool::Zoom, "brush"),
     ] {
-        let lines = [line(AppMessage::Raster(view(&dir, tool))), line(AppMessage::Toolbar(toolbar(bar)))];
+        let lines = [line(AppMessage::Raster(declared(&dir, tool))), line(AppMessage::Toolbar(toolbar(bar)))];
         std::fs::write(dir.join(format!("{name}.jsonl")), lines.concat()).unwrap();
     }
     let program = dir.join("easel");
@@ -302,7 +363,13 @@ fn of_type(dir: &Path, kind: &str) -> Vec<Value> {
     sent(dir).into_iter().filter(|line| line["type"] == kind).collect()
 }
 
+/// Every finished gesture: the parts of a stroke sent while it is drawn
+/// are left out.
 fn gestures(dir: &Path) -> Vec<Value> {
+    all_gestures(dir).into_iter().filter(|gesture| gesture["kind"] != "stroke_part").collect()
+}
+
+fn all_gestures(dir: &Path) -> Vec<Value> {
     of_type(dir, "raster_gesture").into_iter().map(|line| line["gesture"].clone()).collect()
 }
 
@@ -498,24 +565,31 @@ fn the_picture_its_selection_and_its_crop_box_are_drawn_where_the_camera_puts_th
 
 /// Catches gestures that are not sent, sent more than once, or sent in
 /// screen points: each tool's drag or click on the stand-in's picture is
-/// one `raster_gesture` in picture pixels, through the camera, and the
-/// brush previews its drag in its colour until it is sent.
+/// one `raster_gesture` in picture pixels, through the camera. The brush
+/// sends its points as they come, in order, and then the whole stroke; it
+/// draws no trail of its own, so the stroke seen is the picture's.
 #[test]
 fn each_tool_sends_one_gesture_in_picture_pixels() {
     let (mut window, dir, _stand_in) = easel("gestures");
 
-    // The brush: one paint drag, previewed in its colour while drawn.
-    let mut previewed = 0;
+    // The brush: one paint drag, its points sent as they come.
+    let mut trail = 0;
     drag(&mut window, &[[5.0, 5.0], [10.0, 6.0], [15.0, 8.0], [25.0, 12.0]], |window| {
-        previewed = discs(window, Color32::from_rgb(BRUSH[0], BRUSH[1], BRUSH[2]));
+        trail += discs(window, Color32::from_rgb(BRUSH[0], BRUSH[1], BRUSH[2]));
     });
-    assert!(previewed >= 3, "the brush did not preview its drag");
+    assert_eq!(trail, 0, "the host drew a trail of its own over the picture");
     window.until(|_| !gestures(&dir).is_empty());
     let sent = gestures(&dir);
     assert_eq!(sent.len(), 1, "one drag sent {} gestures", sent.len());
     assert_eq!(sent[0]["kind"], "stroke");
     let points = sent[0]["points"].as_array().unwrap();
     assert!(points.len() >= 4, "the drag lost its points: {points:?}");
+    let mut streamed: Vec<Value> = Vec::new();
+    for part in all_gestures(&dir).iter().filter(|gesture| gesture["kind"] == "stroke_part") {
+        assert_eq!(part["from"].as_u64(), Some(streamed.len() as u64), "a part of the stroke came out of order");
+        streamed.extend(part["points"].as_array().unwrap().iter().cloned());
+    }
+    assert_eq!(&streamed, points, "the parts sent while drawing are not the stroke laid");
     let first = &points[0];
     let last = points.last().unwrap();
     assert!(near(first[0].as_f64().unwrap(), 5.0) && near(first[1].as_f64().unwrap(), 5.0) && near(first[2].as_f64().unwrap(), 1.0), "{first}");
@@ -773,5 +847,206 @@ fn layers_are_dragged_into_and_out_of_groups() {
     drag_on_screen(&mut window, from, below);
     window.until(|_| commands(&dir, "reorder").len() > 2);
     assert_eq!(commands(&dir, "reorder")[2]["arg"], json!({ "node": 11, "value": 3, "parent": null }), "the drop below the list did not reach the bottom");
+    close(window, dir);
+}
+
+// The filmstrip.
+
+/// Where each of the film's thumbnails was drawn, in order.
+fn thumbnails(window: &Window, dir: &Path) -> Vec<Rect> {
+    (0..PICTURES.len())
+        .map(|index| {
+            let name = format!("raster:{}", dir.join(format!("film{index}.rgba")).display());
+            textured(window, &name).into_iter().next_back().unwrap_or_else(|| panic!("thumbnail {index} was not drawn"))
+        })
+        .collect()
+}
+
+/// Rectangles drawn with an edge of this colour.
+fn edged(window: &Window, color: Color32) -> Vec<Rect> {
+    window
+        .shapes
+        .iter()
+        .filter_map(|clipped| match &clipped.shape {
+            egui::Shape::Rect(shown) if shown.stroke.color == color && shown.stroke.width > 0.0 => Some(shown.rect),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The ids of the commands sent, in order.
+fn command_ids(dir: &Path) -> Vec<String> {
+    of_type(dir, "command").iter().filter_map(|line| line["id"].as_str().map(String::from)).collect()
+}
+
+fn press_with(window: &mut Window, at: Pos2, button: egui::PointerButton, pressed: bool) {
+    window.events.push(egui::Event::PointerButton { pos: at, button, pressed, modifiers: Default::default() });
+}
+
+const BLUE: Color32 = Color32::from_rgb(37, 99, 235);
+
+/// Catches a filmstrip that is not drawn, is drawn over the picture, or
+/// does not show which picture is shown: a white strip under a hairline
+/// along the bottom of the working area, each thumbnail its own picture 44
+/// points tall at its proportions, in order, the shown one outlined in blue
+/// and the others not, and a bordered + tile after them. The picture's area
+/// ends where the strip begins, the host's first camera and Fit frame the
+/// picture there, and commands report that area as their viewport.
+#[test]
+fn the_filmstrip_is_drawn_under_the_picture_with_the_shown_one_outlined() {
+    let (mut window, dir, _stand_in) = filmed("film-drawn");
+    let area = window.app.raster.shown;
+    let strip = window
+        .shapes
+        .iter()
+        .find_map(|clipped| match &clipped.shape {
+            egui::Shape::Rect(shown) if shown.fill == Color32::WHITE && (shown.rect.top() - area.bottom()).abs() < 0.01 && (shown.rect.width() - area.width()).abs() < 0.01 => Some(shown.rect),
+            _ => None,
+        })
+        .expect("no white strip under the picture's area");
+    assert!((strip.height() - 68.0).abs() < 0.01, "the strip is {} points tall", strip.height());
+    let hairline = window.shapes.iter().any(|clipped| matches!(&clipped.shape, egui::Shape::LineSegment { points, stroke } if stroke.color == crate::widgets::BORDER && (points[0].y - strip.top()).abs() < 1.0 && (points[1].x - points[0].x).abs() >= strip.width() - 0.5));
+    assert!(hairline, "the strip has no hairline above it");
+
+    let thumbs = thumbnails(&window, &dir);
+    for (index, thumb) in thumbs.iter().enumerate() {
+        let (_, width, height) = PICTURES[index];
+        assert!(strip.contains_rect(*thumb), "thumbnail {index} is off the strip: {thumb:?}");
+        assert!((thumb.height() - 44.0).abs() < 0.5, "thumbnail {index} is {} tall", thumb.height());
+        let proportions = (thumb.width() / thumb.height(), width as f32 / height as f32);
+        assert!((proportions.0 - proportions.1).abs() < 0.05, "thumbnail {index} is not at its picture's proportions: {proportions:?}");
+        if index > 0 {
+            assert!(thumb.left() > thumbs[index - 1].right(), "the thumbnails are out of order");
+        }
+    }
+    let blue = edged(&window, BLUE);
+    let outlined = |thumb: &Rect| blue.iter().any(|edge| edge.contains_rect(*thumb) && edge.width() - thumb.width() <= 6.5);
+    assert!(outlined(&thumbs[1]), "the shown picture is not outlined in blue");
+    assert!(!outlined(&thumbs[0]) && !outlined(&thumbs[2]), "a picture not shown is outlined in blue");
+    let add = edged(&window, crate::widgets::BORDER)
+        .into_iter()
+        .find(|tile| strip.contains_rect(*tile) && tile.left() > thumbs[2].right() && (tile.height() - 44.0).abs() < 0.5)
+        .expect("no bordered + tile after the thumbnails");
+    assert!(add.left() - thumbs[2].right() < 20.0, "the + tile is not at the end of the thumbnails");
+
+    // The first camera and Fit frame the picture above the strip.
+    let name = format!("raster:{}", dir.join("picture.rgba").display());
+    let fitted = |window: &Window| {
+        let picture = textured(window, &name).into_iter().next_back().expect("the picture was not drawn");
+        let rect = window.app.raster.shown;
+        assert!(picture.bottom() <= strip.top() - 39.0, "the picture reaches the strip: {picture:?}, strip at {}", strip.top());
+        assert!((picture.center() - rect.center()).length() < 0.5, "the picture is not centered above the strip");
+        let zoom = ((f64::from(rect.width()) - 80.0) / f64::from(W)).min((f64::from(rect.height()) - 80.0) / f64::from(H));
+        assert!(near(raster(window).camera.unwrap().zoom, zoom), "the camera was not fitted to the area above the strip");
+    };
+    fitted(&window);
+    window.app.run_action(&Action::with_arg("canvas.zoom", json!({"zoom": 1})));
+    window.step();
+    window.app.run_action(&Action::new("canvas.fit"));
+    window.step();
+    fitted(&window);
+    window.app.run_action(&Action::new("deselect"));
+    window.until(|_| !commands(&dir, "deselect").is_empty());
+    let viewport = &commands(&dir, "deselect")[0]["viewport"];
+    assert_eq!(viewport, &json!([area.width(), area.height()]), "a command's viewport is not the area above the strip");
+    close(window, dir);
+}
+
+/// Catches a filmstrip that draws and does nothing, or sends the wrong
+/// thing: a click on a thumbnail sends `focus` and then `select` with its
+/// index, and paints nothing on the picture; a right-click opens that
+/// thumbnail's rows above it, on the menus' card, and a row sends its own
+/// action; the + tile opens its rows above it; a thumbnail dragged along
+/// the strip shows where it will land and sends `reorder` with `to` counted
+/// after it is taken out; a drag that ends where it began sends nothing;
+/// and resting on a thumbnail shows its name.
+#[test]
+fn the_filmstrip_sends_focus_select_its_menus_and_reorder() {
+    let (mut window, dir, _stand_in) = filmed("film-actions");
+    let thumbs = thumbnails(&window, &dir);
+
+    // A click: focus, then select.
+    click(&mut window, thumbs[2].center());
+    window.until(|_| !commands(&dir, "show_item").is_empty());
+    let ids = command_ids(&dir);
+    let focus = ids.iter().position(|id| id == "strip_focus").expect("the press sent no focus");
+    let select = ids.iter().position(|id| id == "show_item").unwrap();
+    assert!(focus < select, "focus was not sent before select: {ids:?}");
+    assert_eq!(commands(&dir, "show_item")[0]["arg"], json!({ "value": 2 }));
+    assert_eq!(commands(&dir, "show_item")[0]["tab"], json!("r1"));
+    assert!(gestures(&dir).is_empty(), "a click on the strip painted the picture");
+
+    // Resting on a thumbnail shows its name. A pointer moved just after a
+    // click shows none, so the move waits a moment as a person's would.
+    settle(&mut window);
+    window.events.push(egui::Event::PointerMoved(thumbs[0].center()));
+    for _ in 0..50 {
+        window.step();
+    }
+    assert!(window.texts.iter().any(|(text, _)| text == "Harbor"), "resting on a thumbnail does not show its name");
+
+    // A right-click opens the thumbnail's rows above it.
+    let at = thumbs[0].center();
+    window.events.push(egui::Event::PointerMoved(at));
+    window.step();
+    press_with(&mut window, at, egui::PointerButton::Secondary, true);
+    window.step();
+    press_with(&mut window, at, egui::PointerButton::Secondary, false);
+    window.step();
+    settle(&mut window);
+    let rename = text_at(&window, "Rename");
+    assert!(text_at(&window, "Duplicate").bottom() < thumbs[0].top() && text_at(&window, "Delete").bottom() < thumbs[0].top(), "the thumbnail's rows are not above it");
+    assert!((text_at(&window, "Duplicate").left() - thumbs[0].left()).abs() < 40.0, "the thumbnail's rows are not over it");
+    assert_eq!(command_ids(&dir).iter().filter(|id| *id == "strip_focus").count(), 2, "a right-click did not send focus");
+    click(&mut window, rename.center());
+    window.until(|_| !commands(&dir, "rename_item").is_empty());
+    assert_eq!(commands(&dir, "rename_item")[0]["arg"], json!({ "item": 0 }));
+    assert!(commands(&dir, "copy_item").is_empty() && commands(&dir, "remove_item").is_empty());
+    assert_eq!(commands(&dir, "show_item").len(), 1, "the right-click or its row selected a picture");
+
+    // The + tile opens its rows above it.
+    let add = edged(&window, crate::widgets::BORDER)
+        .into_iter()
+        .find(|tile| tile.left() > thumbs[2].right() && (tile.height() - 44.0).abs() < 0.5)
+        .expect("no + tile");
+    click(&mut window, add.center());
+    settle(&mut window);
+    let new = text_at(&window, "New picture");
+    let open = text_at(&window, "Open PNG or JPEG…");
+    assert!(new.bottom() < add.top() && open.bottom() < add.top(), "the + tile's rows are not above it");
+    click(&mut window, open.center());
+    window.until(|_| !commands(&dir, "open_item").is_empty());
+    assert!(commands(&dir, "new_item").is_empty());
+
+    // A drag past the last thumbnail lands last; one before the first lands
+    // first; each shows a blue line where it will land while it is held.
+    let line = |window: &Window| segments(window, BLUE).into_iter().filter(|[a, b]| (a.x - b.x).abs() < 0.01 && (a.y - b.y).abs() > 40.0).map(|[a, _]| a.x).next();
+    window.events.push(egui::Event::PointerMoved(thumbs[0].center()));
+    window.step();
+    press(&mut window, thumbs[0].center(), true);
+    window.step();
+    for step in 1..=8 {
+        let to = thumbs[2].right() - 4.0;
+        let x = thumbs[0].center().x + (to - thumbs[0].center().x) * step as f32 / 8.0;
+        window.events.push(egui::Event::PointerMoved(pos2(x, thumbs[0].center().y)));
+        window.step();
+    }
+    let shown_at = line(&window);
+    press(&mut window, pos2(thumbs[2].right() - 4.0, thumbs[0].center().y), false);
+    window.step();
+    let landed = shown_at.expect("the drag showed no line where it would land");
+    assert!(landed > thumbs[2].right() && landed < add.left(), "the line is not after the last thumbnail: {landed}");
+    window.until(|_| !commands(&dir, "order_items").is_empty());
+    assert_eq!(commands(&dir, "order_items")[0]["arg"], json!({ "strip": true, "from": 0, "to": 2 }));
+    drag_on_screen(&mut window, thumbs[2].center(), pos2(thumbs[0].left() + 4.0, thumbs[0].center().y));
+    window.until(|_| commands(&dir, "order_items").len() > 1);
+    assert_eq!(commands(&dir, "order_items")[1]["arg"], json!({ "strip": true, "from": 2, "to": 0 }));
+    drag_on_screen(&mut window, thumbs[1].center(), thumbs[1].center() + egui::vec2(8.0, 0.0));
+    for _ in 0..10 {
+        window.step();
+    }
+    assert_eq!(commands(&dir, "order_items").len(), 2, "a drag that ended where it began was sent");
+    assert_eq!(commands(&dir, "show_item").len(), 1, "a drag selected a picture");
+    assert!(gestures(&dir).is_empty(), "the strip's pointer reached the picture");
     close(window, dir);
 }

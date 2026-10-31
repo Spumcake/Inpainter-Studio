@@ -2356,8 +2356,9 @@ impl HostWindow {
         }
     }
 
-    /// A raster tab: its picture through the host's camera, and the pointer's
-    /// gestures sent to the sub-application.
+    /// A raster tab: its picture through the host's camera, its filmstrip
+    /// when it has one, and the pointer's gestures and the strip's actions
+    /// sent to the sub-application.
     fn show_raster(&mut self, ui: &mut egui::Ui, app: usize, tab: &str, rect: Rect, dismissing: bool) {
         let mut out = Vec::new();
         {
@@ -2373,10 +2374,31 @@ impl HostWindow {
                 self.live.moved = true;
             }
         }
+        // The picture's camera works in the area above the filmstrip: Fit
+        // and the zoom buttons frame the picture there, and a command reports
+        // that area as its viewport.
+        let shown = self.raster.shown;
+        self.viewport = [f64::from(shown.width()), f64::from(shown.height())];
         for item in out {
             let gesture = match item {
                 crate::raster::Out::Gesture(gesture) => gesture,
                 crate::raster::Out::Painted(points) => protocol::RasterGesture::Stroke { points },
+                crate::raster::Out::PaintPart { from, points } => protocol::RasterGesture::StrokePart { from, points },
+                crate::raster::Out::PaintLetGo => protocol::RasterGesture::StrokeCancel,
+                crate::raster::Out::Action(action) => {
+                    let viewport = self.viewport;
+                    self.send(
+                        app,
+                        HostMessage::Command {
+                            id: action.id,
+                            tab: Some(tab.to_string()),
+                            arg: action.arg,
+                            node: None,
+                            viewport,
+                        },
+                    );
+                    continue;
+                }
             };
             self.send(
                 app,

@@ -28,7 +28,98 @@ pub struct Coverage {
 /// pressure scales. Measured against the line itself rather than round dabs
 /// along it, so a hard edge is smooth, without the ridges dabs leave between
 /// them, as the owner saw on 2026-10-30.
+#[cfg(test)]
 pub fn stroke_coverage(points: &[[f64; 3]], brush: &Brush) -> Option<Coverage> {
+    stroke_coverage_within(points, brush, Rect::new(i32::MIN / 4, i32::MIN / 4, i32::MAX / 2, i32::MAX / 2))
+}
+
+/// The stroke's coverage inside `clip`, the only pixels it can change.
+pub fn stroke_coverage_within(points: &[[f64; 3]], brush: &Brush, clip: Rect) -> Option<Coverage> {
+    let bounds = stroke_bounds(points, brush)?.intersect(&clip);
+    if bounds.is_empty() {
+        return None;
+    }
+    let mut values = vec![0.0f32; bounds.w as usize * bounds.h as usize];
+    cover(points, brush, bounds, bounds, &mut values);
+    Some(Coverage { rect: bounds, values })
+}
+
+/// The pixels the stroke through `points` can reach.
+pub fn stroke_bounds(points: &[[f64; 3]], brush: &Brush) -> Option<Rect> {
+    let pieces = pieces(points, brush)?;
+    let mut bounds = Rect::new(0, 0, 0, 0);
+    for (a, ra, b, rb) in &pieces {
+        bounds = bounds.union(&piece_box(a, *ra, b, *rb));
+    }
+    (!bounds.is_empty()).then_some(bounds)
+}
+
+/// Raises `values`, the coverage of every pixel of `frame` row by row, to
+/// what the stroke through `points` gives each pixel inside `clip`, and
+/// returns the part it reached. Pixels already fully covered are passed by,
+/// so a stroke that goes over itself, or a piece added to a stroke being
+/// drawn, costs only its new pixels.
+pub fn cover(points: &[[f64; 3]], brush: &Brush, frame: Rect, clip: Rect, values: &mut [f32]) -> Rect {
+    let mut reached = Rect::new(0, 0, 0, 0);
+    let Some(pieces) = pieces(points, brush) else {
+        return reached;
+    };
+    let clip = clip.intersect(&frame);
+    let hardness = brush.hardness.clamp(0.0, 1.0);
+    for (a, ra, b, rb) in &pieces {
+        let area = piece_box(a, *ra, b, *rb).intersect(&clip);
+        if area.is_empty() {
+            continue;
+        }
+        reached = reached.union(&area);
+        let along = [b[0] - a[0], b[1] - a[1]];
+        let length2 = along[0] * along[0] + along[1] * along[1];
+        for y in area.y..area.bottom() {
+            let py = f64::from(y) + 0.5;
+            let row = (y - frame.y) as usize * frame.w as usize;
+            for x in area.x..area.right() {
+                let cell = &mut values[row + (x - frame.x) as usize];
+                if *cell >= 1.0 {
+                    continue;
+                }
+                let px = f64::from(x) + 0.5;
+                // The nearest place on this piece, and the radius there.
+                let t = if length2 > 0.0 {
+                    (((px - a[0]) * along[0] + (py - a[1]) * along[1]) / length2).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let nearest = [a[0] + along[0] * t, a[1] + along[1] * t];
+                let radius = ra + (rb - ra) * t;
+                let distance2 = (px - nearest[0]).powi(2) + (py - nearest[1]).powi(2);
+                if distance2 >= (radius + 0.5) * (radius + 0.5) {
+                    continue;
+                }
+                let distance = distance2.sqrt();
+                // The edge is smoothed over one pixel, whatever the hardness.
+                let edge = (radius - distance + 0.5).clamp(0.0, 1.0);
+                let inner = radius * hardness;
+                let soft = if distance <= inner || radius - inner <= f64::EPSILON {
+                    1.0
+                } else {
+                    let t = ((distance - inner) / (radius - inner)).clamp(0.0, 1.0);
+                    1.0 - t * t * (3.0 - 2.0 * t)
+                };
+                let value = (edge.min(soft)) as f32;
+                if value > *cell {
+                    *cell = value;
+                }
+            }
+        }
+    }
+    reached
+}
+
+/// Each piece of the line: its two ends, with the radius at each. A stroke
+/// of one point is one piece of no length, a round dot.
+type Piece = ([f64; 2], f64, [f64; 2], f64);
+
+fn pieces(points: &[[f64; 3]], brush: &Brush) -> Option<Vec<Piece>> {
     let points: Vec<[f64; 3]> = points
         .iter()
         .copied()
@@ -41,9 +132,7 @@ pub fn stroke_coverage(points: &[[f64; 3]], brush: &Brush) -> Option<Coverage> {
         let scale = if brush.pressure { pressure.clamp(0.0, 1.0) } else { 1.0 };
         ((brush.size * scale).max(1.0) / 2.0).max(0.5)
     };
-    // Each piece of the line: its two ends, with the radius at each. A
-    // stroke of one point is one piece of no length, a round dot.
-    let pieces: Vec<([f64; 2], f64, [f64; 2], f64)> = if points.len() == 1 {
+    Some(if points.len() == 1 {
         let point = points[0];
         vec![([point[0], point[1]], radius_at(point[2]), [point[0], point[1]], radius_at(point[2]))]
     } else {
@@ -51,63 +140,16 @@ pub fn stroke_coverage(points: &[[f64; 3]], brush: &Brush) -> Option<Coverage> {
             .windows(2)
             .map(|pair| ([pair[0][0], pair[0][1]], radius_at(pair[0][2]), [pair[1][0], pair[1][1]], radius_at(pair[1][2])))
             .collect()
-    };
-    let mut bounds = Rect::new(0, 0, 0, 0);
-    for (a, ra, b, rb) in &pieces {
-        let reach = ra.max(*rb) + 1.0;
-        let x = (a[0].min(b[0]) - reach).floor() as i32;
-        let y = (a[1].min(b[1]) - reach).floor() as i32;
-        let right = (a[0].max(b[0]) + reach).ceil() as i32;
-        let bottom = (a[1].max(b[1]) + reach).ceil() as i32;
-        bounds = bounds.union(&Rect::new(x, y, right - x, bottom - y));
-    }
-    if bounds.is_empty() {
-        return None;
-    }
-    let mut values = vec![0.0f32; bounds.w as usize * bounds.h as usize];
-    let hardness = brush.hardness.clamp(0.0, 1.0);
-    for (a, ra, b, rb) in &pieces {
-        let reach = ra.max(*rb) + 1.0;
-        let x0 = ((a[0].min(b[0]) - reach).floor() as i32).max(bounds.x);
-        let y0 = ((a[1].min(b[1]) - reach).floor() as i32).max(bounds.y);
-        let x1 = ((a[0].max(b[0]) + reach).ceil() as i32).min(bounds.right());
-        let y1 = ((a[1].max(b[1]) + reach).ceil() as i32).min(bounds.bottom());
-        let along = [b[0] - a[0], b[1] - a[1]];
-        let length2 = along[0] * along[0] + along[1] * along[1];
-        for y in y0..y1 {
-            let py = f64::from(y) + 0.5;
-            for x in x0..x1 {
-                let px = f64::from(x) + 0.5;
-                // The nearest place on this piece, and the radius there.
-                let t = if length2 > 0.0 {
-                    (((px - a[0]) * along[0] + (py - a[1]) * along[1]) / length2).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                let nearest = [a[0] + along[0] * t, a[1] + along[1] * t];
-                let radius = ra + (rb - ra) * t;
-                let distance = ((px - nearest[0]).powi(2) + (py - nearest[1]).powi(2)).sqrt();
-                // The edge is smoothed over one pixel, whatever the hardness.
-                let edge = (radius - distance + 0.5).clamp(0.0, 1.0);
-                if edge <= 0.0 {
-                    continue;
-                }
-                let inner = radius * hardness;
-                let soft = if distance <= inner || radius - inner <= f64::EPSILON {
-                    1.0
-                } else {
-                    let t = ((distance - inner) / (radius - inner)).clamp(0.0, 1.0);
-                    1.0 - t * t * (3.0 - 2.0 * t)
-                };
-                let value = (edge.min(soft)) as f32;
-                let cell = &mut values[(y - bounds.y) as usize * bounds.w as usize + (x - bounds.x) as usize];
-                if value > *cell {
-                    *cell = value;
-                }
-            }
-        }
-    }
-    Some(Coverage { rect: bounds, values })
+    })
+}
+
+fn piece_box(a: &[f64; 2], ra: f64, b: &[f64; 2], rb: f64) -> Rect {
+    let reach = ra.max(rb) + 1.0;
+    let x = (a[0].min(b[0]) - reach).floor() as i32;
+    let y = (a[1].min(b[1]) - reach).floor() as i32;
+    let right = (a[0].max(b[0]) + reach).ceil() as i32;
+    let bottom = (a[1].max(b[1]) + reach).ceil() as i32;
+    Rect::new(x, y, right - x, bottom - y)
 }
 
 /// Paints or erases a stroke's coverage into a layer whose pixels sit at

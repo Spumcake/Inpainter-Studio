@@ -22,6 +22,11 @@ pub struct RasterView {
     pub picture: String,
     /// Rises with every change to the picture.
     pub revision: u64,
+    /// The part of the picture that differs from revision `since` of the
+    /// same file. A host that still shows `since` reads only these rows;
+    /// any other host reads the whole picture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch: Option<RasterPatch>,
     pub tool: RasterTool,
     /// The selection, as closed outlines in picture pixels, drawn with a
     /// marching edge. Empty when nothing is selected.
@@ -39,6 +44,50 @@ pub struct RasterView {
     /// host owns the camera after that and reports it with `camera`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub camera: Option<DocumentCamera>,
+    /// The tab's pictures, as a filmstrip along the bottom of the working
+    /// area, as the owner's mockup and 0.11's gallery views show. None draws
+    /// no strip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub film: Option<Film>,
+}
+
+/// What changed since an earlier revision: `[x, y, width, height]` in
+/// picture pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RasterPatch {
+    pub since: u64,
+    pub rect: [u32; 4],
+}
+
+/// A gallery's filmstrip: every picture in the tab, the one shown outlined
+/// in blue, and a bordered + tile at the end.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Film {
+    pub items: Vec<FilmItem>,
+    /// The index of the picture shown.
+    pub shown: usize,
+    /// A click on a thumbnail sends `select` with `{"value": index}`.
+    pub select: crate::Action,
+    /// A thumbnail dragged along the strip sends `reorder` with
+    /// `{"from": index, "to": index}` on release, `to` counted after the
+    /// dragged one is taken out.
+    pub reorder: crate::Action,
+    /// The + tile's menu: a click opens these rows above it.
+    pub add: Vec<crate::MenuEntry>,
+    /// A press anywhere on the strip sends `focus` first, so the
+    /// application knows the strip, not the picture, has the keyboard.
+    pub focus: crate::Action,
+}
+
+/// One picture on the filmstrip.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FilmItem {
+    /// Shown when the pointer rests on the thumbnail.
+    pub name: String,
+    pub thumbnail: Thumbnail,
+    /// The thumbnail's right-click menu.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub menu: Vec<crate::MenuEntry>,
 }
 
 /// What the host's pointer does on a raster tab.
@@ -82,8 +131,15 @@ pub enum RasterTool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RasterGesture {
-    /// A brush or eraser stroke: `[x, y, pressure]`, pressure from 0 to 1,
-    /// and 1 with a mouse.
+    /// The newest points of a brush or eraser stroke still being drawn,
+    /// sent as they come, so the sub-application paints them at once:
+    /// `from` is how many points were sent before. The host draws no
+    /// preview of its own; the picture shows the stroke.
+    StrokePart { from: usize, points: Vec<[f64; 3]> },
+    /// The open stroke was let go with Escape: it is taken off the picture.
+    StrokeCancel,
+    /// A finished brush or eraser stroke, every point: `[x, y, pressure]`,
+    /// pressure from 0 to 1, and 1 with a mouse.
     Stroke { points: Vec<[f64; 3]> },
     /// A rectangle, corner to corner.
     Rect { from: [f64; 2], to: [f64; 2] },
@@ -122,15 +178,30 @@ mod tests {
             height: 1080,
             picture: "/tmp/1.rgba".into(),
             revision: 3,
+            patch: Some(RasterPatch { since: 2, rect: [1, 2, 3, 4] }),
             tool: RasterTool::Brush { rgb: [20, 20, 22], size: 24.0, hardness: 0.8, opacity: 1.0, pressure: true },
             selection: vec![vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]]],
             crop: Some([1.0, 2.0, 3.0, 4.0]),
             bounds: Some([0.0, 0.0, 1920.0, 1080.0]),
             camera: Some(DocumentCamera { origin: [0.0, 0.0], zoom: 0.5 }),
+            film: Some(Film {
+                items: vec![FilmItem {
+                    name: "Beach".into(),
+                    thumbnail: Thumbnail { path: "/tmp/t.rgba".into(), width: 68, height: 44, revision: 1 },
+                    menu: Vec::new(),
+                }],
+                shown: 0,
+                select: crate::Action::new("select_picture"),
+                reorder: crate::Action::new("move_picture"),
+                add: Vec::new(),
+                focus: crate::Action::new("film_focus"),
+            }),
         };
         let text = serde_json::to_string(&crate::AppMessage::Raster(view.clone())).unwrap();
         assert_eq!(crate::parse_app_message(&text).unwrap(), crate::AppMessage::Raster(view));
         for gesture in [
+            RasterGesture::StrokePart { from: 3, points: vec![[1.0, 2.0, 0.5]] },
+            RasterGesture::StrokeCancel,
             RasterGesture::Stroke { points: vec![[1.0, 2.0, 0.5]] },
             RasterGesture::Rect { from: [0.0, 0.0], to: [5.0, 5.0] },
             RasterGesture::Lasso { points: vec![[0.0, 0.0], [5.0, 0.0], [5.0, 5.0]] },

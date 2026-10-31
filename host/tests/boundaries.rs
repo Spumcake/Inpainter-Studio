@@ -19,6 +19,7 @@ const SEARCHED: &[&str] = &[
     "src/keys.rs",
     "src/window/settings.rs",
     "src/raster.rs",
+    "src/film.rs",
 ];
 
 /// Words that would mean one of these parts was written for a particular

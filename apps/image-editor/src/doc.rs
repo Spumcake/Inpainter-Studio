@@ -20,6 +20,22 @@ enum Change {
     Size { before: [u32; 2], after: [u32; 2] },
 }
 
+/// A stroke being drawn, on the layer `id`.
+struct Live {
+    id: u64,
+    brush: Brush,
+    points: Vec<[f64; 3]>,
+    /// The layer's pixels before the stroke, and where they sit.
+    before: Pixels,
+    offset: [i32; 2],
+    /// Each picture pixel's coverage so far, row by row.
+    coverage: Vec<f32>,
+    /// The part painted so far, and the part the stroke reaches, in picture
+    /// pixels.
+    painted: Rect,
+    wanted: Rect,
+}
+
 #[derive(Debug, Clone, Default)]
 struct Step {
     changes: Vec<Change>,
@@ -43,6 +59,11 @@ pub struct Doc {
     /// of date.
     composite: Vec<u8>,
     stale: Option<Rect>,
+    /// The part of the composite brought up to date since the host was last
+    /// told, so only it is sent again.
+    changed: Option<Rect>,
+    /// The stroke being drawn, painted as its points come.
+    live: Option<Live>,
     /// Rises whenever the composite changes.
     pub revision: u64,
     /// Rises with every change to the image, so its tab knows it is
@@ -67,6 +88,8 @@ impl Doc {
             pending: None,
             composite: Vec::new(),
             stale: None,
+            changed: None,
+            live: None,
             revision: 0,
             edits: 0,
             outlines: None,
@@ -111,8 +134,14 @@ impl Doc {
             return false;
         };
         self.picture.composite_into(rect, &mut self.composite);
+        self.changed = Some(self.changed.map_or(rect, |changed| changed.union(&rect)));
         self.revision += 1;
         true
+    }
+
+    /// The part of the composite that changed since this was last asked.
+    pub fn take_changed(&mut self) -> Option<Rect> {
+        self.changed.take()
     }
 
     fn touch(&mut self, rect: Rect) {
@@ -251,6 +280,27 @@ impl Doc {
     /// A brush or eraser stroke on the active layer, inside the selection
     /// when there is one. One step.
     pub fn stroke(&mut self, points: &[[f64; 3]], brush: &Brush) -> Result<(), Refusal> {
+        // The stroke already painted as it was drawn becomes the step as it
+        // is, unless the layer must grow to take it.
+        let painted = self.live.as_ref().is_some_and(|live| {
+            let layer = Rect::new(live.offset[0], live.offset[1], live.before.width as i32, live.before.height as i32);
+            live.points == points && live.brush == *brush && self.active == Some(live.id) && layer.contains(&live.wanted)
+        });
+        if painted && let Some(live) = self.live.take() {
+            self.finish_edit();
+            let local = Rect::new(live.painted.x - live.offset[0], live.painted.y - live.offset[1], live.painted.w, live.painted.h);
+            if let Some(pixels) = self.picture.pixels.get(&live.id)
+                && !local.is_empty()
+            {
+                let before = live.before.read(local);
+                let after = pixels.read(local);
+                if before != after {
+                    self.commit(vec![Change::Pixels { id: live.id, rect: local, before, after }], None);
+                }
+            }
+            return Ok(());
+        }
+        self.end_live();
         self.finish_edit();
         if let Some(refusal) = self.paint_refusal(brush.erase) {
             return Err(refusal);
@@ -259,10 +309,10 @@ impl Doc {
             return Ok(());
         };
         let locks = self.picture.locks(id);
-        let Some(coverage) = paint::stroke_coverage(points, brush) else {
+        let clip = self.picture.bounds();
+        let Some(coverage) = paint::stroke_coverage_within(points, brush, clip) else {
             return Ok(());
         };
-        let clip = self.picture.bounds();
         let wanted = coverage.rect.intersect(&clip);
         if wanted.is_empty() {
             return Ok(());
@@ -304,6 +354,83 @@ impl Doc {
         }
         self.commit(changes, None);
         Ok(())
+    }
+
+    /// Paints the newest points of a stroke still being drawn, exactly as
+    /// the finished stroke will paint them, with no step of history: `from`
+    /// is how many points came before. Each pixel keeps the most coverage
+    /// any piece of the stroke gave it, and is painted again from the
+    /// layer as it was before the stroke, so pieces never build up.
+    pub fn paint_live(&mut self, from: usize, points: &[[f64; 3]], brush: &Brush) {
+        if points.is_empty() {
+            return;
+        }
+        if from == 0 {
+            self.end_live();
+            self.finish_edit();
+            if self.paint_refusal(brush.erase).is_some() {
+                return;
+            }
+            let Some(id) = self.active else {
+                return;
+            };
+            let Some(before) = self.picture.pixels.get(&id).cloned() else {
+                return;
+            };
+            let offset = self.picture.find(id).map_or([0, 0], |node| node.offset);
+            let size = self.picture.width as usize * self.picture.height as usize;
+            let empty = Rect::new(0, 0, 0, 0);
+            self.live = Some(Live { id, brush: *brush, points: Vec::new(), before, offset, coverage: vec![0.0; size], painted: empty, wanted: empty });
+        }
+        let clip = self.picture.bounds();
+        let width = self.picture.width as usize;
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if live.points.len() != from || live.brush != *brush || self.active != Some(live.id) {
+            return;
+        }
+        // The pieces the new points add, joined to the last point painted,
+        // raise the stroke's coverage so far, kept for the whole picture.
+        let start = from.saturating_sub(1);
+        live.points.extend_from_slice(points);
+        let layer = Rect::new(live.offset[0], live.offset[1], live.before.width as i32, live.before.height as i32);
+        if let Some(bounds) = paint::stroke_bounds(&live.points[start..], brush) {
+            live.wanted = live.wanted.union(&bounds.intersect(&clip));
+        }
+        let area = paint::cover(&live.points[start..], brush, clip, layer, &mut live.coverage);
+        if area.is_empty() {
+            return;
+        }
+        let mut values = Vec::with_capacity(area.w as usize * area.h as usize);
+        for y in area.y..area.bottom() {
+            let row = y as usize * width + area.x as usize;
+            values.extend_from_slice(&live.coverage[row..row + area.w as usize]);
+        }
+        let keep_alpha = self.picture.locks(live.id).keeps_alpha();
+        let Some(pixels) = self.picture.pixels.get_mut(&live.id) else {
+            return;
+        };
+        let local = Rect::new(area.x - live.offset[0], area.y - live.offset[1], area.w, area.h);
+        pixels.write(local, &live.before.read(local));
+        let coverage = paint::Coverage { rect: area, values };
+        paint::apply(pixels, live.offset, &coverage, clip, self.selection.as_ref(), brush, keep_alpha);
+        live.painted = live.painted.union(&area);
+        self.touch(area);
+    }
+
+    /// Takes the stroke being drawn off its layer, if there is one.
+    pub fn end_live(&mut self) {
+        let Some(live) = self.live.take() else {
+            return;
+        };
+        let local = Rect::new(live.painted.x - live.offset[0], live.painted.y - live.offset[1], live.painted.w, live.painted.h);
+        if let Some(pixels) = self.picture.pixels.get_mut(&live.id)
+            && !local.is_empty()
+        {
+            pixels.write(local, &live.before.read(local));
+            self.touch(live.painted);
+        }
     }
 
     /// Why a brush, or the eraser with `erase`, cannot paint on the active
@@ -823,6 +950,49 @@ mod tests {
         assert!(doc.selection.is_none());
         assert!(doc.redo() && doc.redo());
         assert_eq!(doc.composite(), &after[..]);
+    }
+
+    /// Catches a stroke that looks different while it is drawn than when it
+    /// is laid, or that builds up where its parts meet: a soft, see-through
+    /// stroke crossing itself, painted part by part as the host sends it,
+    /// is byte for byte the same stroke painted at once, one undo step, and
+    /// the composite tells only the part it changed. Let go with Escape, it
+    /// leaves nothing.
+    #[test]
+    fn a_stroke_painted_as_it_is_drawn_is_the_stroke_laid() {
+        let soft = Brush { size: 14.0, hardness: 0.2, opacity: 0.5, ..brush() };
+        let points: Vec<[f64; 3]> = (0..40)
+            .map(|i| {
+                let t = f64::from(i) / 39.0 * std::f64::consts::TAU;
+                [40.0 + 25.0 * t.sin(), 30.0 + 18.0 * (2.0 * t).sin(), 1.0]
+            })
+            .collect();
+        let mut whole = Doc::new(Picture::blank(80, 60));
+        whole.stroke(&points, &soft).unwrap();
+        let laid = whole.composite().to_vec();
+
+        let mut doc = Doc::new(Picture::blank(80, 60));
+        let original = doc.composite().to_vec();
+        doc.take_changed();
+        let mut sent = 0;
+        for chunk in points.chunks(7) {
+            doc.paint_live(sent, chunk, &soft);
+            sent += chunk.len();
+        }
+        assert_eq!(doc.composite(), &laid[..], "the stroke drawn differs from the stroke laid");
+        let changed = doc.take_changed().expect("the stroke changed nothing");
+        assert!(changed.w < 80 && changed.h < 60, "the whole picture was sent again: {changed:?}");
+        doc.stroke(&points, &soft).unwrap();
+        assert_eq!(doc.composite(), &laid[..], "letting go changed the stroke");
+        assert!(doc.undo());
+        assert_eq!(doc.composite(), &original[..], "the stroke was more than one step");
+        assert!(!doc.can_undo());
+
+        doc.paint_live(0, &points, &soft);
+        assert_ne!(doc.composite(), &original[..]);
+        doc.end_live();
+        assert_eq!(doc.composite(), &original[..], "a stroke let go stayed on the picture");
+        assert!(!doc.can_undo());
     }
 
     /// Catches each lock not refusing what it locks, and refusing what it

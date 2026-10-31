@@ -16,3 +16,12 @@ members = [
 # closes the window's Wayland connection. See host/vendor/octotablet/PATCHED.md.
 [patch.crates-io]
 octotablet = { path = "host/vendor/octotablet" }
+
+# Pictures are composited and painted pixel by pixel, which an unoptimised
+# build does twenty times slower: everyday builds are optimised, and keep
+# their debug checks.
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 3

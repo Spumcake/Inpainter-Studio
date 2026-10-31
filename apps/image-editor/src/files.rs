@@ -10,14 +10,43 @@ use std::path::{Path, PathBuf};
 
 /// The first line of every `.ipx` file.
 const MAGIC: &[u8] = b"IPX1\n";
-const VERSION: u32 = 1;
+/// Version 2 holds a gallery of pictures; version 1, from 0.10, one.
+const VERSION: u32 = 2;
 /// The largest picture read or made: about 100 megapixels, so a damaged or
 /// huge file cannot take all the memory.
 const MOST_PIXELS: u64 = 100_000_000;
 
+/// Only the version, read first to know which header follows.
+#[derive(Deserialize)]
+struct Version {
+    version: u32,
+}
+
+/// Version 1's header: one picture.
+#[derive(Serialize, Deserialize)]
+struct HeaderV1 {
+    version: u32,
+    width: u32,
+    height: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active: Option<u64>,
+    /// Bottom to top.
+    layers: Vec<NodeFile>,
+}
+
+/// Version 2's header: every picture of the gallery, in order, and which
+/// is shown.
 #[derive(Serialize, Deserialize)]
 struct Header {
     version: u32,
+    #[serde(default)]
+    shown: usize,
+    pictures: Vec<PictureFile>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PictureFile {
+    name: String,
     width: u32,
     height: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -46,10 +75,26 @@ struct NodeFile {
     children: Option<Vec<NodeFile>>,
 }
 
-/// An image read from its file, and its active layer.
-pub struct Read {
+/// One picture read from a file: its name, layers, and active layer.
+pub struct ReadPicture {
+    pub name: String,
     pub picture: Picture,
     pub active: Option<u64>,
+}
+
+/// A gallery read from its file, never empty, and which picture is shown.
+pub struct Read {
+    pub pictures: Vec<ReadPicture>,
+    pub shown: usize,
+}
+
+/// One picture to write: its name, layers, active layer, and the layers
+/// already encoded for it.
+pub struct Writing<'a> {
+    pub name: &'a str,
+    pub picture: &'a Picture,
+    pub active: Option<u64>,
+    pub cache: &'a mut PngCache,
 }
 
 /// Encoded layers kept by layer id and the bytes they were made from, so a
@@ -72,19 +117,24 @@ fn fingerprint(pixels: &Pixels) -> u64 {
     hash
 }
 
-pub fn write_ipx(path: &Path, picture: &Picture, active: Option<u64>, cache: &mut PngCache) -> Result<(), String> {
+/// Writes a gallery: every picture in order, and which is shown.
+pub fn write_ipx(path: &Path, pictures: Vec<Writing>, shown: usize) -> Result<(), String> {
     let mut blobs: Vec<u8> = Vec::new();
-    let mut layers = Vec::new();
-    for node in &picture.nodes {
-        layers.push(node_file(node, picture, cache, &mut blobs)?);
+    let mut files = Vec::new();
+    for writing in pictures {
+        let mut layers = Vec::new();
+        for node in &writing.picture.nodes {
+            layers.push(node_file(node, writing.picture, writing.cache, &mut blobs)?);
+        }
+        files.push(PictureFile {
+            name: writing.name.to_string(),
+            width: writing.picture.width,
+            height: writing.picture.height,
+            active: writing.active,
+            layers,
+        });
     }
-    let header = Header {
-        version: VERSION,
-        width: picture.width,
-        height: picture.height,
-        active,
-        layers,
-    };
+    let header = Header { version: VERSION, shown, pictures: files };
     let mut bytes = MAGIC.to_vec();
     bytes.extend(serde_json::to_vec(&header).map_err(|error| error.to_string())?);
     bytes.push(b'\n');
@@ -145,33 +195,60 @@ pub fn read_ipx(path: &Path) -> Result<Read, String> {
     let damaged = || String::from("It is not an image file, or it is damaged.");
     let rest = bytes.strip_prefix(MAGIC).ok_or_else(damaged)?;
     let end = rest.iter().position(|byte| *byte == b'\n').ok_or_else(damaged)?;
-    let header: Header = serde_json::from_slice(&rest[..end]).map_err(|_| damaged())?;
-    if header.version != VERSION {
-        return Err(format!(
-            "It is version {} of an image file, and this Image Editor reads version {VERSION}.",
-            header.version
-        ));
+    let line = &rest[..end];
+    let blobs = &rest[end + 1..];
+    let version: Version = serde_json::from_slice(line).map_err(|_| damaged())?;
+    match version.version {
+        // 0.10's file: a gallery of one, named as the file is.
+        1 => {
+            let header: HeaderV1 = serde_json::from_slice(line).map_err(|_| damaged())?;
+            let name = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .filter(|stem| !stem.is_empty())
+                .unwrap_or_else(|| String::from(crate::session::UNTITLED));
+            let file = PictureFile { name, width: header.width, height: header.height, active: header.active, layers: header.layers };
+            Ok(Read { pictures: vec![read_picture(file, blobs)?], shown: 0 })
+        }
+        VERSION => {
+            let header: Header = serde_json::from_slice(line).map_err(|_| damaged())?;
+            let mut pictures = Vec::new();
+            for file in header.pictures {
+                pictures.push(read_picture(file, blobs)?);
+            }
+            if pictures.is_empty() {
+                return Err(damaged());
+            }
+            let shown = header.shown.min(pictures.len() - 1);
+            Ok(Read { pictures, shown })
+        }
+        other => Err(format!(
+            "It is version {other} of an image file, and this Image Editor reads versions 1 and {VERSION}."
+        )),
     }
-    if header.width == 0 || header.height == 0 || u64::from(header.width) * u64::from(header.height) > MOST_PIXELS {
+}
+
+fn read_picture(file: PictureFile, blobs: &[u8]) -> Result<ReadPicture, String> {
+    let damaged = || String::from("It is not an image file, or it is damaged.");
+    if file.width == 0 || file.height == 0 || u64::from(file.width) * u64::from(file.height) > MOST_PIXELS {
         return Err(damaged());
     }
-    let blobs = &rest[end + 1..];
     let mut picture = Picture {
-        width: header.width,
-        height: header.height,
+        width: file.width,
+        height: file.height,
         nodes: Vec::new(),
         pixels: HashMap::new(),
         next_id: 1,
     };
-    for layer in header.layers {
+    for layer in file.layers {
         let node = read_node(layer, blobs, &mut picture)?;
         picture.nodes.push(node);
     }
     if picture.nodes.is_empty() {
         return Err(damaged());
     }
-    let active = header.active.filter(|id| picture.find(*id).is_some());
-    Ok(Read { picture, active })
+    let active = file.active.filter(|id| picture.find(*id).is_some());
+    Ok(ReadPicture { name: file.name, picture, active })
 }
 
 fn read_node(file: NodeFile, blobs: &[u8], picture: &mut Picture) -> Result<Node, String> {
@@ -390,15 +467,64 @@ mod tests {
         folder.locks.all = true;
         folder.opacity = 0.75;
         picture.nodes.push(folder);
+        // A gallery of three: the grouped picture, a plain one of another
+        // size, and one painted red, shown second.
+        let plain = Picture::blank(12, 40);
+        let mut red = Picture::blank(5, 5);
+        let red_id = red.nodes[0].id;
+        red.pixels.insert(red_id, Pixels::filled(5, 5, [255, 0, 0, 255]));
         let path = dir.join("Round.ipx");
-        write_ipx(&path, &picture, Some(a), &mut PngCache::default()).unwrap();
+        let mut caches = [PngCache::default(), PngCache::default(), PngCache::default()];
+        let [first_cache, second_cache, third_cache] = &mut caches;
+        let writing = vec![
+            Writing { name: "Speckles", picture: &picture, active: Some(a), cache: first_cache },
+            Writing { name: "Tall", picture: &plain, active: None, cache: second_cache },
+            Writing { name: "Red", picture: &red, active: Some(red_id), cache: third_cache },
+        ];
+        write_ipx(&path, writing, 1).unwrap();
         assert!(is_ipx(&path));
         let read = read_ipx(&path).unwrap();
-        assert_eq!(read.active, Some(a));
-        assert_eq!((read.picture.width, read.picture.height), (30, 20));
-        assert_eq!(read.picture.nodes, picture.nodes);
-        assert_eq!(read.picture.pixels, picture.pixels);
-        assert!(read.picture.next_id > group);
+        assert_eq!(read.shown, 1);
+        let names: Vec<&str> = read.pictures.iter().map(|read| read.name.as_str()).collect();
+        assert_eq!(names, ["Speckles", "Tall", "Red"]);
+        let first = &read.pictures[0];
+        assert_eq!(first.active, Some(a));
+        assert_eq!((first.picture.width, first.picture.height), (30, 20));
+        assert_eq!(first.picture.nodes, picture.nodes);
+        assert_eq!(first.picture.pixels, picture.pixels);
+        assert!(first.picture.next_id > group);
+        for (got, want) in read.pictures[1..].iter().zip([&plain, &red]) {
+            assert_eq!((got.picture.width, got.picture.height), (want.width, want.height));
+            assert_eq!(got.picture.nodes, want.nodes);
+            assert_eq!(got.picture.pixels, want.pixels, "a picture's pixels came back as another's");
+        }
+        assert_eq!(read.pictures[2].active, Some(red_id));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Catches a 0.10 file that no longer opens: version 1, one picture, opens
+    /// as a gallery of one named as its file is, with its pixels.
+    #[test]
+    fn a_version_1_file_opens_as_one_picture() {
+        let dir = scratch("v1");
+        let mut picture = Picture::blank(6, 4);
+        let id = picture.nodes[0].id;
+        picture.pixels.insert(id, Pixels::filled(6, 4, [9, 8, 7, 255]));
+        let mut blobs = Vec::new();
+        let layers = vec![node_file(&picture.nodes[0], &picture, &mut PngCache::default(), &mut blobs).unwrap()];
+        let header = HeaderV1 { version: 1, width: 6, height: 4, active: Some(id), layers };
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend(serde_json::to_vec(&header).unwrap());
+        bytes.push(b'\n');
+        bytes.extend(blobs);
+        let path = dir.join("Old Beach.ipx");
+        std::fs::write(&path, bytes).unwrap();
+        let read = read_ipx(&path).unwrap();
+        assert_eq!(read.pictures.len(), 1);
+        assert_eq!(read.shown, 0);
+        assert_eq!(read.pictures[0].name, "Old Beach");
+        assert_eq!(read.pictures[0].active, Some(id));
+        assert_eq!(read.pictures[0].picture.pixels, picture.pixels);
         let _ = std::fs::remove_dir_all(dir);
     }
 

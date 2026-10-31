@@ -355,6 +355,7 @@ fn picture_row(
                 thumbnail.width,
                 thumbnail.height,
                 thumbnail.revision,
+                None,
             ) {
                 Some((texture, opaque)) => {
                     if !opaque {

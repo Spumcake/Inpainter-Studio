@@ -419,6 +419,11 @@ impl Doc {
         self.touch(area);
     }
 
+    /// A stroke is being drawn on it.
+    pub fn drawing(&self) -> bool {
+        self.live.is_some()
+    }
+
     /// Takes the stroke being drawn off its layer, if there is one.
     pub fn end_live(&mut self) {
         let Some(live) = self.live.take() else {

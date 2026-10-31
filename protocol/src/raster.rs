@@ -53,10 +53,17 @@ pub struct RasterView {
 
 /// What changed since an earlier revision: `[x, y, width, height]` in
 /// picture pixels.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RasterPatch {
     pub since: u64,
     pub rect: [u32; 4],
+    /// While a change is still being made, such as a stroke being drawn,
+    /// its rows are in a file of their own, `width × height × 4` bytes as
+    /// the picture's are, and the picture file is not written for this
+    /// revision. A host that does not hold `since` keeps what it shows
+    /// until a view comes without a file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 /// A gallery's filmstrip: every picture in the tab, the one shown outlined
@@ -178,7 +185,7 @@ mod tests {
             height: 1080,
             picture: "/tmp/1.rgba".into(),
             revision: 3,
-            patch: Some(RasterPatch { since: 2, rect: [1, 2, 3, 4] }),
+            patch: Some(RasterPatch { since: 2, rect: [1, 2, 3, 4], file: Some("/tmp/1-2.patch".into()) }),
             tool: RasterTool::Brush { rgb: [20, 20, 22], size: 24.0, hardness: 0.8, opacity: 1.0, pressure: true },
             selection: vec![vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]]],
             crop: Some([1.0, 2.0, 3.0, 4.0]),

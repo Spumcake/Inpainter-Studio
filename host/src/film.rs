@@ -341,7 +341,7 @@ impl Strip {
 /// with a hairline otherwise.
 fn paint_thumb(ui: &egui::Ui, painter: &egui::Painter, place: Rect, item: &FilmItem, shown: bool) {
     let thumbnail = &item.thumbnail;
-    match crate::raster::raw_picture(ui.ctx(), &thumbnail.path, thumbnail.width, thumbnail.height, thumbnail.revision, None) {
+    match crate::raster::raw_picture(ui.ctx(), &thumbnail.path, thumbnail.width, thumbnail.height, thumbnail.revision, &[], false) {
         Some((texture, opaque)) => {
             if !opaque {
                 crate::raster::checker(ui.ctx(), painter, place);

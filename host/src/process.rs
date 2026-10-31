@@ -52,7 +52,14 @@ pub struct RasterDisplay {
     /// Counts the views this tab has received, so a preview held for a sent
     /// gesture ends when the answer arrives.
     pub version: u64,
+    /// The changes the latest views brought, oldest first, each with its
+    /// picture file and revision, so none is lost when several views come
+    /// between two frames.
+    pub patches: Vec<(String, u64, protocol::RasterPatch)>,
 }
+
+/// How many of a tab's latest changes are kept for its picture.
+const KEPT_PATCHES: usize = 64;
 
 /// A file dialog a sub-application asked for.
 pub struct FileRequest {
@@ -494,8 +501,14 @@ impl Running {
             // The camera a view carries is taken only when a picture is
             // opened or made; otherwise the host's own camera stays.
             AppMessage::Raster(view) => {
-                let previous = declared.rasters.remove(&view.tab);
+                let mut previous = declared.rasters.remove(&view.tab);
                 let version = previous.as_ref().map_or(1, |previous| previous.version + 1);
+                let mut patches = previous.as_mut().map(|previous| std::mem::take(&mut previous.patches)).unwrap_or_default();
+                if let Some(patch) = &view.patch {
+                    patches.push((view.picture.clone(), view.revision, patch.clone()));
+                    let over = patches.len().saturating_sub(KEPT_PATCHES);
+                    patches.drain(..over);
+                }
                 let camera = match (&view.camera, previous) {
                     (Some(camera), _) => Some(Camera {
                         origin: camera.origin,
@@ -510,6 +523,7 @@ impl Running {
                         view,
                         camera,
                         version,
+                        patches,
                     },
                 );
             }

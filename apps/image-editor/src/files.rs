@@ -88,20 +88,78 @@ pub struct Read {
     pub shown: usize,
 }
 
-/// One picture to write: its name, layers, active layer, and the layers
-/// already encoded for it.
-pub struct Writing<'a> {
-    pub name: &'a str,
-    pub picture: &'a Picture,
-    pub active: Option<u64>,
-    pub cache: &'a mut PngCache,
-}
+/// An encoded layer, shared by a picture's cache and the writes using it.
+pub type Png = std::sync::Arc<Vec<u8>>;
 
-/// Encoded layers kept by layer id and the bytes they were made from, so a
-/// file written again encodes only the layers that changed.
+/// Encoded layers kept by layer id and the fingerprint of the pixels they
+/// were made from, so a file written again encodes only the layers that
+/// changed; and the document's edits when they were made, so a picture
+/// unchanged since is not looked at again.
 #[derive(Default)]
 pub struct PngCache {
-    layers: HashMap<u64, (u64, Vec<u8>)>,
+    layers: HashMap<u64, (u64, Png)>,
+    made_at: Option<u64>,
+}
+
+impl PngCache {
+    /// Keeps what a write encoded for this picture.
+    pub fn keep(&mut self, encoded: Encoded) {
+        self.layers = encoded.layers;
+        self.made_at = Some(encoded.edits);
+    }
+}
+
+/// One layer as a write takes it: its pixels to look at, or none when its
+/// picture has not changed since it was encoded; and what was encoded for
+/// it last.
+struct LayerSnapshot {
+    pixels: Option<Pixels>,
+    kept: Option<(u64, Png)>,
+}
+
+/// One picture to write, owned, so the writer's thread can write it while
+/// the picture is worked on.
+pub struct Snapshot {
+    /// The picture's number in its tab, to give its encoded layers back.
+    pub uid: u64,
+    name: String,
+    width: u32,
+    height: u32,
+    active: Option<u64>,
+    nodes: Vec<Node>,
+    layers: HashMap<u64, LayerSnapshot>,
+    edits: u64,
+}
+
+impl Snapshot {
+    /// The picture as it is: its layers' pixels copied, but only when the
+    /// document changed since its layers were encoded.
+    pub fn take(uid: u64, name: &str, picture: &Picture, active: Option<u64>, edits: u64, cache: &PngCache) -> Self {
+        let unchanged = cache.made_at == Some(edits);
+        let mut layers = HashMap::new();
+        for id in picture.all_layers() {
+            let kept = cache.layers.get(&id).cloned();
+            let pixels = if unchanged && kept.is_some() { None } else { picture.pixels.get(&id).cloned() };
+            layers.insert(id, LayerSnapshot { pixels, kept });
+        }
+        Self {
+            uid,
+            name: name.to_string(),
+            width: picture.width,
+            height: picture.height,
+            active,
+            nodes: picture.nodes.clone(),
+            layers,
+            edits,
+        }
+    }
+}
+
+/// What a write encoded for one picture, for its cache.
+pub struct Encoded {
+    pub uid: u64,
+    edits: u64,
+    layers: HashMap<u64, (u64, Png)>,
 }
 
 /// A fingerprint of a layer's pixels: cheap next to encoding them.
@@ -117,32 +175,31 @@ fn fingerprint(pixels: &Pixels) -> u64 {
     hash
 }
 
-/// Writes a gallery: every picture in order, and which is shown.
-pub fn write_ipx(path: &Path, pictures: Vec<Writing>, shown: usize) -> Result<(), String> {
+/// Writes a gallery: every picture in order, and which is shown. Returns
+/// what was encoded for each picture.
+pub fn write_ipx(path: &Path, pictures: Vec<Snapshot>, shown: usize) -> Result<Vec<Encoded>, String> {
     let mut blobs: Vec<u8> = Vec::new();
     let mut files = Vec::new();
-    for writing in pictures {
+    let mut encoded = Vec::new();
+    for picture in pictures {
+        let mut made = HashMap::new();
         let mut layers = Vec::new();
-        for node in &writing.picture.nodes {
-            layers.push(node_file(node, writing.picture, writing.cache, &mut blobs)?);
+        for node in &picture.nodes {
+            layers.push(node_file(node, &picture.layers, &mut made, &mut blobs)?);
         }
-        files.push(PictureFile {
-            name: writing.name.to_string(),
-            width: writing.picture.width,
-            height: writing.picture.height,
-            active: writing.active,
-            layers,
-        });
+        files.push(PictureFile { name: picture.name, width: picture.width, height: picture.height, active: picture.active, layers });
+        encoded.push(Encoded { uid: picture.uid, edits: picture.edits, layers: made });
     }
     let header = Header { version: VERSION, shown, pictures: files };
     let mut bytes = MAGIC.to_vec();
     bytes.extend(serde_json::to_vec(&header).map_err(|error| error.to_string())?);
     bytes.push(b'\n');
     bytes.extend(blobs);
-    write_atomic(path, &bytes)
+    write_atomic(path, &bytes)?;
+    Ok(encoded)
 }
 
-fn node_file(node: &Node, picture: &Picture, cache: &mut PngCache, blobs: &mut Vec<u8>) -> Result<NodeFile, String> {
+fn node_file(node: &Node, layers: &HashMap<u64, LayerSnapshot>, made: &mut HashMap<u64, (u64, Png)>, blobs: &mut Vec<u8>) -> Result<NodeFile, String> {
     let mut file = NodeFile {
         id: node.id,
         name: node.name.clone(),
@@ -159,23 +216,26 @@ fn node_file(node: &Node, picture: &Picture, cache: &mut PngCache, blobs: &mut V
         Some(children) => {
             let mut inner = Vec::new();
             for child in children {
-                inner.push(node_file(child, picture, cache, blobs)?);
+                inner.push(node_file(child, layers, made, blobs)?);
             }
             file.children = Some(inner);
         }
         None => {
-            let pixels = picture.pixels.get(&node.id).ok_or_else(|| format!("Layer {} has no pixels.", node.id))?;
-            let print = fingerprint(pixels);
-            let png = match cache.layers.get(&node.id) {
-                Some((kept, png)) if *kept == print => png.clone(),
-                _ => {
-                    let png = encode_png(pixels.width, pixels.height, &pixels.data)?;
-                    cache.layers.insert(node.id, (print, png.clone()));
-                    png
+            let layer = layers.get(&node.id).ok_or_else(|| format!("Layer {} has no pixels.", node.id))?;
+            let (print, png) = match (&layer.pixels, &layer.kept) {
+                (None, Some(kept)) => kept.clone(),
+                (Some(pixels), kept) => {
+                    let print = fingerprint(pixels);
+                    match kept {
+                        Some((kept, png)) if *kept == print => (print, png.clone()),
+                        _ => (print, Png::new(encode_png(pixels.width, pixels.height, &pixels.data)?)),
+                    }
                 }
+                (None, None) => return Err(format!("Layer {} has no pixels.", node.id)),
             };
             file.png = Some([blobs.len() as u64, png.len() as u64]);
-            blobs.extend(png);
+            blobs.extend_from_slice(&png);
+            made.insert(node.id, (print, png));
         }
     }
     Ok(file)
@@ -474,12 +534,11 @@ mod tests {
         let red_id = red.nodes[0].id;
         red.pixels.insert(red_id, Pixels::filled(5, 5, [255, 0, 0, 255]));
         let path = dir.join("Round.ipx");
-        let mut caches = [PngCache::default(), PngCache::default(), PngCache::default()];
-        let [first_cache, second_cache, third_cache] = &mut caches;
+        let none = PngCache::default();
         let writing = vec![
-            Writing { name: "Speckles", picture: &picture, active: Some(a), cache: first_cache },
-            Writing { name: "Tall", picture: &plain, active: None, cache: second_cache },
-            Writing { name: "Red", picture: &red, active: Some(red_id), cache: third_cache },
+            Snapshot::take(1, "Speckles", &picture, Some(a), 0, &none),
+            Snapshot::take(2, "Tall", &plain, None, 0, &none),
+            Snapshot::take(3, "Red", &red, Some(red_id), 0, &none),
         ];
         write_ipx(&path, writing, 1).unwrap();
         assert!(is_ipx(&path));
@@ -511,7 +570,8 @@ mod tests {
         let id = picture.nodes[0].id;
         picture.pixels.insert(id, Pixels::filled(6, 4, [9, 8, 7, 255]));
         let mut blobs = Vec::new();
-        let layers = vec![node_file(&picture.nodes[0], &picture, &mut PngCache::default(), &mut blobs).unwrap()];
+        let snapshot = Snapshot::take(1, "Old Beach", &picture, Some(id), 0, &PngCache::default());
+        let layers = vec![node_file(&picture.nodes[0], &snapshot.layers, &mut HashMap::new(), &mut blobs).unwrap()];
         let header = HeaderV1 { version: 1, width: 6, height: 4, active: Some(id), layers };
         let mut bytes = MAGIC.to_vec();
         bytes.extend(serde_json::to_vec(&header).unwrap());

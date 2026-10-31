@@ -480,7 +480,7 @@ impl Pointer {
         let picture = picture_rect(&camera, rect, view);
         // The picture, then a border around it, as the owner set on
         // 2026-10-30, so a white picture stands apart from the grey.
-        match raw_picture(ui.ctx(), &view.picture, view.width, view.height, view.revision, view.patch) {
+        match raw_picture(ui.ctx(), &view.picture, view.width, view.height, view.revision, &display.patches, view.patch.as_ref().is_some_and(|patch| patch.file.is_some())) {
             Some((texture, opaque)) => {
                 if !opaque {
                     checker(ui.ctx(), &painter, picture);
@@ -875,51 +875,71 @@ struct Loaded {
 const FORGET_AFTER: u64 = 600;
 
 /// A file of raw RGBA, `width × height × 4` bytes with straight alpha, as a
-/// texture, read again when `revision` changes: only the rows of `patch`
-/// when the texture holds the revision it starts from. A file of any other
-/// length is not whole yet: the last texture is kept and the file is tried
-/// again on a later frame. Returns the texture and whether every pixel is
-/// opaque.
+/// texture, read again when `revision` changes. `patches` are the changes
+/// the views brought, oldest first, each with its picture and revision: the
+/// texture takes each that follows what it holds, reading only its rows.
+/// While the view's own change is still being made (`making`), its rows in
+/// a file of their own, the picture file is older than the view: a texture
+/// that cannot follow keeps what it shows rather than read it whole. A
+/// picture file of the wrong length is not whole yet: the last texture is
+/// kept and the file is tried again on a later frame. Returns the texture
+/// and whether every pixel is opaque.
 pub(crate) fn raw_picture(
     ctx: &egui::Context,
     path: &str,
     width: u32,
     height: u32,
     revision: u64,
-    patch: Option<RasterPatch>,
+    patches: &[(String, u64, RasterPatch)],
+    making: bool,
 ) -> Option<(egui::TextureId, bool)> {
     let id = egui::Id::new("raster-pictures");
     let pass = ctx.cumulative_pass_nr();
-    let known: Option<Loaded> = ctx.data(|data| data.get_temp::<HashMap<String, Loaded>>(id).and_then(|cache| cache.get(path).cloned()));
-    let current = known.as_ref().is_some_and(|known| known.revision == revision && known.size == [width, height]);
-    let patched = match (&known, patch) {
-        (Some(known), Some(patch)) if !current && known.revision == patch.since && known.size == [width, height] => {
-            read_patch(ctx, path, width, height, patch.rect).map(|(at, image, opaque)| {
-                known.texture.clone().set_partial(at, image, picture_options());
-                Loaded { revision, opaque: known.opaque && opaque, ..known.clone() }
-            })
-        }
-        _ => None,
-    };
-    let loaded = if current {
-        known
-    } else if patched.is_some() {
-        patched
-    } else {
-        match read_raw(ctx, path, width, height) {
-            Some((image, opaque)) => Some(Loaded {
-                revision,
-                size: [width, height],
-                texture: ctx.load_texture(format!("raster:{path}"), image, picture_options()),
-                opaque,
-                used: pass,
-            }),
-            None => {
-                ctx.request_repaint_after(Duration::from_millis(100));
-                known
+    let known: Option<Loaded> = ctx
+        .data(|data| data.get_temp::<HashMap<String, Loaded>>(id).and_then(|cache| cache.get(path).cloned()))
+        .filter(|known| known.size == [width, height]);
+    let mut loaded = known.clone();
+    if let Some(known) = loaded.as_mut()
+        && known.revision != revision
+    {
+        for (picture, at, patch) in patches {
+            if picture != path || *at <= known.revision {
+                continue;
             }
+            if patch.since != known.revision {
+                break;
+            }
+            let rows = match &patch.file {
+                Some(file) => read_rows(ctx, file, width, height, patch.rect),
+                None => read_patch(ctx, picture, width, height, patch.rect),
+            };
+            let Some((corner, image, opaque)) = rows else {
+                break;
+            };
+            known.texture.set_partial(corner, image, picture_options());
+            known.revision = *at;
+            known.opaque &= opaque;
         }
-    };
+    }
+    let waiting = making;
+    let behind = loaded.as_ref().is_none_or(|loaded| loaded.revision != revision);
+    if behind && !(waiting && loaded.is_some()) {
+        match read_raw(ctx, path, width, height) {
+            // The picture file read while a change is still being made is
+            // older than the view: it is kept as no revision, so the view
+            // without a file reads it again.
+            Some((image, opaque)) => {
+                loaded = Some(Loaded {
+                    revision: if waiting { 0 } else { revision },
+                    size: [width, height],
+                    texture: ctx.load_texture(format!("raster:{path}"), image, picture_options()),
+                    opaque,
+                    used: pass,
+                });
+            }
+            None => ctx.request_repaint_after(Duration::from_millis(100)),
+        }
+    }
     let loaded = loaded?;
     let answer = (loaded.texture.id(), loaded.opaque);
     ctx.data_mut(|data| {
@@ -928,6 +948,24 @@ pub(crate) fn raw_picture(
         cache.retain(|_, picture| pass.saturating_sub(picture.used) < FORGET_AFTER);
     });
     Some(answer)
+}
+
+/// Reads a file holding only the rows of `rect`, `width × height × 4` bytes
+/// for the rect, with where they go in the texture.
+fn read_rows(ctx: &egui::Context, file: &str, width: u32, height: u32, rect: [u32; 4]) -> Option<([usize; 2], egui::ColorImage, bool)> {
+    if width.max(height) as usize > ctx.input(|input| input.max_texture_side) {
+        return None;
+    }
+    let [x, y, w, h] = rect.map(|value| value as usize);
+    if w == 0 || h == 0 || x + w > width as usize || y + h > height as usize {
+        return None;
+    }
+    let bytes = std::fs::read(file).ok()?;
+    if bytes.len() != w * h * 4 {
+        return None;
+    }
+    let opaque = bytes.chunks_exact(4).all(|pixel| pixel[3] == 255);
+    Some(([x, y], egui::ColorImage::from_rgba_unmultiplied([w, h], &bytes), opaque))
 }
 
 /// Pixels stay square when zoomed in, and blend smoothly when zoomed out.
@@ -1023,6 +1061,56 @@ pub(crate) fn checker(ctx: &egui::Context, painter: &egui::Painter, area: Rect) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Catches a change lost when two views come between frames, a picture
+    /// read whole for every change, and an older picture file shown as a
+    /// newer revision: two changes queued at once both reach the texture,
+    /// in order, as partial updates; one that does not follow what the
+    /// texture holds, while its change is still being made, is waited for.
+    #[test]
+    fn queued_changes_reach_the_texture_in_order() {
+        let dir = std::env::temp_dir().join(format!("inpainter-raster-patches-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let picture = dir.join("1-1.rgba").display().to_string();
+        std::fs::write(&picture, [255u8; 8 * 6 * 4]).unwrap();
+        let ctx = egui::Context::default();
+        let deltas = |ctx: &egui::Context| -> Vec<egui::epaint::ImageDelta> {
+            let mut delta = ctx.tex_manager().write().take_delta();
+            let set = delta.set.iter().flat_map(|(_, deltas)| deltas.iter().cloned()).collect();
+            delta.clear();
+            set
+        };
+        assert!(raw_picture(&ctx, &picture, 8, 6, 1, &[], false).is_some());
+        assert!(deltas(&ctx).iter().any(|delta| delta.pos.is_none()), "the picture was not read");
+
+        let mut patches = Vec::new();
+        for (revision, corner, colour) in [(2u64, [0u32, 0u32], [255u8, 0, 0, 255]), (3, [4, 4], [0, 0, 255, 255])] {
+            let file = dir.join(format!("1-1-{revision}.patch"));
+            std::fs::write(&file, colour.repeat(4)).unwrap();
+            let patch = RasterPatch { since: revision - 1, rect: [corner[0], corner[1], 2, 2], file: Some(file.display().to_string()) };
+            patches.push((picture.clone(), revision, patch));
+        }
+        assert!(raw_picture(&ctx, &picture, 8, 6, 3, &patches, true).is_some());
+        let set = deltas(&ctx);
+        let corners: Vec<Option<[usize; 2]>> = set.iter().map(|delta| delta.pos).collect();
+        assert_eq!(corners, vec![Some([0, 0]), Some([4, 4])], "the changes did not reach the texture in order, as parts");
+        let egui::ImageData::Color(first) = &set[0].image;
+        assert_eq!(first.pixels[0], Color32::from_rgb(255, 0, 0));
+
+        // The change made: the same revision, nothing more to read.
+        assert!(raw_picture(&ctx, &picture, 8, 6, 3, &patches, false).is_some());
+        assert!(deltas(&ctx).is_empty(), "a picture already shown was read again");
+
+        // A change that does not follow what the texture holds, while it is
+        // still being made, is waited for, not read from the older file.
+        let file = dir.join("1-1-9.patch");
+        std::fs::write(&file, [0u8; 16]).unwrap();
+        let stray = vec![(picture.clone(), 9, RasterPatch { since: 8, rect: [0, 0, 2, 2], file: Some(file.display().to_string()) })];
+        assert!(raw_picture(&ctx, &picture, 8, 6, 9, &stray, true).is_some(), "the picture shown was dropped");
+        assert!(deltas(&ctx).is_empty(), "an older picture file was read for a change still being made");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// A crop drag keeps the box on the picture, whichever way it goes, and
     /// an edge crossed over the other swaps them instead of turning negative.

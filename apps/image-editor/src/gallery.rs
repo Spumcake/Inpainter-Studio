@@ -27,6 +27,13 @@ pub struct Frame {
     /// The composite revision last written to this picture's file for the
     /// host, and the revision the host was told.
     pub written: Option<(u64, u64)>,
+    /// The picture file is older than the revision the host was told: a
+    /// stroke being drawn sent only its rows.
+    pub behind: bool,
+    /// The files of rows sent while a stroke was drawn, oldest first, and
+    /// the last change sent, sent again until the picture file catches up.
+    pub patches: std::collections::VecDeque<std::path::PathBuf>,
+    pub last_patch: Option<protocol::RasterPatch>,
     /// The filmstrip's thumbnail: the composite revision it was made from,
     /// its bytes, and where they are.
     pub film: Option<(u64, Vec<u8>, Thumbnail)>,
@@ -91,6 +98,9 @@ impl Gallery {
             host_camera: false,
             thumbs: HashMap::new(),
             written: None,
+            behind: false,
+            patches: std::collections::VecDeque::new(),
+            last_patch: None,
             film: None,
             pngs: PngCache::default(),
         }

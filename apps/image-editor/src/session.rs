@@ -22,6 +22,11 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// How many files of rows sent while a stroke is drawn are kept for each
+/// picture, for a host that falls behind; one that falls further waits for
+/// the stroke's end.
+const KEPT_PATCHES: usize = 32;
+
 /// How long a change waits before it is written, so a burst of edits is
 /// written once.
 const WRITE_AFTER: Duration = Duration::from_secs(1);
@@ -139,6 +144,8 @@ pub struct Image {
     /// last failed write, why and when.
     unwritten_since: Option<Instant>,
     write_failed: Option<(String, Instant)>,
+    /// Being written by the writer's thread: what the image was, and where.
+    saving: Option<(Signature, PathBuf)>,
     /// A camera to send with the next picture: the picture is new, opened,
     /// or newly shown.
     send_camera: bool,
@@ -202,6 +209,9 @@ pub struct Session {
     next_revision: u64,
     /// Points of a stroke were painted and the picture is not sent yet.
     live_due: bool,
+    /// The thread that writes images due inside a project, started with the
+    /// first.
+    writer: Option<Writer>,
     /// Tab ids still to ask about while quitting, after the one asked.
     quit_rest: Vec<String>,
     quitting: bool,
@@ -240,6 +250,7 @@ impl Session {
             next_file: 1,
             next_revision: seed,
             live_due: false,
+            writer: None,
             quit_rest: Vec::new(),
             quitting: false,
             closing: false,
@@ -306,6 +317,12 @@ impl Session {
                 }
                 self.cache = folder.join(".inpainter").join("cache").join("image-editor");
                 self.project = Some(folder);
+                // Rows a stroke left there in an earlier run are not needed.
+                for entry in std::fs::read_dir(&self.cache).into_iter().flatten().flatten() {
+                    if entry.path().extension().is_some_and(|extension| extension == "patch") {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
                 // Every picture is written again where the host now looks.
                 for image in &mut self.images {
                     for frame in &mut image.gallery.frames {
@@ -406,7 +423,7 @@ impl Session {
             }
             _ => {}
         }
-        if self.project.is_some() && self.write_due(Instant::now()) {
+        if self.finish_writes(false) {
             out.extend(self.declared());
         }
         out
@@ -415,10 +432,41 @@ impl Session {
     /// The loop's wake with no message: writes what is due inside a project,
     /// and sends what that changed, such as a tab's new name.
     pub fn tick(&mut self) -> Vec<AppMessage> {
-        if self.project.is_some() && self.write_due(Instant::now()) {
-            return self.declared();
+        let mut out = self.catch_up();
+        if self.project.is_some() {
+            self.write_due(Instant::now());
         }
-        Vec::new()
+        if self.finish_writes(false) {
+            out.extend(self.declared());
+        }
+        out
+    }
+
+    /// Writes whole every picture file a stroke left behind, while nothing
+    /// is being drawn, and tells the host the picture shown is whole again.
+    fn catch_up(&mut self) -> Vec<AppMessage> {
+        if self.images.iter().any(|image| image.gallery.frames.iter().any(|frame| frame.doc.drawing())) {
+            return Vec::new();
+        }
+        let cache = self.cache.clone();
+        let mut shown = false;
+        for (index, image) in self.images.iter_mut().enumerate() {
+            let shown_uid = image.frame().uid;
+            for frame in &mut image.gallery.frames {
+                if !frame.behind {
+                    continue;
+                }
+                let picture = cache.join(format!("{}-{}.rgba", image.id, frame.uid));
+                if files::write_atomic(&picture, frame.doc.composite()).is_ok() {
+                    caught_up(frame);
+                    shown |= index == self.active && frame.uid == shown_uid;
+                }
+            }
+        }
+        if !shown {
+            return Vec::new();
+        }
+        self.raster_view(self.active, false).map(AppMessage::Raster).into_iter().collect()
     }
 
     /// Inside a project, writes every image not yet written, as when the
@@ -479,6 +527,7 @@ impl Session {
             strip_focus: false,
             unwritten_since: None,
             write_failed: None,
+            saving: None,
             send_camera: true,
         });
         self.active = self.images.len() - 1;
@@ -906,7 +955,7 @@ impl Session {
         if !std::mem::take(&mut self.live_due) {
             return Vec::new();
         }
-        self.raster_view(self.active).map(AppMessage::Raster).into_iter().collect()
+        self.raster_view(self.active, true).map(AppMessage::Raster).into_iter().collect()
     }
 
     fn gesture(&mut self, gesture: RasterGesture) {
@@ -1103,10 +1152,10 @@ impl Session {
         }
     }
 
-    /// Writes every image whose change is a second old, and tries a failed
-    /// one again after a while. Returns whether any was written.
-    fn write_due(&mut self, now: Instant) -> bool {
-        let mut wrote = false;
+    /// Starts writing every image whose change is a second old, and tries a
+    /// failed one again after a while. The writer's thread encodes and
+    /// writes, so painting never waits for it.
+    fn write_due(&mut self, now: Instant) {
         for index in 0..self.images.len() {
             let image = &mut self.images[index];
             if !image.dirty {
@@ -1120,15 +1169,115 @@ impl Session {
             if image.write_failed.as_ref().is_some_and(|(_, failed)| now.duration_since(*failed) < RETRY_AFTER) {
                 continue;
             }
-            wrote |= self.write_into_project(index).is_ok();
+            self.start_write(index);
         }
-        wrote
+    }
+
+    /// Hands one image to the writer's thread: its pictures as they are now,
+    /// and the file it goes to. Not while it is being written already, or
+    /// while a stroke is drawn on it.
+    fn start_write(&mut self, index: usize) {
+        let Some(folder) = self.project.clone() else {
+            return;
+        };
+        // Nothing is copied for a write while a stroke is drawn anywhere.
+        if self.images.iter().any(|image| image.gallery.frames.iter().any(|frame| frame.doc.drawing())) {
+            return;
+        }
+        let taken: Vec<PathBuf> = self
+            .images
+            .iter()
+            .flat_map(|image| image.path.iter().chain(image.saving.as_ref().map(|(_, path)| path)))
+            .cloned()
+            .collect();
+        let Some(image) = self.images.get_mut(index) else {
+            return;
+        };
+        if image.saving.is_some() {
+            return;
+        }
+        let path = match &image.path {
+            Some(path) => path.clone(),
+            None => match free_names(&image.label)
+                .map(|name| folder.join(format!("{name}.ipx")))
+                .find(|path| !path.exists() && !taken.contains(path))
+            {
+                Some(path) => path,
+                None => return,
+            },
+        };
+        let (pictures, shown) = snapshot(&mut image.gallery);
+        let job = Job { tab: image.id.clone(), signature: signature(image), path: path.clone(), pictures, shown };
+        image.saving = Some((job.signature, path));
+        let writer = self.writer.get_or_insert_with(Writer::start);
+        if writer.jobs.send(job).is_ok() {
+            writer.waiting += 1;
+        } else if let Some(image) = self.images.get_mut(index) {
+            image.saving = None;
+        }
+    }
+
+    /// Takes the writer's finished writes, waiting for every one with
+    /// `block`, as a write that must come after them does. Returns whether
+    /// any finished.
+    fn finish_writes(&mut self, block: bool) -> bool {
+        let mut any = false;
+        loop {
+            let Some(writer) = self.writer.as_mut() else {
+                return any;
+            };
+            if writer.waiting == 0 {
+                return any;
+            }
+            let done = if block {
+                writer.done.recv().map_err(|_| true)
+            } else {
+                writer.done.try_recv().map_err(|error| error == std::sync::mpsc::TryRecvError::Disconnected)
+            };
+            let done = match done {
+                Ok(done) => done,
+                Err(false) => return any,
+                // The writer stopped: what it held is unwritten, and is tried
+                // again with a new one after a while.
+                Err(true) => {
+                    self.writer = None;
+                    for image in &mut self.images {
+                        if image.saving.take().is_some() {
+                            image.write_failed = Some(("The image could not be written.".into(), Instant::now()));
+                        }
+                    }
+                    return true;
+                }
+            };
+            writer.waiting -= 1;
+            any = true;
+            let Some(image) = self.images.iter_mut().find(|image| image.id == done.tab) else {
+                continue;
+            };
+            image.saving = None;
+            match done.result {
+                Ok(encoded) => {
+                    keep(&mut image.gallery, encoded);
+                    image.label = file_title(&done.path);
+                    image.path = Some(done.path);
+                    image.write_failed = None;
+                    // Changed while it was written: written again soon.
+                    if signature(image) == done.signature {
+                        image.dirty = false;
+                        image.unwritten_since = None;
+                    }
+                }
+                Err(reason) => image.write_failed = Some((reason, Instant::now())),
+            }
+        }
     }
 
     /// Writes one image into the project's folder: to its own file, or, for
     /// one never written, to a new file named after it that replaces
     /// nothing. Returns the file, or none for an untouched image.
     fn write_into_project(&mut self, index: usize) -> Result<Option<PathBuf>, String> {
+        // The writer's earlier writes land first, so none lands after this.
+        self.finish_writes(true);
         let Some(folder) = self.project.clone() else {
             return Err("No project folder.".into());
         };
@@ -1163,6 +1312,7 @@ impl Session {
 
     /// Outside a project: Save, or Save As, to `path`.
     fn write_at(&mut self, index: usize, path: &Path, then_quit: bool, out: &mut Vec<AppMessage>) {
+        self.finish_writes(true);
         let Some(image) = self.images.get_mut(index) else {
             return;
         };
@@ -1309,12 +1459,15 @@ impl Session {
             return Vec::new();
         }
         self.write_film(index);
-        let view = self.raster_view(index);
+        let view = self.raster_view(index, false);
         self.write_thumbnails(index);
         view.map(AppMessage::Raster).into_iter().collect()
     }
 
-    fn raster_view(&mut self, index: usize) -> Option<RasterView> {
+    /// The view of the picture shown. While a stroke is drawn (`live`), only
+    /// the rows it changed are written, to a file of their own; the picture
+    /// file is written whole at the next view that is not.
+    fn raster_view(&mut self, index: usize, live: bool) -> Option<RasterView> {
         let tool = self.raster_tool();
         let move_tool = self.tools.tool == ToolKind::Move;
         let crop_tool = self.tools.tool == ToolKind::Crop;
@@ -1335,13 +1488,54 @@ impl Session {
         let changed = frame.doc.take_changed();
         let mut patch = None;
         let revision = match frame.written {
-            Some((made, told)) if made == frame.doc.revision => told,
+            Some((made, told)) if made == frame.doc.revision => {
+                // Until the picture file catches up, when the program is
+                // idle, the host is told the picture is still being made.
+                if frame.behind {
+                    patch = frame.last_patch.clone();
+                }
+                told
+            }
             earlier => {
-                let _ = files::write_atomic(&picture, frame.doc.composite());
                 next += 1;
-                if let (Some((_, since)), Some(rect)) = (earlier, changed) {
-                    let rect = [rect.x.max(0) as u32, rect.y.max(0) as u32, rect.w.max(0) as u32, rect.h.max(0) as u32];
-                    patch = Some(protocol::RasterPatch { since, rect });
+                let rect = changed
+                    .map(|rect| [rect.x.max(0) as u32, rect.y.max(0) as u32, rect.w.max(0) as u32, rect.h.max(0) as u32])
+                    .filter(|rect| rect[2] > 0 && rect[3] > 0);
+                let rows = match (earlier, rect) {
+                    (Some((_, since)), Some(rect)) if live => {
+                        let path = cache.join(format!("{image_id}-{}-{next}.patch", frame.uid));
+                        let width = frame.doc.picture.width as usize;
+                        let composite = frame.doc.composite();
+                        let mut bytes = Vec::with_capacity(rect[2] as usize * rect[3] as usize * 4);
+                        for y in rect[1] as usize..(rect[1] + rect[3]) as usize {
+                            let start = (y * width + rect[0] as usize) * 4;
+                            bytes.extend_from_slice(&composite[start..start + rect[2] as usize * 4]);
+                        }
+                        files::write_atomic(&path, &bytes).ok().map(|()| (since, rect, path))
+                    }
+                    _ => None,
+                };
+                match rows {
+                    Some((since, rect, path)) => {
+                        patch = Some(protocol::RasterPatch { since, rect, file: Some(path.display().to_string()) });
+                        frame.last_patch = patch.clone();
+                        frame.behind = true;
+                        // The host reads each in turn; a few are kept for a
+                        // host that falls behind.
+                        frame.patches.push_back(path);
+                        while frame.patches.len() > KEPT_PATCHES {
+                            if let Some(old) = frame.patches.pop_front() {
+                                let _ = std::fs::remove_file(old);
+                            }
+                        }
+                    }
+                    None => {
+                        let _ = files::write_atomic(&picture, frame.doc.composite());
+                        caught_up(frame);
+                        if let (Some((_, since)), Some(rect)) = (earlier, rect) {
+                            patch = Some(protocol::RasterPatch { since, rect, file: None });
+                        }
+                    }
                 }
                 frame.written = Some((frame.doc.revision, next));
                 next
@@ -1591,20 +1785,96 @@ fn new_gallery() -> Gallery {
     Gallery::one(UNTITLED, new_doc())
 }
 
+/// The picture file holds the revision the host was told: the files of
+/// rows sent while a stroke was drawn are not needed any more. The host
+/// either holds that revision or reads the picture file whole.
+fn caught_up(frame: &mut Frame) {
+    frame.behind = false;
+    frame.last_patch = None;
+    for path in frame.patches.drain(..) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Writes a tab's gallery to its file, each held slider finished first.
 fn write_gallery(path: &Path, gallery: &mut Gallery) -> Result<(), String> {
-    let shown = gallery.shown;
-    let mut pictures = Vec::new();
-    for frame in &mut gallery.frames {
-        frame.doc.finish_edit();
-        pictures.push(files::Writing {
-            name: &frame.name,
-            picture: &frame.doc.picture,
-            active: frame.doc.active,
-            cache: &mut frame.pngs,
-        });
+    let (pictures, shown) = snapshot(gallery);
+    let encoded = files::write_ipx(path, pictures, shown)?;
+    keep(gallery, encoded);
+    Ok(())
+}
+
+/// A gallery's pictures as they are now, each held slider finished first,
+/// and which is shown.
+fn snapshot(gallery: &mut Gallery) -> (Vec<files::Snapshot>, usize) {
+    let pictures = gallery
+        .frames
+        .iter_mut()
+        .map(|frame| {
+            frame.doc.finish_edit();
+            files::Snapshot::take(frame.uid, &frame.name, &frame.doc.picture, frame.doc.active, frame.doc.edits, &frame.pngs)
+        })
+        .collect();
+    (pictures, gallery.shown)
+}
+
+/// Keeps what a write encoded, in each picture still in the gallery.
+fn keep(gallery: &mut Gallery, encoded: Vec<files::Encoded>) {
+    for encoded in encoded {
+        if let Some(frame) = gallery.frames.iter_mut().find(|frame| frame.uid == encoded.uid) {
+            frame.pngs.keep(encoded);
+        }
     }
-    files::write_ipx(path, pictures, shown)
+}
+
+/// What an image is, as far as its file goes: its gallery's changes, its
+/// pictures' changes, and the picture shown. A write made of an image with
+/// the same signature holds everything in it.
+type Signature = (u64, u64, u64);
+
+fn signature(image: &Image) -> Signature {
+    let edits = image.gallery.frames.iter().map(|frame| frame.doc.edits).sum();
+    (image.gallery.edits, edits, image.frame().uid)
+}
+
+/// The thread that writes images inside a project, one at a time and in
+/// order, so encoding and writing never hold up painting.
+struct Writer {
+    jobs: std::sync::mpsc::Sender<Job>,
+    done: std::sync::mpsc::Receiver<Done>,
+    /// Writes handed over and not yet taken back.
+    waiting: usize,
+}
+
+struct Job {
+    tab: String,
+    signature: Signature,
+    path: PathBuf,
+    pictures: Vec<files::Snapshot>,
+    shown: usize,
+}
+
+struct Done {
+    tab: String,
+    signature: Signature,
+    path: PathBuf,
+    result: Result<Vec<files::Encoded>, String>,
+}
+
+impl Writer {
+    fn start() -> Self {
+        let (jobs, incoming) = std::sync::mpsc::channel::<Job>();
+        let (finished, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for job in incoming {
+                let result = files::write_ipx(&job.path, job.pictures, job.shown);
+                if finished.send(Done { tab: job.tab, signature: job.signature, path: job.path, result }).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { jobs, done, waiting: 0 }
+    }
 }
 
 /// The commands that leave the keyboard with the filmstrip once it has it:
@@ -2121,6 +2391,86 @@ mod tests {
         assert_eq!(&red[..4], [220, 0, 0, 255], "the first thumbnail is not its picture");
         let white = std::fs::read(&film.items[1].thumbnail.path).unwrap();
         assert!(white.chunks(4).all(|pixel| pixel == [255, 255, 255, 255]));
+    }
+
+    /// Catches a stroke that writes the whole picture for every part, and
+    /// a picture file or row files left behind: while drawn, each view's
+    /// rows are a file of their own, holding the composite's rows, and the
+    /// picture file is untouched, even when the stroke ends; once idle, the
+    /// picture file is written whole under the revision the host already
+    /// shows, and the row files go.
+    #[test]
+    fn a_stroke_drawn_sends_only_its_rows_and_the_picture_catches_up() {
+        let mut session = Session::launch();
+        let first = last_raster(&session.greeting());
+        command(&mut session, "tool", json!({ "tool": "brush" }));
+        let tab = session.images[0].id.clone();
+        let before = std::fs::read(&first.picture).unwrap();
+        let points = [[100.0, 100.0, 1.0], [300.0, 140.0, 1.0], [500.0, 100.0, 1.0]];
+        let mut views: Vec<RasterView> = Vec::new();
+        for (from, point) in points.iter().enumerate() {
+            session.handle(HostMessage::RasterGesture { tab: tab.clone(), gesture: RasterGesture::StrokePart { from, points: vec![*point] } });
+            let view = last_raster(&session.take_live());
+            let patch = view.patch.clone().expect("a part came without its rows");
+            assert_eq!(patch.since, views.last().map_or(first.revision, |view| view.revision), "a part does not follow the one before");
+            let file = patch.file.as_ref().expect("a part's rows are not a file of their own");
+            let [x, y, w, h] = patch.rect.map(|value| value as usize);
+            let rows = std::fs::read(file).unwrap();
+            let composite = session.images[0].doc_mut().composite();
+            let mut want = Vec::new();
+            for row in y..y + h {
+                want.extend_from_slice(&composite[(row * 1920 + x) * 4..(row * 1920 + x + w) * 4]);
+            }
+            assert!(rows == want, "part {from}'s rows are not the picture's");
+            views.push(view);
+        }
+        assert_eq!(std::fs::read(&first.picture).unwrap(), before, "the whole picture was written while the stroke was drawn");
+        let last = views.last().unwrap().clone();
+        let end = last_raster(&gesture(&mut session, RasterGesture::Stroke { points: points.to_vec() }));
+        assert_eq!(end.revision, last.revision, "the stroke's end was sent as a new picture");
+        assert_eq!(std::fs::read(&first.picture).unwrap(), before, "the whole picture was written as the stroke ended");
+        let caught = last_raster(&session.tick());
+        assert_eq!((caught.revision, caught.patch.is_none()), (last.revision, true), "the idle program did not say the picture is whole");
+        let image = &mut session.images[0];
+        assert_eq!(std::fs::read(&caught.picture).unwrap(), image.doc_mut().composite(), "the picture file did not catch up");
+        let cache = Path::new(&caught.picture).parent().unwrap();
+        let rows = std::fs::read_dir(cache).unwrap().flatten().filter(|entry| entry.path().extension().is_some_and(|extension| extension == "patch")).count();
+        assert_eq!(rows, 0, "files of rows were left behind");
+    }
+
+    /// Catches a write in the background that starts while the person
+    /// works, loses a change, or lands after a later one: a due write waits
+    /// for the program to be idle; a picture changed while its write is made
+    /// stays unwritten; and the next write holds both changes.
+    #[test]
+    fn a_change_made_while_written_is_written_too() {
+        let folder = scratch_folder();
+        std::fs::create_dir_all(&folder).unwrap();
+        let folder = folder.canonicalize().unwrap();
+        let mut session = Session::launch();
+        let _ = session.greeting();
+        session.handle(HostMessage::Project { folder: folder.display().to_string() });
+        command(&mut session, "tool", json!({ "tool": "brush" }));
+        stroke(&mut session, [100.0, 100.0], [300.0, 100.0]);
+        // Due, a write waits for the program to be idle, never a message.
+        session.images[0].unwritten_since = Some(Instant::now() - WRITE_AFTER * 2);
+        command(&mut session, "add_layer", json!({}));
+        command(&mut session, "undo", json!({}));
+        assert!(session.images[0].saving.is_none(), "a write was started while the person works");
+        session.tick();
+        assert!(session.images[0].saving.is_some(), "the write did not go to the writer");
+        stroke(&mut session, [100.0, 300.0], [300.0, 300.0]);
+        session.finish_writes(true);
+        assert!(session.images[0].dirty, "a change made while writing was taken as written");
+        let path = session.images[0].path.clone().expect("the first write named no file");
+        let read = files::read_ipx(&path).unwrap();
+        let pixel = |picture: &Picture, y: usize| picture.pixels.values().next().unwrap().data[(y * 1920 + 200) * 4];
+        assert_eq!(pixel(&read.pictures[0].picture, 100), 0);
+        session.write_into_project(0).unwrap();
+        assert!(!session.images[0].dirty);
+        let read = files::read_ipx(&path).unwrap();
+        assert_eq!((pixel(&read.pictures[0].picture, 100), pixel(&read.pictures[0].picture, 300)), (0, 0), "the second write lost a stroke");
+        let _ = std::fs::remove_dir_all(folder);
     }
 
     /// Catches a stroke taken off the picture while it is still drawn: the

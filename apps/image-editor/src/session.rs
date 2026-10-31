@@ -264,12 +264,18 @@ impl Session {
     /// One message from the host, and every reply.
     pub fn handle(&mut self, message: HostMessage) -> Vec<AppMessage> {
         let mut out = Vec::new();
-        // A stroke being drawn lasts only while its points come: anything
-        // else but the camera takes it off the picture first.
+        // A stroke being drawn lasts while its points come. A message that
+        // could change the picture takes it off first; the host's ping each
+        // second, the camera, and the viewport leave it be, so a stroke held
+        // longer than a second stays.
         let drawing = matches!(
             &message,
             HostMessage::RasterGesture { gesture: RasterGesture::StrokePart { .. } | RasterGesture::Stroke { .. }, .. }
                 | HostMessage::Camera { .. }
+                | HostMessage::Viewport { .. }
+                | HostMessage::Ping
+                | HostMessage::Keep { .. }
+                | HostMessage::Claim { .. }
         );
         if !drawing {
             for image in &mut self.images {
@@ -2115,6 +2121,27 @@ mod tests {
         assert_eq!(&red[..4], [220, 0, 0, 255], "the first thumbnail is not its picture");
         let white = std::fs::read(&film.items[1].thumbnail.path).unwrap();
         assert!(white.chunks(4).all(|pixel| pixel == [255, 255, 255, 255]));
+    }
+
+    /// Catches a stroke taken off the picture while it is still drawn: the
+    /// host's ping each second, a camera move, and a new viewport between
+    /// its parts leave every part on the picture.
+    #[test]
+    fn a_stroke_held_past_a_ping_stays_on_the_picture() {
+        let mut session = Session::launch();
+        let _ = session.greeting();
+        command(&mut session, "tool", json!({ "tool": "brush" }));
+        let tab = session.images[0].id.clone();
+        let part = |session: &mut Session, from: usize, points: Vec<[f64; 3]>| {
+            session.handle(HostMessage::RasterGesture { tab: tab.clone(), gesture: RasterGesture::StrokePart { from, points } });
+        };
+        part(&mut session, 0, vec![[100.0, 100.0, 1.0], [200.0, 100.0, 1.0]]);
+        session.handle(HostMessage::Ping);
+        session.handle(HostMessage::Camera { tab: tab.clone(), origin: [0.0, 0.0], zoom: 0.5 });
+        session.handle(HostMessage::Viewport { viewport: [900.0, 600.0] });
+        part(&mut session, 2, vec![[300.0, 100.0, 1.0], [400.0, 100.0, 1.0]]);
+        assert_eq!(at(&mut session, 150, 100)[..3], [0, 0, 0], "the stroke's first part was taken off");
+        assert_eq!(at(&mut session, 350, 100)[..3], [0, 0, 0], "the stroke's later part was not painted");
     }
 
     /// Catches a thumbnail click that changes nothing, or changes the

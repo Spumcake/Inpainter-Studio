@@ -30,6 +30,9 @@ pub enum AppMessage {
     Tab { id: String, label: String },
     /// What the host draws in that tab's contents area.
     Contents { tab: String, kind: ContentsKind },
+    /// This application edits files of these media types, such as
+    /// `image/png`: the host may offer to edit one there, with `open_as_new`.
+    Edits { media_types: Vec<String> },
     /// That tab uses the host's properties panel, on this side.
     Panel { tab: String, side: PanelSide },
     /// The whole document after a change. `camera` is present when a sketch
@@ -105,6 +108,19 @@ pub enum AppMessage {
     Claimed { id: String, yours: bool },
 }
 
+/// The cell, and its picture's path relative to the project, that new work
+/// was opened from, and where the cell lives: a conversation session, or a
+/// notebook's file relative to the project.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpenedFrom {
+    pub cell: String,
+    pub picture: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notebook: Option<String>,
+}
+
 /// What the host writes to a sub-application, on its standard input.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -173,6 +189,14 @@ pub enum HostMessage {
     Open {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
+    },
+    /// Open that file as new work, as `edits` declared: a new tab called
+    /// `name`, never the file itself. `from` says what it came from.
+    OpenAsNew {
+        path: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<OpenedFrom>,
     },
     /// Make sure that tab's file is written. The answer is `kept`.
     Keep { tab: String },
@@ -398,7 +422,8 @@ impl Declaration {
             | AppMessage::Cells { .. }
             | AppMessage::RunCell { .. }
             | AppMessage::StopCell { .. }
-            | AppMessage::Claimed { .. } => Accept::More,
+            | AppMessage::Claimed { .. }
+            | AppMessage::Edits { .. } => Accept::More,
             AppMessage::End => Accept::Ready,
         }
     }
@@ -751,6 +776,12 @@ mod tests {
         round_trip_app(AppMessage::StopCell {
             tab: "book".into(),
             cell: "c1".into(),
+        });
+        round_trip_app(AppMessage::Edits { media_types: vec!["image/png".into(), "image/jpeg".into()] });
+        round_trip_host(HostMessage::OpenAsNew {
+            path: "/p/images/a.png".into(),
+            name: "A girl on a beach".into(),
+            from: Some(OpenedFrom { cell: "c1".into(), picture: "images/a.png".into(), session: Some("s1".into()), notebook: None }),
         });
         round_trip_app(AppMessage::Claimed {
             id: "claim-1".into(),

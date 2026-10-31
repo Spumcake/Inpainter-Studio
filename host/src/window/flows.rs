@@ -400,7 +400,7 @@ impl HostWindow {
         )
     }
 
-    fn tell(&mut self, text: String) {
+    pub(super) fn tell(&mut self, text: String) {
         self.assistant.send(Command::Note(text));
     }
 

@@ -742,6 +742,15 @@ pub(crate) fn menu_card(style: &mut egui::Style) {
     style.spacing.menu_margin = egui::Margin::same(8);
 }
 
+/// A small button floating on the menus' card, such as a picture's Edit:
+/// white, a faint hairline, and the menus' shadow; grey while pointed at.
+pub(crate) fn card_pill(painter: &egui::Painter, rect: Rect, hovered: bool) {
+    let radius = 8;
+    painter.add(MENU_SHADOW.as_shape(rect, radius));
+    let fill = if hovered { SELECTED } else { Color32::WHITE };
+    painter.rect(rect, radius, fill, Stroke::new(1.0, MENU_EDGE), egui::StrokeKind::Inside);
+}
+
 /// The card, with the room the level picker's contents want.
 pub(crate) fn floating_card() -> egui::Frame {
     egui::Frame::new()

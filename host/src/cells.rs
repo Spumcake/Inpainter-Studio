@@ -27,6 +27,8 @@ pub(crate) enum CardAction {
     Models(String, Rect),
     /// A filmstrip thumbnail was clicked: show that version.
     ShowVersion(String, usize),
+    /// The Edit button on the cell's picture was clicked.
+    EditPicture(String),
     /// A rendered Markdown cell was double-clicked: show its source.
     ShowSource(String),
 }
@@ -213,9 +215,63 @@ fn picture_height(ctx: &egui::Context, path: &str, width: f32) -> f32 {
     picture_texture(ctx, path).map_or(PICTURE_H, |texture| fit(texture.size_vec2(), width, PICTURE_H).y)
 }
 const FILM_H: f32 = 52.0;
+/// The Edit button on a cell's picture: its height, inset from the corner,
+/// and its inside.
+const EDIT_H: f32 = 28.0;
+const EDIT_INSET: f32 = 8.0;
+const EDIT_PAD: f32 = 10.0;
+const EDIT_ICON: f32 = 16.0;
+const EDIT_GAP: f32 = 6.0;
 const THUMB_GAP: f32 = 8.0;
 /// The filmstrip's outline around the version shown.
 const SHOWN: Color32 = Color32::from_rgb(37, 99, 235);
+
+/// The media types some running application edits, as the window last
+/// said: an Image cell's picture of one of them shows an Edit button. The
+/// window says none while the assistant works.
+pub(crate) fn set_editable(ctx: &egui::Context, media_types: Vec<String>) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("cell-editable"), media_types));
+}
+
+fn editable(ctx: &egui::Context, media_type: &str) -> bool {
+    ctx.data(|data| data.get_temp::<Vec<String>>(egui::Id::new("cell-editable")))
+        .is_some_and(|types| types.iter().any(|known| known == media_type))
+}
+
+/// The picture a cell's output names, with its media type.
+pub(crate) fn picture_part(parts: &[CellPart]) -> Option<(&str, &str)> {
+    parts.iter().find_map(|part| match part {
+        CellPart::Path { path, media_type } if media_type.starts_with("image/") => Some((path.as_str(), media_type.as_str())),
+        _ => None,
+    })
+}
+
+/// What new work made from a cell's picture is called: its prompt, safe as
+/// a file's name, cut at a word before 32 characters, or "Picture".
+pub(crate) fn picture_name(prompt: &str) -> String {
+    let spaced: String = prompt.chars().map(|c| if c == '/' || c == '\\' || c.is_control() { ' ' } else { c }).collect();
+    let mut name = String::new();
+    for word in spaced.split_whitespace() {
+        let length = name.chars().count() + usize::from(!name.is_empty()) + word.chars().count();
+        if length >= PICTURE_NAME {
+            if name.is_empty() {
+                name = word.chars().take(PICTURE_NAME - 1).collect();
+            }
+            break;
+        }
+        if !name.is_empty() {
+            name.push(' ');
+        }
+        name.push_str(word);
+    }
+    // No leading dot, which would hide the file.
+    let name = name.trim_start_matches(|c: char| c == '.' || c.is_whitespace());
+    let name = name.trim_end_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace());
+    if name.is_empty() { String::from("Picture") } else { name.to_string() }
+}
+
+/// New work's names stay under this many characters.
+const PICTURE_NAME: usize = 32;
 
 /// The picture a part names, if it is one.
 fn picture_path(parts: &[CellPart]) -> Option<&str> {
@@ -607,6 +663,30 @@ pub(crate) fn paint_card(
                 let size = fit(texture.size_vec2(), area.width(), area.height());
                 let rect = Rect::from_center_size(pos2(area.center().x, area.top() + size.y / 2.0), size);
                 paint_rounded(&painter, rect, &texture, 8.0);
+                // Edit, always on the picture shown, as picture-edit.png
+                // shows and the owner set on 2026-10-31.
+                let media = picture_part(&cell.output).map_or("", |(_, media)| media);
+                if editable(ui.ctx(), media) {
+                    let label = painter.layout_no_wrap("Edit".into(), ts::small(), TEXT);
+                    let full = EDIT_PAD + EDIT_ICON + EDIT_GAP + label.size().x + EDIT_PAD + 2.0;
+                    // On a narrow picture, the brush alone, so the button
+                    // stays on it.
+                    let worded = rect.width() >= full + 2.0 * EDIT_INSET;
+                    let width = if worded { full } else { 2.0 * EDIT_PAD + EDIT_ICON };
+                    let pill = Rect::from_min_size(pos2(rect.right() - EDIT_INSET - width, rect.top() + EDIT_INSET), vec2(width, EDIT_H));
+                    let button = ui
+                        .interact(pill, egui::Id::new(("cell-edit", &cell.id)), Sense::click())
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    widgets::card_pill(&painter, pill, button.hovered());
+                    crate::toolbar::paint_icon(&painter, pos2(pill.left() + EDIT_PAD + EDIT_ICON / 2.0, pill.center().y), "brush", EDIT_ICON, TEXT);
+                    if worded {
+                        let at = pos2(pill.left() + EDIT_PAD + EDIT_ICON + EDIT_GAP, pill.center().y - label.size().y / 2.0);
+                        painter.galley(at, label, TEXT);
+                    }
+                    if button.clicked() {
+                        actions.push(CardAction::EditPicture(cell.id.clone()));
+                    }
+                }
             }
             None => {
                 painter.text(area.center(), Align2::CENTER_CENTER, "The picture could not be read.", ts::small(), MUTED);

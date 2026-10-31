@@ -40,24 +40,44 @@ pub(crate) const HOST_ID: &str = "inpainter";
 /// any application's skill.
 pub(crate) fn host_skill() -> protocol::Skill {
     protocol::Skill {
-        id: "prompt".into(),
+        id: PROMPT_SKILL.into(),
         name: "Prompt".into(),
         description: "Write a prompt and run it as a cell in the conversation.".into(),
-        instructions: "When the person asks for a piece of writing, or to write or run a prompt, call run_text_prompt with the prompt. Do not write the piece in the reply. After the tool returns, reply briefly.".into(),
-        tools: vec![protocol::Tool {
-            name: RUN_PROMPT.into(),
-            description: "Show a text prompt as a cell and run it.".into(),
-            input: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "prompt": {"type": "string", "description": "The prompt to run."}
-                },
-                "required": ["prompt"],
-                "additionalProperties": false
-            }),
-        }],
+        instructions: "When the person asks for a piece of writing, or to write or run a prompt, call run_text_prompt with the prompt. Do not write the piece in the reply. When they ask to edit a picture an Image cell made, call edit_picture with the cell's id, or with none for the latest. After the tool returns, reply briefly.".into(),
+        tools: vec![
+            protocol::Tool {
+                name: RUN_PROMPT.into(),
+                description: "Show a text prompt as a cell and run it.".into(),
+                input: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "prompt": {"type": "string", "description": "The prompt to run."}
+                    },
+                    "required": ["prompt"],
+                    "additionalProperties": false
+                }),
+            },
+            protocol::Tool {
+                name: EDIT_PICTURE.into(),
+                description: "Open the picture an Image cell in the conversation shows as new work, in its own tab, ready to paint. The cell is unchanged.".into(),
+                input: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "cell": {"type": "string", "description": "The Image cell's id. Leave it out for the latest Image cell."}
+                    },
+                    "additionalProperties": false
+                }),
+            },
+        ],
     }
 }
+
+/// The host's own skill, which runs prompts and opens cells' pictures.
+pub(crate) const PROMPT_SKILL: &str = "prompt";
+
+/// The tool that opens a cell's picture as new work. A skill of the
+/// person's never takes this name.
+pub(crate) const EDIT_PICTURE: &str = "edit_picture";
 
 /// The tool the host's prompt skill offers. A skill of the person's never
 /// takes this name.
@@ -83,7 +103,7 @@ pub(crate) fn offered_skills(settings: &Settings) -> Vec<(String, SkillSetting)>
             .collect();
         slug = slug.split('_').filter(|part| !part.is_empty()).collect::<Vec<_>>().join("_");
         slug.truncate(48);
-        if slug.is_empty() || slug == RUN_PROMPT {
+        if slug.is_empty() || slug == RUN_PROMPT || slug == EDIT_PICTURE {
             slug = format!("skill_{slug}").trim_end_matches('_').to_string();
         }
         let mut name = slug.clone();

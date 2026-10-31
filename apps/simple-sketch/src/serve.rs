@@ -340,7 +340,8 @@ impl Server {
             | HostMessage::SetVersion { .. }
             | HostMessage::MoveCell { .. }
             | HostMessage::DeleteCell { .. }
-            | HostMessage::ShowSource { .. } => {}
+            | HostMessage::ShowSource { .. }
+            | HostMessage::OpenAsNew { .. } => {}
         }
         if self.project.is_some() {
             self.write_due(Instant::now());

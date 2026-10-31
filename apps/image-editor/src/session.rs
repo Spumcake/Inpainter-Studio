@@ -265,6 +265,7 @@ impl Session {
             messages.push(AppMessage::Panel { tab: image.id.clone(), side: PanelSide::Right });
         }
         messages.push(AppMessage::Skills { skills: crate::assist::skills() });
+        messages.push(AppMessage::Edits { media_types: vec![String::from("image/png"), String::from("image/jpeg")] });
         messages.push(AppMessage::End);
         if !self.images.is_empty() {
             messages.extend(self.emit());
@@ -339,6 +340,7 @@ impl Session {
             HostMessage::Open { path } => {
                 self.open_path(path.map(PathBuf::from), &mut out);
             }
+            HostMessage::OpenAsNew { path, name, from } => self.open_as_new(Path::new(&path), &name, from, &mut out),
             HostMessage::Command { id, tab, arg, viewport, .. } => {
                 if viewport[0] > 0.0 && viewport[1] > 0.0 {
                     self.viewport = viewport;
@@ -1132,7 +1134,9 @@ impl Session {
                             (read.name, doc)
                         })
                         .collect();
-                    self.push_image(Gallery::new(pictures, read.shown), Some(path), None);
+                    let mut gallery = Gallery::new(pictures, read.shown);
+                    gallery.source = read.source;
+                    self.push_image(gallery, Some(path), None);
                     self.declare_new(out);
                 }
                 Err(reason) => out.push(notice("This image could not be opened", &reason)),
@@ -1145,6 +1149,24 @@ impl Session {
                 let gallery = Gallery::one(&title, Doc::new(Picture::from_pixels(&title, pixels)));
                 let index = self.push_image(gallery, None, Some(title));
                 // It is new work, so it is kept in the project as an image.
+                self.images[index].dirty = true;
+                self.declare_new(out);
+            }
+            Err(reason) => out.push(notice("This picture could not be opened", &reason)),
+        }
+    }
+
+    /// Opens a picture as new work, as a cell's Edit asks: a new tab called
+    /// `name`, with one picture of one layer, never the file itself. Inside
+    /// a project it is written as a new file, and keeps where it came from.
+    fn open_as_new(&mut self, path: &Path, name: &str, from: Option<protocol::OpenedFrom>, out: &mut Vec<AppMessage>) {
+        let name = safe_name(name);
+        let name = if name.is_empty() { file_title(path) } else { name };
+        match files::import(path) {
+            Ok(pixels) => {
+                let mut gallery = Gallery::one(&name, Doc::new(Picture::from_pixels(&name, pixels)));
+                gallery.source = from;
+                let index = self.push_image(gallery, None, Some(name));
                 self.images[index].dirty = true;
                 self.declare_new(out);
             }
@@ -1207,7 +1229,7 @@ impl Session {
             },
         };
         let (pictures, shown) = snapshot(&mut image.gallery);
-        let job = Job { tab: image.id.clone(), signature: signature(image), path: path.clone(), pictures, shown };
+        let job = Job { tab: image.id.clone(), source: image.gallery.source.clone(), signature: signature(image), path: path.clone(), pictures, shown };
         image.saving = Some((job.signature, path));
         let writer = self.writer.get_or_insert_with(Writer::start);
         if writer.jobs.send(job).is_ok() {
@@ -1796,10 +1818,18 @@ fn caught_up(frame: &mut Frame) {
     }
 }
 
+/// A name that is safe as a file's: path separators, control characters,
+/// and line breaks become spaces, and runs of spaces one.
+pub fn safe_name(name: &str) -> String {
+    let spaced: String = name.chars().map(|c| if c == '/' || c == '\\' || c.is_control() { ' ' } else { c }).collect();
+    let joined = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    joined.trim_start_matches('.').trim().to_string()
+}
+
 /// Writes a tab's gallery to its file, each held slider finished first.
 fn write_gallery(path: &Path, gallery: &mut Gallery) -> Result<(), String> {
     let (pictures, shown) = snapshot(gallery);
-    let encoded = files::write_ipx(path, pictures, shown)?;
+    let encoded = files::write_ipx(path, pictures, shown, gallery.source.clone())?;
     keep(gallery, encoded);
     Ok(())
 }
@@ -1848,6 +1878,7 @@ struct Writer {
 
 struct Job {
     tab: String,
+    source: Option<protocol::OpenedFrom>,
     signature: Signature,
     path: PathBuf,
     pictures: Vec<files::Snapshot>,
@@ -1867,7 +1898,7 @@ impl Writer {
         let (finished, done) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for job in incoming {
-                let result = files::write_ipx(&job.path, job.pictures, job.shown);
+                let result = files::write_ipx(&job.path, job.pictures, job.shown, job.source);
                 if finished.send(Done { tab: job.tab, signature: job.signature, path: job.path, result }).is_err() {
                     break;
                 }

@@ -89,6 +89,8 @@ pub struct Declared {
     pub skills: Vec<Skill>,
     /// Counts the `skills` messages, so a change is noticed.
     pub skills_version: u64,
+    /// The media types it edits, as its `edits` declared.
+    pub edits: Vec<String>,
     /// Answers to `invoke` not yet passed to the assistant.
     pub results: VecDeque<ToolResult>,
     /// Answers to `keep`: the tab, and its file or none when cancelled.
@@ -545,6 +547,7 @@ impl Running {
                 declared.skills = skills;
                 declared.skills_version += 1;
             }
+            AppMessage::Edits { media_types } => declared.edits = media_types,
             AppMessage::ToolResult(result) => declared.results.push_back(result),
             AppMessage::Kept { tab, path, error } => declared.kept.push_back((tab, path, error)),
             AppMessage::Cells { tab, cells, selected } => {

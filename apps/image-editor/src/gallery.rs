@@ -67,12 +67,15 @@ pub struct Gallery {
     /// Rises with every change to the strip, done or undone.
     pub edits: u64,
     next_uid: u64,
+    /// The cell and picture this gallery was opened from as new work, kept
+    /// in its file.
+    pub source: Option<protocol::OpenedFrom>,
 }
 
 impl Gallery {
     /// A gallery of `pictures`, named, showing `shown`.
     pub fn new(pictures: Vec<(String, Doc)>, shown: usize) -> Self {
-        let mut gallery = Self { frames: Vec::new(), shown: 0, undo: Vec::new(), redo: Vec::new(), edits: 0, next_uid: 1 };
+        let mut gallery = Self { frames: Vec::new(), shown: 0, undo: Vec::new(), redo: Vec::new(), edits: 0, next_uid: 1, source: None };
         for (name, doc) in pictures {
             let frame = gallery.frame_of(&name, doc);
             gallery.frames.push(frame);

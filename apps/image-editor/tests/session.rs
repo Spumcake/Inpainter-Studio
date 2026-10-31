@@ -316,3 +316,66 @@ fn a_picture_added_from_the_strip_is_painted_alone() {
     drop(program);
     let _ = std::fs::remove_dir_all(folder);
 }
+
+/// A gallery file's header: the line of JSON after its magic.
+fn header(path: &Path) -> serde_json::Value {
+    let bytes = std::fs::read(path).unwrap();
+    let start = bytes.iter().position(|byte| *byte == b'{').expect("no header");
+    let end = start + bytes[start..].iter().position(|byte| *byte == b'\n').expect("no header's end");
+    serde_json::from_slice(&bytes[start..end]).unwrap()
+}
+
+fn until_file(path: &Path, changed_after: Option<std::time::SystemTime>) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let ready = || std::fs::metadata(path).and_then(|meta| meta.modified()).is_ok_and(|modified| changed_after.is_none_or(|after| modified > after));
+    while !ready() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(ready(), "{} was never written", path.display());
+}
+
+/// Catches a picture opened as new work that is not kept, broken by its
+/// name, or forgets where it came from: `open_as_new` with a name holding
+/// "/" and a line break makes a tab of one picture called by a safe name,
+/// written in the project's own folder with the picture's pixels and its
+/// source; opened again, painted, and saved, the file keeps its source.
+#[test]
+fn a_picture_opened_as_new_work_is_kept_with_its_source() {
+    let folder = scratch("open-as-new");
+    let source = folder.join("lamp.png");
+    image::RgbaImage::from_pixel(20, 10, image::Rgba([10, 120, 200, 255])).save(&source).unwrap();
+    let from = protocol::OpenedFrom { cell: "c7".into(), picture: "images/lamp.png".into(), session: Some("s3".into()), notebook: None };
+
+    let mut program = Program::start(false);
+    program.send(HostMessage::Project { folder: folder.display().to_string() });
+    program.raster(0);
+    program.send(HostMessage::OpenAsNew { path: source.display().to_string(), name: "AC/DC lamp\nposter".into(), from: Some(from.clone()) });
+    let opened = program.wait(|message| match message {
+        AppMessage::Raster(view) if (view.width, view.height) == (20, 10) => Some(view.clone()),
+        _ => None,
+    });
+    assert_eq!(opened.film.as_ref().unwrap().items.len(), 1);
+    assert_eq!(opened.film.as_ref().unwrap().items[0].name, "AC DC lamp poster");
+    assert_eq!(pixel(Path::new(&opened.picture), 20, 3, 3), [10, 120, 200, 255]);
+    let written = folder.join("AC DC lamp poster.ipx");
+    until_file(&written, None);
+    assert_eq!(header(&written)["source"], serde_json::to_value(&from).unwrap(), "the file forgot where it came from");
+    drop(program);
+
+    // Opened again, painted, and saved: the source stays.
+    let saved = std::fs::metadata(&written).unwrap().modified().unwrap();
+    let mut again = Program::start(false);
+    again.send(HostMessage::Project { folder: folder.display().to_string() });
+    again.raster(0);
+    again.send(HostMessage::Open { path: Some(written.display().to_string()) });
+    let shown = again.wait(|message| match message {
+        AppMessage::Raster(view) if (view.width, view.height) == (20, 10) => Some(view.clone()),
+        _ => None,
+    });
+    again.send(HostMessage::Command { id: "tool".into(), tab: Some(shown.tab.clone()), arg: Some(json!({ "tool": "brush" })), node: None, viewport: [1200.0, 800.0] });
+    again.send(HostMessage::RasterGesture { tab: shown.tab.clone(), gesture: RasterGesture::Stroke { points: vec![[2.0, 2.0, 1.0], [18.0, 8.0, 1.0]] } });
+    until_file(&written, Some(saved));
+    assert_eq!(header(&written)["source"], serde_json::to_value(&from).unwrap(), "a save lost where the work came from");
+    drop(again);
+    let _ = std::fs::remove_dir_all(folder);
+}

@@ -42,6 +42,9 @@ struct Header {
     #[serde(default)]
     shown: usize,
     pictures: Vec<PictureFile>,
+    /// The cell and picture the gallery was opened from as new work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<protocol::OpenedFrom>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -86,6 +89,7 @@ pub struct ReadPicture {
 pub struct Read {
     pub pictures: Vec<ReadPicture>,
     pub shown: usize,
+    pub source: Option<protocol::OpenedFrom>,
 }
 
 /// An encoded layer, shared by a picture's cache and the writes using it.
@@ -177,7 +181,7 @@ fn fingerprint(pixels: &Pixels) -> u64 {
 
 /// Writes a gallery: every picture in order, and which is shown. Returns
 /// what was encoded for each picture.
-pub fn write_ipx(path: &Path, pictures: Vec<Snapshot>, shown: usize) -> Result<Vec<Encoded>, String> {
+pub fn write_ipx(path: &Path, pictures: Vec<Snapshot>, shown: usize, source: Option<protocol::OpenedFrom>) -> Result<Vec<Encoded>, String> {
     let mut blobs: Vec<u8> = Vec::new();
     let mut files = Vec::new();
     let mut encoded = Vec::new();
@@ -190,7 +194,7 @@ pub fn write_ipx(path: &Path, pictures: Vec<Snapshot>, shown: usize) -> Result<V
         files.push(PictureFile { name: picture.name, width: picture.width, height: picture.height, active: picture.active, layers });
         encoded.push(Encoded { uid: picture.uid, edits: picture.edits, layers: made });
     }
-    let header = Header { version: VERSION, shown, pictures: files };
+    let header = Header { version: VERSION, shown, pictures: files, source };
     let mut bytes = MAGIC.to_vec();
     bytes.extend(serde_json::to_vec(&header).map_err(|error| error.to_string())?);
     bytes.push(b'\n');
@@ -268,7 +272,7 @@ pub fn read_ipx(path: &Path) -> Result<Read, String> {
                 .filter(|stem| !stem.is_empty())
                 .unwrap_or_else(|| String::from(crate::session::UNTITLED));
             let file = PictureFile { name, width: header.width, height: header.height, active: header.active, layers: header.layers };
-            Ok(Read { pictures: vec![read_picture(file, blobs)?], shown: 0 })
+            Ok(Read { pictures: vec![read_picture(file, blobs)?], shown: 0, source: None })
         }
         VERSION => {
             let header: Header = serde_json::from_slice(line).map_err(|_| damaged())?;
@@ -280,7 +284,7 @@ pub fn read_ipx(path: &Path) -> Result<Read, String> {
                 return Err(damaged());
             }
             let shown = header.shown.min(pictures.len() - 1);
-            Ok(Read { pictures, shown })
+            Ok(Read { pictures, shown, source: header.source })
         }
         other => Err(format!(
             "It is version {other} of an image file, and this Image Editor reads versions 1 and {VERSION}."
@@ -540,10 +544,12 @@ mod tests {
             Snapshot::take(2, "Tall", &plain, None, 0, &none),
             Snapshot::take(3, "Red", &red, Some(red_id), 0, &none),
         ];
-        write_ipx(&path, writing, 1).unwrap();
+        let source = protocol::OpenedFrom { cell: "c1".into(), picture: "images/a.png".into(), session: Some("s1".into()), notebook: None };
+        write_ipx(&path, writing, 1, Some(source.clone())).unwrap();
         assert!(is_ipx(&path));
         let read = read_ipx(&path).unwrap();
         assert_eq!(read.shown, 1);
+        assert_eq!(read.source, Some(source), "the gallery forgot where it came from");
         let names: Vec<&str> = read.pictures.iter().map(|read| read.name.as_str()).collect();
         assert_eq!(names, ["Speckles", "Tall", "Red"]);
         let first = &read.pictures[0];

@@ -91,7 +91,7 @@ fn command(window: &mut Window, app_id: &str, id: &str) {
     window.step();
 }
 
-fn book_cells(app: &crate::window::HostWindow) -> Vec<protocol::Cell> {
+pub(super) fn book_cells(app: &crate::window::HostWindow) -> Vec<protocol::Cell> {
     app.apps
         .iter()
         .find(|started| started.id == "mission-control")
@@ -1185,6 +1185,23 @@ fn a_notebook_cells_chevron_chooses_its_level() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Adds an Image cell to the notebook shown, types `prompt`, and runs it
+/// until its picture is made. Returns the cell's id.
+pub(super) fn make_book_picture(window: &mut Window, prompt: &str) -> String {
+    show_workspace(window);
+    command(window, "mission-control", "kind_image");
+    command(window, "mission-control", "add_cell");
+    window.until(|app| book_cells(app).iter().any(|cell| cell.kind == protocol::IMAGE_KIND));
+    let id = book_cells(&window.app).iter().find(|cell| cell.kind == protocol::IMAGE_KIND).unwrap().id.clone();
+    type_prompt(window, &id, prompt);
+    let typed = prompt.to_string();
+    window.until(move |app| book_cells(app).iter().any(|cell| cell.prompt() == typed));
+    command(window, "mission-control", "run");
+    let made = id.clone();
+    window.until(move |app| book_cells(app).iter().any(|cell| cell.id == made && cell.state == CellState::Done && !cell.versions.is_empty()));
+    id
+}
+
 /// Catches an Image kind a notebook only lists: chosen from the kind
 /// dropdown, added, typed, and run, the cell asks the image skill for a
 /// picture, and its version records the picture, kept in the project.
@@ -1195,16 +1212,7 @@ fn a_notebook_image_cell_makes_a_picture() {
     let mut window = project_window(apps(), &stand_in, &dir);
     window.app.settings.add_image_skill();
     window.select("mission-control");
-    show_workspace(&mut window);
-    command(&mut window, "mission-control", "kind_image");
-    command(&mut window, "mission-control", "add_cell");
-    window.until(|app| book_cells(app).iter().any(|cell| cell.kind == protocol::IMAGE_KIND));
-    let id = book_cells(&window.app).iter().find(|cell| cell.kind == protocol::IMAGE_KIND).unwrap().id.clone();
-    type_prompt(&mut window, &id, "A lighthouse in a storm.");
-    window.until(|app| book_cells(app).iter().any(|cell| cell.prompt() == "A lighthouse in a storm."));
-    command(&mut window, "mission-control", "run");
-    let made = id.clone();
-    window.until(move |app| book_cells(app).iter().any(|cell| cell.id == made && cell.state == CellState::Done && !cell.versions.is_empty()));
+    let id = make_book_picture(&mut window, "A lighthouse in a storm.");
     assert_eq!(stand_in.pictures()[0]["prompt"], "A lighthouse in a storm.");
     assert!(stand_in.requests().is_empty(), "the Image cell went to a chat model");
     let cell = book_cells(&window.app).into_iter().find(|cell| cell.id == id).unwrap();

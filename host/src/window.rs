@@ -678,6 +678,10 @@ impl eframe::App for HostWindow {
         self.note_kinds();
         self.pump_assistant();
         self.take_cell_requests();
+        // An Image cell's picture shows Edit when an application edits it,
+        // and waits while the assistant works, as every control does.
+        let editable = if self.locked() { Vec::new() } else { self.edited_types() };
+        crate::cells::set_editable(&ctx, editable);
         self.tick_cells();
         self.poll_claim();
         self.project_frame(&ctx, frame);
@@ -1031,6 +1035,16 @@ impl HostWindow {
     /// The host's own tool was called: a prompt, or one of the person's
     /// skills, runs as a cell in the conversation.
     fn begin_host_cell(&mut self, call: String, tool: &str, input: serde_json::Value) {
+        // Editing a cell's picture opens it; it makes no cell.
+        if protocol::split_tool_key(tool).is_some_and(|(_, skill, name)| skill == route::PROMPT_SKILL && name == route::EDIT_PICTURE) {
+            let cell = input.get("cell").and_then(|value| value.as_str()).filter(|cell| !cell.trim().is_empty());
+            let (ok, output) = match self.edit_picture(cell) {
+                Ok(name) => (true, serde_json::json!(format!("Opened the picture as new work, \"{name}\", in its own tab."))),
+                Err(reason) => (false, serde_json::json!({ "error": reason })),
+            };
+            self.assistant.send(Command::Result(protocol::ToolResult { call, ok, output, images: Vec::new() }));
+            return;
+        }
         let text = |key: &str| input.get(key).and_then(|value| value.as_str()).unwrap_or("").to_string();
         let (prompt, run_on, picture) = match route::skill_for_tool(&self.settings, tool) {
             Some(skill) => {
@@ -1087,6 +1101,11 @@ impl HostWindow {
                 }
                 crate::cells::CardAction::ShowSource(id) => self.show_source(&id),
                 crate::cells::CardAction::ShowVersion(id, index) => self.show_version(&id, index),
+                crate::cells::CardAction::EditPicture(id) => {
+                    if let Err(reason) = self.edit_picture(Some(&id)) {
+                        self.tell(format!("The picture could not be opened: {reason}"));
+                    }
+                }
                 crate::cells::CardAction::Models(id, at) => {
                     let open = self.model_menu.as_ref().is_some_and(|(open, _)| *open == id);
                     self.model_menu = if open { None } else { Some((id, at)) };
@@ -1157,6 +1176,88 @@ impl HostWindow {
                 cell: id.to_string(),
             },
         );
+    }
+
+    /// Every media type a running application edits.
+    fn edited_types(&self) -> Vec<String> {
+        let mut types: Vec<String> = Vec::new();
+        for started in self.apps.iter().filter(|started| !started.running.exited()) {
+            for media in &started.running.declared.edits {
+                if !types.contains(media) {
+                    types.push(media.clone());
+                }
+            }
+        }
+        types
+    }
+
+    /// Opens the picture an Image cell shows as new work, in the first
+    /// application that edits its media type: the conversation's cell or a
+    /// notebook's, or with no id the conversation's latest Image cell. The
+    /// cell is unchanged. Returns the name asked for, or why nothing was
+    /// sent.
+    pub(crate) fn edit_picture(&mut self, id: Option<&str>) -> Result<String, String> {
+        // With no id, the latest Image cell that shows a picture.
+        let in_conversation = |cell: &&protocol::Cell| {
+            cell.kind == protocol::IMAGE_KIND
+                && match id {
+                    Some(id) => cell.id == id,
+                    None => crate::cells::picture_part(&cell.output).is_some(),
+                }
+        };
+        let conversation = self.chat.conversation.iter().rev().filter_map(|entry| entry.cell.as_ref()).find(in_conversation).cloned();
+        // Where the cell lives: the conversation, or a notebook, named by its
+        // file once it has one.
+        let (cell, notebook) = match (conversation, id) {
+            (Some(cell), _) => (cell, None),
+            (None, Some(id)) => {
+                let (app, tab) = self.cell_home(id).ok_or("There is no Image cell with that id.")?;
+                let started = &self.apps[app];
+                let cell = started.running.declared.cells.get(&tab).and_then(|(cells, _)| cells.iter().find(|cell| cell.id == id)).cloned();
+                let file = started.running.tabs().0.into_iter().find(|entry| entry.id == tab).and_then(|entry| entry.path);
+                (cell.ok_or("There is no Image cell with that id.")?, Some(file))
+            }
+            (None, None) => return Err("The conversation has no Image cell.".into()),
+        };
+        // The version shown, and the prompt that made it, not an edit of
+        // the prompt not yet run.
+        let shown = cell.current.and_then(|index| cell.versions.get(index));
+        let (output, made_by) = match shown {
+            Some(version) => {
+                let mut ran = protocol::Cell::text(String::new(), "");
+                ran.input = version.input.clone();
+                (version.output.clone(), ran.prompt())
+            }
+            None => (cell.output.clone(), cell.prompt()),
+        };
+        let (picture, media) = crate::cells::picture_part(&output).ok_or("The cell shows no picture.")?;
+        let folder = self.project.as_ref().map(|project| project.folder.clone()).ok_or("No project is open.")?;
+        let path = folder.join(picture);
+        if std::fs::File::open(&path).is_err() {
+            return Err(format!("The picture's file, {picture}, cannot be read."));
+        }
+        let app = self
+            .apps
+            .iter()
+            .position(|started| !started.running.exited() && started.running.declared.edits.iter().any(|known| known == media))
+            .ok_or("No application here edits this picture.")?;
+        let name = crate::cells::picture_name(&made_by);
+        let relative = |file: String| {
+            let file = std::path::PathBuf::from(file);
+            file.strip_prefix(&folder).map(|inside| inside.display().to_string()).unwrap_or_else(|_| file.display().to_string())
+        };
+        let from = protocol::OpenedFrom {
+            cell: cell.id.clone(),
+            picture: picture.to_string(),
+            session: notebook.is_none().then(|| self.project.as_ref().map(|project| project.session.clone())).flatten(),
+            notebook: notebook.flatten().map(relative),
+        };
+        if !self.workspace_shown() {
+            self.toggle_workspace();
+        }
+        self.selected = app;
+        self.send(app, HostMessage::OpenAsNew { path: path.display().to_string(), name: name.clone(), from: Some(from) });
+        Ok(name)
     }
 
     fn cell_home(&self, id: &str) -> Option<(usize, String)> {
@@ -1403,7 +1504,7 @@ impl HostWindow {
                     } else if let Some((_, png)) = &picture {
                         // The assistant sees the picture it asked for, as the
                         // owner set on 2026-10-30.
-                        (serde_json::json!("Made the picture."), vec![assistant::picture_base64(png)])
+                        (serde_json::json!(format!("Made the picture in cell {id}.")), vec![assistant::picture_base64(png)])
                     } else {
                         (serde_json::json!(text), Vec::new())
                     };

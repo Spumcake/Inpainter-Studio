@@ -96,6 +96,7 @@ mod settings_checks;
 mod image_checks;
 mod editor_checks;
 mod raster_checks;
+mod edit_checks;
 
 /// A folder of the check's own, which it removes when done.
 fn scratch(name: &str) -> PathBuf {
@@ -524,11 +525,9 @@ fn declared(app: &HostWindow) -> Vec<String> {
             })
         })
         .collect();
-    names.push(protocol::tool_key(
-        crate::route::HOST_ID,
-        "prompt",
-        "run_text_prompt",
-    ));
+    for tool in ["run_text_prompt", crate::route::EDIT_PICTURE] {
+        names.push(protocol::tool_key(crate::route::HOST_ID, "prompt", tool));
+    }
     names.sort();
     names
 }
@@ -582,6 +581,7 @@ fn a_stand_in_under_a_known_id_offers_only_its_own_skill() {
     assert_eq!(
         offered(&requests[0]),
         vec![
+            "inpainter__prompt__edit_picture".to_string(),
             "inpainter__prompt__run_text_prompt".to_string(),
             "simple-sketch__quill__stamp_glyph".to_string(),
         ]
